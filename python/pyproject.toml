@@ -1,0 +1,65 @@
+[project]
+name = "rkp"
+version = "0.0.1"
+description = "Dataclass records with Arrow, Spark, Iceberg, and AWS Glue interoperability"
+readme = "README.md"
+requires-python = ">=3.11, <3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pyarrow>=16.0.0",
+    "tzdata>=2025.2; sys_platform == 'win32'",
+]
+
+[project.urls]
+Documentation = "https://platob.github.io/rkp/"
+Repository = "https://github.com/Platob/rkp"
+Issues = "https://github.com/Platob/rkp/issues"
+
+[project.optional-dependencies]
+iceberg = ["pyiceberg[pyarrow]>=0.11.1,<0.12"]
+awsglue = ["boto3>=1.35,<2"]
+spark = ["pyarrow>=18.0.0", "pyspark>=4.0,<5"]
+all = [
+    "boto3>=1.35,<2",
+    "pyiceberg[pyarrow]>=0.11.1,<0.12",
+    "pyarrow>=18.0.0",
+    "pyspark>=4.0,<5",
+]
+test = [
+    "boto3>=1.35,<2",
+    "moto[glue]>=5.1,<6",
+    "pytest>=7",
+    "pyiceberg[pyarrow]>=0.11.1,<0.12",
+    "pyarrow>=18.0.0",
+    "pyspark>=4.0,<5",
+    "typing_extensions>=4.6",
+]
+
+[dependency-groups]
+docs = ["mkdocs>=1.6,<2", "mkdocs-material>=9.7.7,<10"]
+dev = [
+    "mypy>=2.3,<3",
+    "pip-audit>=2.10,<3",
+    "pytest-cov>=7.1,<8",
+    "ruff>=0.16,<0.17",
+    "twine>=7,<8",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.uv.build-backend]
+source-include = ["tests/**", "benchmarks/**"]
