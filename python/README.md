@@ -41,8 +41,9 @@ assert encoded.file_name == "prices.json.gz"
 The package provides native Python views over Yggdryl's `DataType`, `Field`,
 `MimeType`, `MediaType`, `Uri`, `Url`, and `Urn`, plus dataclass-compatible records. Parsing,
 validation, Arrow conversion, ordering, stable hashing, and path normalization
-remain owned by Rust. Python 3.10 and PyArrow 15 are the minimum supported
-versions; PyArrow 15 supplies the generic Arrow C-stream reader boundary.
+remain owned by Rust. Python 3.10 and PyArrow 18 are the minimum supported
+versions; 15 supplied the generic Arrow C-stream reader boundary, and 18 is
+where the run-end-encoded map and extension-type scalar paths became correct.
 `DataType.arrow_scalar(value, *, safe=True)` builds a Scalar of the projected
 physical type. `Field.arrow_scalar` adds top-level nullability enforcement and returns
 an already matching Scalar by identity; `safe=False` explicitly requests

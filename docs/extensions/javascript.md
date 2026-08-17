@@ -304,6 +304,83 @@ assert.equal(stream.compression, null)
 assert.equal(stream.maxRowGroupSize, null)
 ```
 
+## Anything in, a reader out
+
+`readArrow`, `writeArrow`, and `appendArrow` are the same three calls with the argument widened to
+whatever your last library handed you. Each one becomes the single native reader and is passed to the
+same native method, so widening the argument never adds a second way to write.
+
+```javascript
+const assert = require('node:assert/strict')
+const arrow = require('apache-arrow')
+const { IOBase, MimeType } = require('@yggdryl/node')
+
+const table = new arrow.Table({
+  id: arrow.vectorFromArray([1n, 2n], new arrow.Int64()),
+})
+
+function handle() {
+  const stream = IOBase.fromBytes()
+  stream.mediaType = MimeType.ARROW_STREAM
+  return stream
+}
+
+// A table, a reader, named columns, and plain records all write.
+for (const rows of [
+  table,
+  arrow.RecordBatchReader.from(arrow.tableToIPC(table)),
+  { id: [1n, 2n] },
+  [{ id: 1n }, { id: 2n }],
+]) {
+  const target = handle()
+  target.writeArrow(rows)
+  assert.equal(target.readArrow().toTable().numRows, 2)
+}
+```
+
+| You are holding | What happens |
+| --- | --- |
+| a native `BatchReader` or Arrow IPC bytes | used as it stands |
+| an Arrow JS `Table`, `RecordBatch`, or `RecordBatchReader` | its batches, encoded as one stream |
+| an Arrow JS `Vector` | the one column a declared schema names, and refused when none does |
+| an object of named columns | `tableFromArrays` |
+| an object of scalar values | one row |
+| an array or iterable of any of those | concatenated into one stream |
+| an array of plain records | `tableFromJSON`, inferred from all of them at once |
+
+Arrow JS has no C Data consumer, so this boundary encodes one Arrow IPC stream in both directions -
+the batches were going to be materialized either way, which is why an array and a generator cost the
+same here and why the Python side can stream where this one cannot.
+
+An **async** source is the one shape that changes the call's shape: its rows do not exist until they
+are awaited, so `writeArrow` returns a promise for it and nothing for every synchronous source. An
+Arrow JS reader implements both iteration protocols and is treated as the synchronous one.
+
+```javascript
+const assert = require('node:assert/strict')
+const arrow = require('apache-arrow')
+const { IOBase, MimeType } = require('@yggdryl/node')
+
+async function main() {
+  const table = new arrow.Table({ id: arrow.vectorFromArray([1n], new arrow.Int64()) })
+  async function* pages() {
+    yield table
+    yield table
+  }
+
+  const handle = IOBase.fromBytes()
+  handle.mediaType = MimeType.ARROW_STREAM
+  await handle.writeArrow(pages())
+
+  assert.equal(handle.readArrow().toTable().numRows, 2)
+}
+
+main()
+```
+
+`apache-arrow` is loaded only when a value actually has to be materialized, and a build without it
+reports that package by name rather than failing somewhere inside a conversion.
+
 ## Iceberg is a namespace
 
 The table format sits on top of the record encodings in the core, so it is one name here rather than

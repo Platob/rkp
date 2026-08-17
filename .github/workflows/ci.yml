@@ -16,8 +16,20 @@ env:
 
 jobs:
   rust:
-    name: Rust quality
+    # The Parquet encoding and the Iceberg table format over it are behind
+    # non-default features, so a single-configuration job never compiles them
+    # at all: their code, their tests, and their documentation are only checked
+    # by the second leg.
+    name: Rust quality (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            flags: ""
+          - name: parquet iceberg
+            flags: --features "parquet iceberg"
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -25,15 +37,15 @@ jobs:
       - name: Formatting
         run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
       - name: Clippy
-        run: cargo clippy --locked --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path rust/Cargo.toml --workspace --all-targets ${{ matrix.flags }} -- -D warnings
       - name: Tests
-        run: cargo test --locked --manifest-path rust/Cargo.toml --workspace --all-targets
+        run: cargo test --locked --manifest-path rust/Cargo.toml --workspace --all-targets ${{ matrix.flags }}
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --manifest-path rust/Cargo.toml --workspace --no-deps
+        run: cargo doc --locked --manifest-path rust/Cargo.toml --workspace --no-deps ${{ matrix.flags }}
       - name: Compile benchmarks
-        run: cargo bench --locked --manifest-path rust/Cargo.toml --benches --no-run
+        run: cargo bench --locked --manifest-path rust/Cargo.toml --benches --no-run ${{ matrix.flags }}
 
   core-msrv:
     name: Core Rust 1.85
@@ -54,8 +66,8 @@ jobs:
       fail-fast: false
       matrix:
         pyarrow:
-          - "pyarrow==15.*"
-          - "pyarrow>=15"
+          - "pyarrow==18.*"
+          - "pyarrow>=18"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -63,8 +75,14 @@ jobs:
           python-version: "3.12"
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
+      # `pandas` and `polars` are not runtime dependencies; they are installed
+      # so the tests covering the frame entry points run here instead of
+      # skipping. Both are optional for PyArrow itself, so the pinned PyArrow
+      # in the matrix still decides which one is used.
       - name: Install build and test tools
-        run: python -m pip install "maturin>=1.9,<2" "${{ matrix.pyarrow }}" "pytest>=8" "mypy>=1.15"
+        run: >-
+          python -m pip install "maturin>=1.9,<2" "${{ matrix.pyarrow }}"
+          "pytest>=8" "mypy>=1.15" "pandas>=2" "polars>=1" tzdata
       - name: Build wheel
         run: maturin build --locked --manifest-path python/Cargo.toml --interpreter python --out python/dist
       - name: Install wheel

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import io
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pyarrow as pa  # type: ignore[import-untyped]
 
@@ -239,6 +239,19 @@ record_batches: pa.RecordBatchReader = record_handle.read_arrow_batch_reader(
 stored_root: Field = record_handle.read_arrow_field()
 record_handle.write_arrow_batch_reader(record_batches, options=record_options)
 record_handle.append_arrow_batch_reader(record_batches, options=record_options)
+
+generic_batches: pa.RecordBatchReader = record_handle.read_arrow(options=record_options)
+record_handle.write_arrow(pa.table({"id": [1]}))
+record_handle.write_arrow([{"id": 1}], options=record_options)
+record_handle.append_arrow(generic_batches)
+pandas_frames: Iterator[Any] = record_handle.read_pandas()
+pandas_frame: Any = record_handle.read_pandas_frame(options=record_options)
+record_handle.write_pandas(pandas_frames)
+record_handle.write_pandas_frame(pandas_frame, options=record_options)
+polars_frames: Iterator[Any] = record_handle.read_polars()
+polars_frame: Any = record_handle.read_polars_frame(options=record_options)
+record_handle.write_polars(polars_frames)
+record_handle.write_polars_frame(polars_frame, options=record_options)
 parquet_options: RecordOptions = RecordOptions("trades.parquet")
 row_group_size: int | None = parquet_options.max_row_group_size
 footer_metadata: dict[str, str] | None = parquet_options.key_value_metadata

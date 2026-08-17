@@ -848,6 +848,39 @@ class IOBase:
     def append_arrow_batch_reader(
         self, batches: BatchesLike, *, options: RecordOptionsLike | None = None
     ) -> None: ...
+    def read_arrow(
+        self, *, options: RecordOptionsLike | None = None
+    ) -> pyarrow.RecordBatchReader: ...
+    def write_arrow(
+        self, data: RowsLike, *, options: RecordOptionsLike | None = None
+    ) -> None: ...
+    def append_arrow(
+        self, data: RowsLike, *, options: RecordOptionsLike | None = None
+    ) -> None: ...
+    def read_pandas(
+        self, *, options: RecordOptionsLike | None = None
+    ) -> Iterator[Any]: ...
+    def read_pandas_frame(
+        self, *, options: RecordOptionsLike | None = None
+    ) -> Any: ...
+    def write_pandas(
+        self, frames: Any, *, options: RecordOptionsLike | None = None
+    ) -> None: ...
+    def write_pandas_frame(
+        self, frame: Any, *, options: RecordOptionsLike | None = None
+    ) -> None: ...
+    def read_polars(
+        self, *, options: RecordOptionsLike | None = None
+    ) -> Iterator[Any]: ...
+    def read_polars_frame(
+        self, *, options: RecordOptionsLike | None = None
+    ) -> Any: ...
+    def write_polars(
+        self, frames: Any, *, options: RecordOptionsLike | None = None
+    ) -> None: ...
+    def write_polars_frame(
+        self, frame: Any, *, options: RecordOptionsLike | None = None
+    ) -> None: ...
     def __fspath__(self) -> str: ...
     def __len__(self) -> int: ...
     def __iter__(self) -> Iterator[IOBase]: ...
@@ -860,6 +893,10 @@ FieldLike = Field | str | Any
 # Anything that exports Arrow batches: a reader, a table, a batch, any Arrow C
 # stream exporter, or a sequence of batches.
 BatchesLike = Any
+# Anything the generic entry points build a reader from: everything BatchesLike
+# covers, plus a PyArrow Dataset or Scanner, a pandas or polars frame, an
+# iterable of any of those, and an iterable of plain rows.
+RowsLike = Any
 # Record settings, or the media type naming the encoding they belong to.
 RecordOptionsLike = RecordOptions | MediaType | MimeType | str
 

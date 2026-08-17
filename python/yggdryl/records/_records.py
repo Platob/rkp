@@ -1406,7 +1406,13 @@ def _convert_int(value: object, path: str) -> int:
 
 
 def _convert_float(value: object, path: str) -> float:
-    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+    # A half-float is the one Arrow value PyArrow hands back as a NumPy scalar
+    # rather than a Python one before PyArrow 21, and `numpy.float16` is not a
+    # `float` subclass the way `numpy.float64` is. `__float__` is what says a
+    # value is a real number, so it is what this accepts: a bool has one and is
+    # excluded here because its truthiness is not a number, and a string has
+    # none, so the branch below still owns text.
+    if not isinstance(value, (bool, str)) and hasattr(value, "__float__"):
         try:
             return float(value)
         except (OverflowError, ValueError) as error:
