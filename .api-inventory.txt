@@ -816,6 +816,16 @@
   pub fn to_json(&self) -> Result<Value>
   pub fn to_v1_json(&self) -> Result<Value>
 
+### yggdryl::iceberg::table (additions)
+  pub fn manifests_at(&self, snapshot: &Snapshot) -> Result<Vec<ManifestFile>>
+  pub fn snapshot_by_ref(&self, name: &str) -> Result<&Snapshot>
+  pub fn plan_at(&self, snapshot_id: i64, filters: &[(&str, &str)]) -> Result<ScanPlan>
+  pub fn scan_at(&self, snapshot_id: i64, filters: &[(&str, &str)], field: Option<&Field>) -> Result<BatchReader>
+  pub fn commit_changes(&mut self, change: impl FnOnce(&mut TableMetadata) -> Result<()>) -> Result<()>
+  pub fn inspect_history(&self) -> Result<BatchReader>
+  pub fn inspect_snapshots(&self) -> Result<BatchReader>
+  pub fn inspect_files(&self) -> Result<BatchReader>
+
 ### yggdryl::iceberg::schema  [rust\src\iceberg\schema.rs]
   pub fn schema_from_json(name: &str, schema: &Value) -> Result<Field>
   pub fn schema_to_json(root: &Field) -> Result<Value>

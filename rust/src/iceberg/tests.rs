@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 
 use crate::io::IOBase;
 use crate::local::Folder;
@@ -1632,4 +1632,331 @@ mod handles {
             1
         );
     }
+}
+
+#[test]
+fn time_travel_reads_a_previous_snapshot_by_id_and_by_ref() {
+    let path = root("time-travel");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+
+    let first = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+    table
+        .append(crate::arrow::batch_reader(first.schema(), [first]))
+        .unwrap();
+    let past = table.current_snapshot().unwrap().snapshot_id;
+    let second = trades(&[9], &[Some("NVDA")], &[Some("XNAS")]);
+    table
+        .overwrite(crate::arrow::batch_reader(second.schema(), [second]))
+        .unwrap();
+
+    // The present shows the overwrite; the retained snapshot shows history.
+    assert_eq!(collect(table.scan(None).unwrap())[0].0, 9);
+    let history = collect(table.scan_at(past, &[], None).unwrap());
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].0, 1);
+
+    // Planning history prunes exactly as planning the present does.
+    let plan = table.plan_at(past, &[("venue", "XLON")]).unwrap();
+    assert_eq!(plan.tasks.len(), 0);
+    assert_eq!(table.plan_at(past, &[]).unwrap().tasks.len(), 1);
+
+    // A tag names the snapshot, and an unknown ref says which refs exist.
+    table
+        .commit_changes(|metadata| {
+            metadata.refs.push((
+                smol_str::SmolStr::new("audit"),
+                crate::iceberg::SnapshotRef {
+                    snapshot_id: past,
+                    kind: smol_str::SmolStr::new_static("tag"),
+                },
+            ));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(table.snapshot_by_ref("audit").unwrap().snapshot_id, past);
+    let message = table.snapshot_by_ref("missing").unwrap_err().to_string();
+    assert!(message.contains("audit"), "{message}");
+
+    // A snapshot nobody retained is refused naming the ones that are.
+    let message = match table.scan_at(-1, &[], None) {
+        Err(error) => error.to_string(),
+        Ok(_) => unreachable!("a snapshot nobody retained must not scan"),
+    };
+    assert!(message.contains("retained"), "{message}");
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn a_metadata_only_commit_writes_a_version_and_a_failure_leaves_none() {
+    let path = root("metadata-commit");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    let version = table.version();
+
+    table
+        .commit_changes(|metadata| {
+            metadata.properties.push((
+                smol_str::SmolStr::new("owner"),
+                smol_str::SmolStr::new("desk"),
+            ));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(table.version(), version + 1);
+    assert_eq!(table.metadata().property("owner"), Some("desk"));
+
+    // A rejected change is a commit that never happened.
+    let failed: crate::Result<()> = table.commit_changes(|_| {
+        Err(crate::Error::Codec {
+            format: "iceberg",
+            position: 0,
+            reason: smol_str::SmolStr::new_static("rejected"),
+        })
+    });
+    assert!(failed.is_err());
+    assert_eq!(table.version(), version + 1);
+
+    // The written document reads back with the change applied.
+    let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+    assert_eq!(reopened.metadata().property("owner"), Some("desk"));
+    assert_eq!(reopened.version(), version + 1);
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn the_inspection_tables_report_history_snapshots_and_files() {
+    let path = root("inspect");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::identity(0, &trade_schema(), &["venue"]).unwrap(),
+    )
+    .unwrap();
+    let first = trades(
+        &[1, 2],
+        &[Some("AAPL"), Some("MSFT")],
+        &[Some("XNAS"), Some("XNYS")],
+    );
+    table
+        .append(crate::arrow::batch_reader(first.schema(), [first]))
+        .unwrap();
+    let second = trades(&[3], &[Some("NVDA")], &[Some("XNAS")]);
+    table
+        .append(crate::arrow::batch_reader(second.schema(), [second]))
+        .unwrap();
+
+    // History: two snapshots, both on the current ancestry chain.
+    let history: Vec<RecordBatch> = table
+        .inspect_history()
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(history[0].num_rows(), 2);
+    let ancestor = history[0]
+        .column_by_name("is_current_ancestor")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::BooleanArray>()
+        .unwrap()
+        .clone();
+    assert!(ancestor.value(0) && ancestor.value(1));
+
+    // Snapshots: the operation column reads straight off the summary.
+    let snapshots: Vec<RecordBatch> = table
+        .inspect_snapshots()
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(snapshots[0].num_rows(), 2);
+    let operations = snapshots[0]
+        .column_by_name("operation")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .clone();
+    assert_eq!(operations.value(0), "append");
+
+    // Files: three partitioned files, each naming its column=value chain.
+    let files: Vec<RecordBatch> = table
+        .inspect_files()
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(files[0].num_rows(), 3);
+    let partitions = files[0]
+        .column_by_name("partition")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .clone();
+    let rendered: Vec<&str> = (0..3).map(|row| partitions.value(row)).collect();
+    assert!(rendered.contains(&"venue=XNAS"), "{rendered:?}");
+    assert!(rendered.contains(&"venue=XNYS"), "{rendered:?}");
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn a_zero_row_append_commits_a_snapshot_that_reads_as_nothing() {
+    let path = root("zero-row");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+
+    let empty = trades(&[], &[], &[]);
+    table
+        .append(crate::arrow::batch_reader(empty.schema(), [empty]))
+        .unwrap();
+
+    // The commit is real - it has a snapshot - and the table stays empty.
+    assert!(table.current_snapshot().is_some());
+    assert_eq!(collect(table.scan(None).unwrap()).len(), 0);
+    assert_eq!(table.plan(&[]).unwrap().tasks.len(), 0);
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn a_nan_value_neither_poisons_a_bound_nor_hides_a_row() {
+    let path = root("nan-bounds");
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Float64.nullable_field("ratio"),
+    ])
+    .unwrap()
+    .required_field("row");
+    assign_field_ids(&mut schema, 1).unwrap();
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+
+    let arrow_schema = schema.to_arrow_schema().unwrap();
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(arrow_array::Float64Array::from(vec![
+                1.5,
+                f64::NAN,
+                f64::INFINITY,
+            ])),
+        ],
+    )
+    .unwrap();
+    table
+        .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+        .unwrap();
+
+    // Every row reads back, and a filter on the finite value still finds it:
+    // a NaN in the column must not produce a bound that excludes the file.
+    let mut ids = Vec::new();
+    for batch in table.scan(None).unwrap() {
+        let batch = batch.unwrap();
+        let column = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone();
+        for row in 0..batch.num_rows() {
+            ids.push(column.value(row));
+        }
+    }
+    assert_eq!(ids, [1, 2, 3]);
+    assert_eq!(table.plan(&[("ratio", "1.5")]).unwrap().tasks.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn a_truncated_manifest_is_a_typed_error_and_not_a_panic() {
+    let path = root("corrupt-manifest");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    let batch = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+    table
+        .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+        .unwrap();
+
+    // Truncate every Avro manifest under metadata/ to a torn prefix.
+    for entry in std::fs::read_dir(path.join("metadata")).unwrap() {
+        let file = entry.unwrap().path();
+        if file.extension().is_some_and(|extension| extension == "avro") {
+            let bytes = std::fs::read(&file).unwrap();
+            std::fs::write(&file, &bytes[..bytes.len().min(16)]).unwrap();
+        }
+    }
+
+    let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+    let message = reopened.plan(&[]).unwrap_err().to_string();
+    assert!(!message.is_empty());
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn a_wide_schema_round_trips_with_every_field_numbered() {
+    let path = root("wide");
+    let mut schema = DataType::from_fields(
+        (0..300).map(|index| DataType::Int64.nullable_field(format!("column_{index:03}"))),
+    )
+    .unwrap()
+    .required_field("row");
+    assign_field_ids(&mut schema, 1).unwrap();
+    assert_eq!(schema.max_id().unwrap(), Some(300));
+
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    let arrow_schema = schema.to_arrow_schema().unwrap();
+    let columns: Vec<ArrayRef> = (0..300)
+        .map(|index| Arc::new(Int64Array::from(vec![index])) as ArrayRef)
+        .collect();
+    let batch = RecordBatch::try_new(arrow_schema, columns).unwrap();
+    table
+        .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+        .unwrap();
+
+    // Reopening parses the wide schema back and reads every column.
+    let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+    assert_eq!(reopened.schema().unwrap().field_len(), 300);
+    let read = reopened.scan(None).unwrap().next().unwrap().unwrap();
+    assert_eq!(read.num_columns(), 300);
+    assert_eq!(read.num_rows(), 1);
+
+    let _ = std::fs::remove_dir_all(&path);
 }

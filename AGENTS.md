@@ -317,6 +317,15 @@ that compiles annotations into native values.
   statistic bytes *are* the Iceberg single-value encoding, and emit counts alone
   for the rest. A missing statistic costs a planner one file read; a wrong one
   costs correctness.
+- **Every retained snapshot is a complete table, and reading one is an
+  ordinary scan.** Time travel is `scan_at`/`plan_at` with a snapshot id and
+  `snapshot_by_ref` for a branch or tag; the snapshot is read as the schema it
+  was written under. A metadata-only change - a property, a ref, an evolved
+  schema - commits through `Table::commit_changes`, which writes one new
+  document and leaves the in-memory table unchanged on any failure. The
+  table's own record renders as record batches through `inspect_history`,
+  `inspect_snapshots`, and `inspect_files`, under PyIceberg's column names;
+  never add a second, struct-shaped spelling of the same report.
 - **An exchange format is validated against an outside implementation.** Round
   tripping through this crate's own reader proves only that the reader and the
   writer agree with each other. `scripts/check_iceberg_interop.py` and the

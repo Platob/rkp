@@ -90,6 +90,7 @@
 //! file belongs to.
 
 mod avro;
+mod inspect;
 mod manifest;
 mod metadata;
 mod partition;

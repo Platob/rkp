@@ -236,14 +236,57 @@ impl<H: IOBase> Table<H> {
     ///
     /// Returns an error when the manifest list cannot be reached or decoded.
     pub fn manifests(&self) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = self.current_snapshot() else {
-            return Ok(Vec::new());
-        };
+        match self.current_snapshot() {
+            Some(snapshot) => self.manifests_at(snapshot),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Return every manifest one retained snapshot points at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest list cannot be reached or decoded.
+    pub fn manifests_at(&self, snapshot: &Snapshot) -> Result<Vec<ManifestFile>> {
         if snapshot.manifest_list.is_empty() {
             return Ok(Vec::new());
         }
         let handle = self.child_at(&snapshot.manifest_list)?;
         read_manifest_list(&handle)
+    }
+
+    /// Return the retained snapshot a branch or tag names.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the refs the table does have when `name` is not
+    /// one of them, or when the ref points at a snapshot that is not retained.
+    pub fn snapshot_by_ref(&self, name: &str) -> Result<&Snapshot> {
+        let reference = self
+            .metadata
+            .refs
+            .iter()
+            .find_map(|(candidate, reference)| (candidate == name).then_some(reference))
+            .ok_or_else(|| {
+                let known: Vec<&str> = self
+                    .metadata
+                    .refs
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                invalid(format_smolstr!(
+                    "expected a branch or tag this table has, got {name:?}; it has [{}]",
+                    known.join(", ")
+                ))
+            })?;
+        self.metadata
+            .snapshot_by_id(reference.snapshot_id)
+            .ok_or_else(|| {
+                invalid(format_smolstr!(
+                    "expected the ref {name:?} to point at a retained snapshot, got {}",
+                    reference.snapshot_id
+                ))
+            })
     }
 
     /// Plan a scan: decide which data files the metadata says have to be read.
@@ -266,11 +309,90 @@ impl<H: IOBase> Table<H> {
         self.planned(&resolved)
     }
 
+    /// Plan a scan of one retained snapshot rather than the current one.
+    ///
+    /// This is the planning half of time travel: the snapshot's manifest list
+    /// is walked with the same three-level pruning a current-snapshot plan
+    /// uses, so a filtered read of history skips exactly what a filtered read
+    /// of the present skips.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no retained snapshot carries `snapshot_id`, when
+    /// a filter names a column the snapshot's schema does not declare, or when
+    /// a manifest cannot be reached or decoded.
+    pub fn plan_at(&self, snapshot_id: i64, filters: &[(&str, &str)]) -> Result<ScanPlan> {
+        let snapshot = self.require_snapshot(snapshot_id)?;
+        let schema = self.schema_of(snapshot)?;
+        let resolved = super::scan::filters(schema, filters)?;
+        let manifests = self.manifests_at(snapshot)?;
+        self.plan_manifests(&manifests, &resolved)
+    }
+
+    /// Read one retained snapshot's rows: time travel as an ordinary scan.
+    ///
+    /// The rows are read as the schema that was current when the snapshot was
+    /// written, so a column added later does not appear and a column dropped
+    /// later still does. `filters` and `field` mean exactly what they mean on
+    /// [`Self::scan_where`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no retained snapshot carries `snapshot_id`, when
+    /// a filter names a column that schema does not declare, or when a
+    /// manifest cannot be read.
+    pub fn scan_at(
+        &self,
+        snapshot_id: i64,
+        filters: &[(&str, &str)],
+        field: Option<&Field>,
+    ) -> Result<BatchReader> {
+        let snapshot = self.require_snapshot(snapshot_id)?;
+        let stored = self.schema_of(snapshot)?.clone();
+        let resolved = super::scan::filters(&stored, filters)?;
+        let manifests = self.manifests_at(snapshot)?;
+        let plan = self.plan_manifests(&manifests, &resolved)?;
+        self.reader(plan.tasks, &stored, field, resolved)
+    }
+
+    /// Return one retained snapshot, or say which ids are retained.
+    fn require_snapshot(&self, snapshot_id: i64) -> Result<&Snapshot> {
+        self.metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+            let retained: Vec<String> = self
+                .metadata
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.snapshot_id.to_string())
+                .collect();
+            invalid(format_smolstr!(
+                "expected a retained snapshot id, got {snapshot_id}; the table retains [{}]",
+                retained.join(", ")
+            ))
+        })
+    }
+
+    /// Return the schema one snapshot was written under, or the current one.
+    fn schema_of(&self, snapshot: &Snapshot) -> Result<&Field> {
+        match snapshot.schema_id {
+            Some(schema_id) => self.metadata.schema_by_id(schema_id).ok_or_else(|| {
+                invalid(format_smolstr!(
+                    "expected the snapshot's schema {schema_id} among the table's schemas, got none"
+                ))
+            }),
+            None => self.schema(),
+        }
+    }
+
     /// Plan a scan from filters that are already resolved.
     fn planned(&self, filters: &[Filter]) -> Result<ScanPlan> {
         let manifests = self.manifests()?;
+        self.plan_manifests(&manifests, filters)
+    }
+
+    /// Plan one set of manifests under one set of resolved filters.
+    fn plan_manifests(&self, manifests: &[ManifestFile], filters: &[Filter]) -> Result<ScanPlan> {
         super::scan::plan(
-            &manifests,
+            manifests,
             &|spec_id| {
                 self.metadata
                     .spec_by_id(spec_id)
@@ -297,6 +419,89 @@ impl<H: IOBase> Table<H> {
             .into_iter()
             .map(|task| (task.entry.data_file, task.spec))
             .collect())
+    }
+
+    /// Commit a metadata-only change as the next table version.
+    ///
+    /// `change` receives the metadata to mutate - table properties, a new
+    /// schema from [`TableMetadata::add_schema`], a snapshot ref - and the
+    /// result is written as one new metadata document, exactly as a data
+    /// commit writes one. An error from the change, or from the write, leaves
+    /// the table's in-memory state exactly as it was: a failed commit is a
+    /// commit that never happened.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let folder = yggdryl::local::Folder::new(std::env::temp_dir().join("t"))?;
+    /// # let mut table = yggdryl::iceberg::Table::open(folder)?;
+    /// table.commit_changes(|metadata| {
+    ///     metadata.set_property("commit.retry.num-retries", "4")?;
+    ///     Ok(())
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the change's own failure, or the write failure of the new
+    /// document.
+    pub fn commit_changes(
+        &mut self,
+        change: impl FnOnce(&mut TableMetadata) -> Result<()>,
+    ) -> Result<()> {
+        // The change runs on a copy, so a rejected change costs nothing.
+        let mut updated = self.metadata.clone();
+        change(&mut updated)?;
+        updated.last_updated_ms = now_ms();
+
+        let previous = std::mem::replace(&mut self.metadata, updated);
+        let previous_version = self.version;
+        if let Err(error) = self.commit_metadata() {
+            // A failed write must leave the handle describing the table that
+            // is actually there, which is still the previous version.
+            self.metadata = previous;
+            self.version = previous_version;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Render when each snapshot became current, oldest first.
+    ///
+    /// The columns are `made_current_at`, `snapshot_id`, `parent_id`, and
+    /// `is_current_ancestor`, the names PyIceberg's `history` table uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the batch cannot be assembled.
+    pub fn inspect_history(&self) -> Result<BatchReader> {
+        super::inspect::history(&self.metadata)
+    }
+
+    /// Render every retained snapshot with its operation and summary.
+    ///
+    /// The columns are `committed_at`, `snapshot_id`, `parent_id`,
+    /// `operation`, `manifest_list`, and the free-form `summary` map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the batch cannot be assembled.
+    pub fn inspect_snapshots(&self) -> Result<BatchReader> {
+        super::inspect::snapshots(&self.metadata)
+    }
+
+    /// Render the live data files of the current snapshot.
+    ///
+    /// The columns are `file_path`, `file_format`, `spec_id`, the rendered
+    /// `partition` chain, `record_count`, and `file_size_in_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a manifest cannot be reached or decoded.
+    pub fn inspect_files(&self) -> Result<BatchReader> {
+        let entries = self.data_files()?;
+        super::inspect::files(&entries)
     }
 
     /// Read every row of the current snapshot, keeping the columns `field` names.

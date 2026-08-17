@@ -949,6 +949,71 @@ select a row. `ScanPlan` reports both numbers, so "a filtered read touches only
 the files the metadata says it must" is something a caller can assert on rather
 than believe.
 
+## Time travel and the inspection tables
+
+!!! note "Rust only"
+    Time travel and the inspection tables are core surfaces the bindings do
+    not project yet.
+
+Nothing a commit writes is mutated in place, so every retained snapshot is still a complete table.
+Reading one is an ordinary scan with the snapshot named:
+
+```rust
+use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+use yggdryl::local::Folder;
+use yggdryl::DataType;
+
+let root = std::env::temp_dir().join("yggdryl-doc-time-travel");
+let _ = std::fs::remove_dir_all(&root);
+
+let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+    .required_field("row");
+assign_field_ids(&mut schema, 1)?;
+let mut table = Table::create(
+    Folder::new(&root)?,
+    FormatVersion::V2,
+    schema.clone(),
+    PartitionSpec::unpartitioned(),
+)?;
+
+let arrow_schema = schema.to_arrow_schema()?;
+let one = arrow_array::RecordBatch::try_new(
+    std::sync::Arc::clone(&arrow_schema),
+    vec![std::sync::Arc::new(arrow_array::Int64Array::from(vec![1]))],
+)?;
+table.append(yggdryl::arrow::batch_reader(std::sync::Arc::clone(&arrow_schema), [one]))?;
+let past = table.current_snapshot().expect("one commit").snapshot_id;
+
+let nine = arrow_array::RecordBatch::try_new(
+    std::sync::Arc::clone(&arrow_schema),
+    vec![std::sync::Arc::new(arrow_array::Int64Array::from(vec![9]))],
+)?;
+table.overwrite(yggdryl::arrow::batch_reader(arrow_schema, [nine]))?;
+
+// The present shows the overwrite; the retained snapshot shows what was.
+assert_eq!(table.scan(None)?.count(), 1);
+let history = table.scan_at(past, &[], None)?.next().expect("one batch")?;
+assert_eq!(history.num_rows(), 1);
+
+// Planning history prunes exactly as planning the present does.
+assert_eq!(table.plan_at(past, &[])?.tasks.len(), 1);
+
+let _ = std::fs::remove_dir_all(&root);
+```
+
+A snapshot is read as the schema that was current when it was written, so a column added later does
+not appear and a column dropped later still does. A branch or tag resolves with `snapshot_by_ref`,
+and a metadata-only change - a property, a new ref, an evolved schema - commits through
+`commit_changes`, which writes one new metadata document and leaves the table untouched when the
+change or the write fails.
+
+The table also renders its own record as record batches, under the column names PyIceberg's
+inspection tables use: `inspect_history` (when each snapshot became current, and whether it is on
+the current ancestry chain), `inspect_snapshots` (operation, manifest list, and the summary map per
+retained snapshot), and `inspect_files` (path, format, spec, rendered `column=value` partition
+chain, row count, and size per live data file). They are ordinary readers, so the same collect that
+drains a scan drains them.
+
 ## The three record methods over a table
 
 === "Rust"
@@ -1156,6 +1221,141 @@ let rows: usize = partition
     .sum();
 assert_eq!(rows, 1);
 ```
+
+## The Spark quickstart, locally
+
+!!! note "Rust only"
+    The same walk runs from the bindings through the record surface; the
+    evolution and time-travel steps are core surfaces the bindings do not
+    project yet.
+
+The scenario the [Spark quickstart](https://iceberg.apache.org/spark-quickstart/) walks - create
+`nyc.taxis`, insert, read, update, delete, evolve, look back - runs against this module with no
+Spark, no JVM, and no catalog service. A local folder is the whole warehouse.
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+use yggdryl::local::Folder;
+use yggdryl::DataType;
+
+let root = std::env::temp_dir().join("yggdryl-doc-nyc-taxis");
+let _ = std::fs::remove_dir_all(&root);
+
+// CREATE TABLE nyc.taxis (...) PARTITIONED BY (vendor_id)
+let mut schema = DataType::from_fields([
+    DataType::Int64.required_field("vendor_id"),
+    DataType::Int64.required_field("trip_id"),
+    DataType::Float32.nullable_field("trip_distance"),
+    DataType::Float64.nullable_field("fare_amount"),
+    DataType::Utf8.nullable_field("store_and_fwd_flag"),
+])?
+.required_field("row");
+assign_field_ids(&mut schema, 1)?;
+let spec = PartitionSpec::identity(0, &schema, &["vendor_id"])?;
+let mut table = Table::create(Folder::new(&root)?, FormatVersion::V2, schema.clone(), spec)?;
+
+// INSERT INTO nyc.taxis VALUES (...)
+let arrow_schema = schema.to_arrow_schema()?;
+let taxis = |vendors: &[i64], trips: &[i64], distances: &[f32], fares: &[f64], flags: &[&str]| {
+    RecordBatch::try_new(
+        Arc::clone(&arrow_schema),
+        vec![
+            Arc::new(Int64Array::from(vendors.to_vec())),
+            Arc::new(Int64Array::from(trips.to_vec())),
+            Arc::new(Float32Array::from(distances.to_vec())),
+            Arc::new(Float64Array::from(fares.to_vec())),
+            Arc::new(StringArray::from(flags.to_vec())),
+        ],
+    )
+};
+let rows = taxis(
+    &[1, 2, 2, 1],
+    &[1_000_371, 1_000_372, 1_000_373, 1_000_374],
+    &[1.8, 2.5, 0.9, 8.4],
+    &[15.32, 22.15, 9.01, 42.13],
+    &["N", "N", "N", "Y"],
+)?;
+table.append(yggdryl::arrow::batch_reader(rows.schema(), [rows]))?;
+
+// SELECT * FROM nyc.taxis
+let fares = |table: &Table<Folder>| -> Result<Vec<(i64, f64)>, Box<dyn std::error::Error>> {
+    let mut rows = Vec::new();
+    for batch in table.scan(None)? {
+        let batch = batch?;
+        let trips = batch.column_by_name("trip_id").expect("the trip column");
+        let fares = batch.column_by_name("fare_amount").expect("the fare column");
+        let trips = trips.as_any().downcast_ref::<Int64Array>().expect("int64");
+        let fares = fares.as_any().downcast_ref::<Float64Array>().expect("float64");
+        for row in 0..batch.num_rows() {
+            rows.push((trips.value(row), fares.value(row)));
+        }
+    }
+    rows.sort_by_key(|(trip, _)| *trip);
+    Ok(rows)
+};
+assert_eq!(fares(&table)?.len(), 4);
+assert_eq!(fares(&table)?[0], (1_000_371, 15.32));
+let before_changes = table.current_snapshot().expect("the insert").snapshot_id;
+
+// UPDATE nyc.taxis SET fare_amount = 16.32 WHERE trip_id = 1000371
+// An update is a merge: the incoming row matches on the key and replaces.
+let update = taxis(&[1], &[1_000_371], &[1.8], &[16.32], &["N"])?;
+table.merge(
+    yggdryl::arrow::batch_reader(update.schema(), [update]),
+    &["trip_id".to_owned()],
+    true,
+)?;
+assert_eq!(fares(&table)?[0], (1_000_371, 16.32));
+assert_eq!(fares(&table)?.len(), 4);
+
+// DELETE FROM nyc.taxis WHERE vendor_id = 1
+// A delete is a filtered overwrite with nothing incoming: the selected
+// partition is replaced by no rows, and every other file is carried over.
+table.overwrite_where(
+    &[("vendor_id", "1")],
+    yggdryl::arrow::batch_reader(Arc::clone(&arrow_schema), []),
+)?;
+assert_eq!(
+    fares(&table)?,
+    [(1_000_372, 22.15), (1_000_373, 9.01)],
+);
+
+// ALTER TABLE nyc.taxis ADD COLUMN fare_per_distance float
+let mut evolved = schema.fields().to_vec();
+evolved.push(DataType::Float32.nullable_field("fare_per_distance"));
+table.commit_changes(|metadata| {
+    let mut evolved = DataType::from_fields(evolved.clone())?.required_field("row");
+    // The new column gets the next unused id; the retired ones are never reused.
+    evolved.assign_ids(metadata.last_column_id + 1)?;
+    let schema_id = metadata.add_schema(evolved)?;
+    metadata.current_schema_id = schema_id;
+    Ok(())
+})?;
+let widened = table.scan(None)?.next().expect("one batch")?;
+assert_eq!(widened.schema().fields().len(), 6);
+assert_eq!(widened.column_by_name("fare_per_distance").expect("the new column").null_count(), 2);
+
+// Time travel: the table before the update and the delete is still there.
+assert_eq!(table.scan_at(before_changes, &[], None)?.map(|batch| batch.map(|b| b.num_rows())).sum::<Result<usize, _>>()?, 4);
+
+// SELECT * FROM nyc.taxis.history / .snapshots / .files
+let history = table.inspect_history()?.next().expect("one batch")?;
+assert_eq!(history.num_rows(), 3);
+let files = table.inspect_files()?.next().expect("one batch")?;
+assert_eq!(files.num_rows(), 1);
+
+let _ = std::fs::remove_dir_all(&root);
+```
+
+Every data-moving step above is one commit, so the history table ends with three rows - the insert,
+the merge, the filtered overwrite - and the metadata-only schema change never appears there, because
+it moved no data. The delete really is an overwrite: `vendor_id` is a partition column, so the plan selects one
+partition's file, replaces it with nothing, and carries the other file into the new snapshot
+untouched. And the time-travel read at the end sees the four original fares, because nothing a
+commit writes is ever mutated in place.
 
 ## Schema evolution and field ids
 
