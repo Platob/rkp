@@ -1203,7 +1203,12 @@ fn one_walk_numbers_finds_and_bounds_every_identifier_in_a_tree() {
             .unwrap(),
         )
         .unwrap();
-    assert_eq!(evolved.assign_ids(schema.max_id().unwrap().unwrap() + 1).unwrap(), 7);
+    assert_eq!(
+        evolved
+            .assign_ids(schema.max_id().unwrap().unwrap() + 1)
+            .unwrap(),
+        7
+    );
     assert_eq!(evolved.field_by_id(1).map(Field::name), Some("id"));
     assert_eq!(evolved.field_by_id(6).map(Field::name), Some("venue"));
 }
@@ -1232,7 +1237,10 @@ fn a_datatype_rebuilds_any_layout_from_replacement_children() {
             DataType::Utf8.nullable_field("text"),
         ])
         .unwrap();
-    assert_eq!(rebuilt.to_string(), union.to_string().replace("int64", "int32"));
+    assert_eq!(
+        rebuilt.to_string(),
+        union.to_string().replace("int64", "int32")
+    );
 
     // The arity is the layout's, and a mismatch says which was expected.
     let message = list

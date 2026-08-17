@@ -347,6 +347,266 @@ def test_typed_names_location_and_protocol_properties_share_field_metadata() -> 
     assert field.location is None
 
 
+WELL_KNOWN_PROTOCOLS = (
+    "http",
+    "file",
+    "urn",
+    "postgres",
+    "postgresql",
+    "mysql",
+    "arrow",
+    "sql",
+    "glue",
+    "iceberg",
+    "fix",
+    "field",
+    "dtype",
+    "s3",
+    "gs",
+    "az",
+    "spark",
+    "polars",
+    "pandas",
+)
+
+
+def test_protocol_view_implements_the_mapping_protocol_over_bare_names() -> None:
+    field = Field("price", "float64", nullable=False, metadata={"venue": "XPAR"})
+    view = field.iceberg
+
+    assert not view
+    assert len(view) == 0
+    assert list(view) == []
+    assert view.scheme == "iceberg"
+    assert view.prefix == "iceberg"
+    assert view.key("doc") == "iceberg:doc"
+
+    view["doc"] = "closing price"
+    view["field-id"] = "7"
+
+    assert bool(view)
+    assert len(view) == 2
+    assert "doc" in view
+    assert "iceberg:doc" not in view
+    assert 7 not in view
+    assert view["doc"] == "closing price"
+    assert view.get("doc") == "closing price"
+    marker = object()
+    assert view.get("missing", marker) is marker
+    assert view.get("missing") is None
+    assert list(view) == ["doc", "field-id"]
+    assert list(view.keys()) == ["doc", "field-id"]
+    assert list(view.values()) == ["closing price", "7"]
+    assert list(view.items()) == [("doc", "closing price"), ("field-id", "7")]
+    assert dict(view) == {"doc": "closing price", "field-id": "7"}
+    assert str(view) == '{"doc":"closing price","field-id":"7"}'
+    assert repr(view) == (
+        'ProtocolMetadata("iceberg", {"doc":"closing price","field-id":"7"})'
+    )
+
+    with pytest.raises(KeyError, match="iceberg:missing"):
+        _ = view["missing"]
+    with pytest.raises(KeyError, match="iceberg:missing"):
+        del view["missing"]
+    with pytest.raises(TypeError):
+        view["doc"] = 3  # type: ignore[assignment]
+    with pytest.raises(TypeError):
+        _ = view[3]  # type: ignore[index]
+
+    view.update({"doc": "close"}, snapshot="9")
+    assert dict(view.items()) == {
+        "doc": "close",
+        "field-id": "7",
+        "snapshot": "9",
+    }
+    before = dict(view.items())
+    with pytest.raises(ValueError):
+        view.update([("valid", "1"), ("", "rejected")])
+    assert dict(view.items()) == before
+
+    del view["snapshot"]
+    assert "snapshot" not in view
+    view.clear()
+    assert not view
+    assert dict(field.items()) == {"venue": "XPAR"}
+
+
+def test_protocol_view_is_a_live_window_on_the_field_it_came_from() -> None:
+    field = Field("price", "float64", nullable=False)
+    view = field.iceberg
+    other = field.iceberg
+
+    view["doc"] = "closing price"
+    assert field.get_property("iceberg", "doc") == "closing price"
+    assert field["iceberg:doc"] == "closing price"
+    assert other["doc"] == "closing price"
+    assert view == other
+
+    other["doc"] = "close"
+    assert view["doc"] == "close"
+
+    field.set_property("iceberg", "field-id", "7")
+    assert view["field-id"] == "7"
+    assert len(view) == 2
+
+    field.clear_properties("iceberg")
+    assert not view
+    assert view == field.postgres
+
+    unrelated = Field("other", "int64")
+    unrelated.iceberg["doc"] = "close"
+    assert view != unrelated.iceberg
+    with pytest.raises(TypeError):
+        hash(view)
+
+
+def test_protocol_view_named_accessors_cover_every_well_known_protocol() -> None:
+    field = Field("price", "float64", nullable=False)
+
+    for protocol in WELL_KNOWN_PROTOCOLS:
+        view = getattr(field, protocol)
+        assert view.scheme == protocol
+        assert view.prefix == protocol
+        assert view.key("doc") == f"{protocol}:doc"
+        view["doc"] = protocol
+
+    assert [name.split(":", 1)[0] for name in field] == sorted(
+        WELL_KNOWN_PROTOCOLS
+    )
+    for protocol in WELL_KNOWN_PROTOCOLS:
+        assert field.get_property(protocol, "doc") == protocol
+        assert field[f"{protocol}:doc"] == protocol
+        assert field.protocol(protocol.upper())["doc"] == protocol
+
+    with pytest.raises(ValueError):
+        field.protocol("1invalid")
+
+
+def test_protocol_view_http_covers_https_and_ignores_header_case() -> None:
+    field = Field(
+        "payload",
+        "binary",
+        nullable=False,
+        metadata={"HTTPS:Content-Type": "application/json"},
+    )
+    http = field.http
+    https = field.protocol("HTTPS")
+
+    assert https.scheme == "https"
+    assert http.prefix == https.prefix == "http"
+    assert http["Content-Type"] == "application/json"
+    assert https["content-type"] == "application/json"
+    assert "CONTENT-TYPE" in http
+    assert list(http) == ["content-type"]
+    assert http == https
+
+    https["Content-Encoding"] = "gzip"
+    assert field["http:content-encoding"] == "gzip"
+    assert http["content-encoding"] == "gzip"
+    assert field.content_encoding == "gzip"
+
+    del http["CONTENT-ENCODING"]
+    assert field.content_encoding is None
+    assert not hasattr(field, "https")
+
+
+def test_protocol_view_refuses_writes_to_a_frozen_record_field() -> None:
+    row_type = Record.from_arrow_schema(
+        pa.schema([pa.field("id", pa.int64(), nullable=False)]),
+        class_name="FrozenViewRecord",
+    )
+    child = row_type.schema_fields()[0]
+    view = child.iceberg
+
+    assert view.get("doc") is None
+    assert len(view) == 0
+    with pytest.raises(TypeError, match="read-only"):
+        view["doc"] = "identifier"
+    with pytest.raises(TypeError, match="read-only"):
+        view.update({"doc": "identifier"})
+    with pytest.raises(TypeError, match="read-only"):
+        del view["doc"]
+    with pytest.raises(TypeError, match="read-only"):
+        view.clear()
+    with pytest.raises(TypeError, match="read-only"):
+        child.set_partition(True)
+    assert list(view.items()) == []
+    assert not child.is_partition
+
+
+def test_partition_fields_are_marked_reported_and_split_on_a_struct_root() -> None:
+    root = Field(
+        "row",
+        DataType.from_fields(
+            [
+                Field("year", "int32", nullable=False),
+                Field("month", "int32", nullable=False),
+                Field("price", "float64", nullable=False),
+            ]
+        ),
+        nullable=False,
+    )
+
+    assert not root.has_partition_fields
+    assert root.partition_fields == []
+    assert root.partition_field_names == []
+    assert root.partition_field_len == 0
+    assert root.without_partition_fields() == root
+
+    marked = root.with_partition_fields(["year", "month"])
+
+    assert marked.has_partition_fields
+    assert marked.partition_field_names == ["year", "month"]
+    assert marked.partition_field_len == 2
+    assert [child.name for child in marked.partition_fields] == ["year", "month"]
+    assert all(isinstance(child, Field) for child in marked.partition_fields)
+    assert all(child.is_partition for child in marked.partition_fields)
+    assert marked.partition_fields[0].field["partition"] == "true"
+    assert not root.has_partition_fields
+
+    assert marked.only_partition_fields().partition_field_names == ["year", "month"]
+    assert [child.name for child in marked.only_partition_fields().data_type] == [
+        "year",
+        "month",
+    ]
+    assert [child.name for child in marked.without_partition_fields().data_type] == [
+        "price"
+    ]
+
+    year = Field("year", "int32", nullable=False)
+    assert not year.is_partition
+    year.set_partition(True)
+    assert year.is_partition
+    assert year["field:partition"] == "true"
+    assert year.field["partition"] == "true"
+    year.set_partition(False)
+    assert not year.is_partition
+    assert year == Field("year", "int32", nullable=False)
+
+    with pytest.raises(TypeError):
+        year.set_partition(1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="struct root"):
+        year.only_partition_fields()
+    with pytest.raises(ValueError, match="struct root"):
+        year.without_partition_fields()
+
+
+def test_with_partition_fields_reports_a_column_the_root_does_not_have() -> None:
+    root = Field(
+        "row",
+        DataType.from_fields([Field("year", "int32", nullable=False)]),
+        nullable=False,
+    )
+
+    with pytest.raises(ValueError, match=r'a column of "row" to partition on'):
+        root.with_partition_fields(["year", "missing"])
+    assert not root.has_partition_fields
+    with pytest.raises(TypeError):
+        # A bare string is a column name spelled as an iterable of letters,
+        # which the boundary refuses rather than partitioning on "y".
+        root.with_partition_fields("year")
+
+
 def test_typed_int32_field_id_is_canonical_atomic_and_arrow_compatible() -> None:
     imported = Field.from_arrow(
         pa.field(

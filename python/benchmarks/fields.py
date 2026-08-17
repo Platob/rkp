@@ -36,6 +36,22 @@ WIDE_DIFF_RIGHT = Field(
         Field(f"right_{index:04d}", "int32") for index in range(1_024)
     ),
 )
+PROTOCOL_FIELD = Field(
+    "price",
+    "float64",
+    nullable=False,
+    metadata={
+        "iceberg:doc": "closing price",
+        "iceberg:field-id": "7",
+        "iceberg:schema-id": "3",
+        "postgres:column": "close",
+        "postgres:type": "numeric(18,6)",
+        "venue": "XPAR",
+    },
+)
+# A view held across reads is the shape a caller who reads several properties
+# of one protocol ends up with; creating one per read is measured separately.
+HELD_PROTOCOL_VIEW = PROTOCOL_FIELD.iceberg
 KNOWN_MIME = "application/json"
 CUSTOM_MIME = "application/vnd.benchmark+json"
 COMPOUND_MEDIA = "text/csv;encodings=application/gzip,application/zstd"
@@ -118,6 +134,38 @@ def _spark_compatibility() -> DataType:
     return DEFAULT_STRUCT.to_scheme_compat("spark")
 
 
+# The protocol cases measure the boundary the live view adds: creating one is a
+# scheme clone plus a reference to the field, and each read then crosses into
+# the core exactly as ``get_property`` does, with the key assembled by the view
+# instead of by the caller.
+def _create_protocol_view() -> object:
+    return PROTOCOL_FIELD.iceberg
+
+
+def _read_through_protocol_view() -> object:
+    return PROTOCOL_FIELD.iceberg["doc"]
+
+
+def _read_through_held_protocol_view() -> object:
+    return HELD_PROTOCOL_VIEW["doc"]
+
+
+def _read_through_get_property() -> object:
+    return PROTOCOL_FIELD.get_property("iceberg", "doc")
+
+
+def _read_through_metadata_key() -> object:
+    return PROTOCOL_FIELD["iceberg:doc"]
+
+
+def _protocol_view_items() -> object:
+    return list(PROTOCOL_FIELD.iceberg.items())
+
+
+def _write_through_protocol_view() -> None:
+    PROTOCOL_FIELD.iceberg["doc"] = "closing price"
+
+
 def _measure(name: str, operation: Callable[[], object], iterations: int) -> None:
     samples = timeit.repeat(operation, number=iterations, repeat=7)
     median = statistics.median(samples)
@@ -158,6 +206,17 @@ def main() -> None:
         _measure("default Python record", _default_python_record, args.iterations)
         _measure("default Arrow scalar", _default_arrow_scalar, args.iterations)
         _measure("Spark compatibility", _spark_compatibility, args.iterations)
+        _measure("protocol view creation", _create_protocol_view, args.iterations)
+        _measure("protocol view read", _read_through_protocol_view, args.iterations)
+        _measure(
+            "protocol held view read",
+            _read_through_held_protocol_view,
+            args.iterations,
+        )
+        _measure("protocol get_property", _read_through_get_property, args.iterations)
+        _measure("protocol metadata key", _read_through_metadata_key, args.iterations)
+        _measure("protocol view items", _protocol_view_items, args.iterations)
+        _measure("protocol view write", _write_through_protocol_view, args.iterations)
         _measure(
             "MIME known parse",
             lambda: MimeType.from_str(KNOWN_MIME),

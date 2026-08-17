@@ -1570,6 +1570,23 @@ Object.defineProperty(Field.prototype, Symbol.iterator, {
   },
 })
 
+// One protocol's properties are a Map keyed by bare names. The native view
+// holds the Field rather than a copy of its metadata, so this loader only adds
+// the two language protocols Node-API cannot spell: the built-in collection
+// inputs `update` accepts, and iteration.
+const { ProtocolMetadata } = binding
+const protocolUpdate = ProtocolMetadata.prototype.update
+ProtocolMetadata.prototype.update = function update(values) {
+  return protocolUpdate.call(this, normalizeMetadata(values))
+}
+
+Object.defineProperty(ProtocolMetadata.prototype, Symbol.iterator, {
+  configurable: true,
+  value: function* propertyEntries() {
+    for (const { key, value } of this.entries()) yield [key, value]
+  },
+})
+
 for (const PathValue of [Uri, Url, Urn]) {
   Object.defineProperty(PathValue.prototype, Symbol.iterator, {
     configurable: true,

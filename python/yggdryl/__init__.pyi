@@ -4,6 +4,7 @@ from ._native import (
     IOBase as IOBase,
     MediaType as MediaType,
     MimeType as MimeType,
+    ProtocolMetadata as ProtocolMetadata,
     RecordOptions as RecordOptions,
     Uri as Uri,
     Url as Url,

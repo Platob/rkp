@@ -405,9 +405,11 @@ the rest of the [`Scheme`](enums.md) vocabulary - and `protocol` takes one that 
 runtime. There is no `https` accessor, because HTTPS shares the canonical `http:` namespace; the view
 for either scheme reports `http` as its prefix.
 
-`set` is the one operation that is not a plain map write: it replaces exactly this protocol's
+Rust's `set` is the one operation that is not a plain map write: it replaces exactly this protocol's
 properties and leaves every other key untouched, which is what a protocol-scoped assignment has to
-mean when one map holds them all.
+mean when one map holds them all. The bindings expose the mapping and `update` but not that
+replacement, for the same reason they expose no whole-metadata `set`: in Python `set` on a mapping
+means one key, and in JavaScript `Map.set` does too.
 
 ## A field can be a partition column
 
@@ -458,7 +460,7 @@ stored partitioned says so on the columns themselves:
     ).with_partition_fields(["year", "venue"])
 
     assert schema.has_partition_fields
-    assert list(schema.partition_field_names()) == ["year", "venue"]
+    assert schema.partition_field_names == ["year", "venue"]
     assert schema.data_type["year"].is_partition
     assert not schema.data_type["price"].is_partition
 

@@ -837,7 +837,11 @@ impl PyField {
 
     fn property_iter(&self, scheme: &str) -> PyResult<PyFieldPropertyIterator> {
         let scheme = CoreScheme::from_str(scheme).map_err(value_error)?;
-        Ok(PyFieldPropertyIterator::new(&self.inner, scheme))
+        Ok(PyFieldPropertyIterator::new(
+            &self.inner,
+            scheme,
+            PropertyIteratorKind::Items,
+        ))
     }
 
     fn clear_properties(&mut self, scheme: &str) -> PyResult<()> {
@@ -845,6 +849,196 @@ impl PyField {
         let scheme = CoreScheme::from_str(scheme).map_err(value_error)?;
         self.inner.clear_properties(&scheme);
         Ok(())
+    }
+
+    /// Returns one protocol's properties as a live view of this field.
+    ///
+    /// The scheme accepts every spelling `get_property` accepts, so `HTTPS`
+    /// selects the one canonical `http:` namespace.
+    fn protocol(slf: Py<Self>, scheme: &str) -> PyResult<PyProtocolMetadata> {
+        let scheme = CoreScheme::from_str(scheme).map_err(value_error)?;
+        Ok(PyProtocolMetadata::new(slf, scheme))
+    }
+
+    /// Returns the live HTTP and HTTPS property view.
+    #[getter]
+    fn http(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::HTTP)
+    }
+
+    /// Returns the live file protocol property view.
+    #[getter]
+    fn file(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::FILE)
+    }
+
+    /// Returns the live uniform resource name property view.
+    #[getter]
+    fn urn(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::URN)
+    }
+
+    /// Returns the live short-spelling `PostgreSQL` property view.
+    #[getter]
+    fn postgres(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::POSTGRES)
+    }
+
+    /// Returns the live long-spelling `PostgreSQL` property view.
+    #[getter]
+    fn postgresql(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::POSTGRESQL)
+    }
+
+    /// Returns the live `MySQL` property view.
+    #[getter]
+    fn mysql(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::MYSQL)
+    }
+
+    /// Returns the live Arrow property view.
+    #[getter]
+    fn arrow(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::ARROW)
+    }
+
+    /// Returns the live generic SQL property view.
+    #[getter]
+    fn sql(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::SQL)
+    }
+
+    /// Returns the live AWS Glue property view.
+    #[getter]
+    fn glue(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::GLUE)
+    }
+
+    /// Returns the live Apache Iceberg property view.
+    #[getter]
+    fn iceberg(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::ICEBERG)
+    }
+
+    /// Returns the live Financial Information eXchange property view.
+    #[getter]
+    fn fix(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::FIX)
+    }
+
+    /// Returns the live Yggdryl field property view.
+    #[getter]
+    fn field(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::FIELD)
+    }
+
+    /// Returns the live Yggdryl datatype property view.
+    #[getter]
+    fn dtype(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::DTYPE)
+    }
+
+    /// Returns the live Amazon S3 property view.
+    #[getter]
+    fn s3(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::S3)
+    }
+
+    /// Returns the live Google Cloud Storage property view.
+    #[getter]
+    fn gs(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::GS)
+    }
+
+    /// Returns the live Azure Blob Storage property view.
+    #[getter]
+    fn az(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::AZ)
+    }
+
+    /// Returns the live Apache Spark property view.
+    #[getter]
+    fn spark(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::SPARK)
+    }
+
+    /// Returns the live Polars property view.
+    #[getter]
+    fn polars(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::POLARS)
+    }
+
+    /// Returns the live pandas property view.
+    #[getter]
+    fn pandas(slf: Py<Self>) -> PyProtocolMetadata {
+        PyProtocolMetadata::new(slf, CoreScheme::PANDAS)
+    }
+
+    /// Returns whether this field carries the values a path spells out.
+    #[getter]
+    fn is_partition(&self) -> bool {
+        self.inner.is_partition()
+    }
+
+    /// Marks or unmarks this field as one a path spells out.
+    fn set_partition(&mut self, partition: bool) -> PyResult<()> {
+        self.require_mutable()?;
+        self.inner.set_partition(partition);
+        Ok(())
+    }
+
+    /// Returns the struct children that partition the rows.
+    #[getter]
+    fn partition_fields(&self) -> Vec<Self> {
+        self.inner
+            .partition_fields()
+            .cloned()
+            .map(Self::from_inner)
+            .collect()
+    }
+
+    /// Returns the names of the struct children that partition the rows.
+    #[getter]
+    fn partition_field_names(&self) -> Vec<&str> {
+        self.inner.partition_field_names().collect()
+    }
+
+    /// Returns how many struct children partition the rows.
+    #[getter]
+    fn partition_field_len(&self) -> usize {
+        self.inner.partition_field_len()
+    }
+
+    /// Returns whether any struct child partitions the rows.
+    #[getter]
+    fn has_partition_fields(&self) -> bool {
+        self.inner.has_partition_fields()
+    }
+
+    /// Returns this struct root holding only the columns a path spells out.
+    fn only_partition_fields(&self) -> PyResult<Self> {
+        self.inner
+            .only_partition_fields()
+            .map(Self::from_inner)
+            .map_err(value_error)
+    }
+
+    /// Returns this struct root without the columns a path spells out.
+    fn without_partition_fields(&self) -> PyResult<Self> {
+        self.inner
+            .without_partition_fields()
+            .map(Self::from_inner)
+            .map_err(value_error)
+    }
+
+    /// Returns this struct root with the named children marked as partitions.
+    fn with_partition_fields(&self, names: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let names = names.extract::<Vec<String>>()?;
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.inner
+            .with_partition_fields(&names)
+            .map(Self::from_inner)
+            .map_err(value_error)
     }
 
     fn __len__(&self) -> usize {
@@ -997,9 +1191,217 @@ impl PyField {
     }
 }
 
+/// One protocol's field properties, addressed by their bare names.
+///
+/// The value is a live view rather than a snapshot: it holds the Python
+/// `Field` object and reaches the core through it on every call. A write
+/// through the view is therefore visible on the field, a write on the field is
+/// visible through the view, and two views of one field see each other's
+/// writes. Every mutation goes through the field's own frozen-schema gate.
+#[pyclass(name = "ProtocolMetadata", module = "yggdryl._native")]
+pub(crate) struct PyProtocolMetadata {
+    field: Py<PyField>,
+    scheme: CoreScheme,
+}
+
+impl PyProtocolMetadata {
+    fn new(field: Py<PyField>, scheme: CoreScheme) -> Self {
+        Self { field, scheme }
+    }
+
+    /// Borrows the viewed field for reading.
+    fn borrow_field<'py>(&self, py: Python<'py>) -> PyResult<PyRef<'py, PyField>> {
+        Ok(self.field.bind(py).try_borrow()?)
+    }
+
+    /// Borrows the viewed field for writing, refusing a frozen one.
+    fn borrow_field_mut<'py>(&self, py: Python<'py>) -> PyResult<PyRefMut<'py, PyField>> {
+        let field = self.field.bind(py).try_borrow_mut()?;
+        field.require_mutable()?;
+        Ok(field)
+    }
+}
+
+#[pymethods]
+impl PyProtocolMetadata {
+    // A view of mutable metadata cannot promise a stable hash, so it is
+    // unhashable for the same reason an explicitly mutated MediaType is.
+    #[classattr]
+    const __hash__: Option<Py<PyAny>> = None;
+
+    /// Returns the protocol this view remembers.
+    #[getter]
+    fn scheme(&self) -> &str {
+        self.scheme.as_str()
+    }
+
+    /// Returns the canonical key prefix this view applies.
+    #[getter]
+    fn prefix(&self, py: Python<'_>) -> PyResult<String> {
+        let field = self.borrow_field(py)?;
+        Ok(field.inner.protocol(&self.scheme).prefix().to_owned())
+    }
+
+    /// Returns the full metadata key one property name is stored under.
+    fn key(&self, py: Python<'_>, name: &str) -> PyResult<String> {
+        let field = self.borrow_field(py)?;
+        Ok(field.inner.protocol(&self.scheme).key(name))
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        let field = self.borrow_field(py)?;
+        Ok(field.inner.protocol(&self.scheme).len())
+    }
+
+    /// Answers emptiness without counting the properties `len` would count.
+    fn __bool__(&self, py: Python<'_>) -> PyResult<bool> {
+        let field = self.borrow_field(py)?;
+        Ok(!field.inner.protocol(&self.scheme).is_empty())
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyFieldPropertyIterator> {
+        self.keys(py)
+    }
+
+    fn __contains__(&self, py: Python<'_>, name: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let Ok(name) = name.extract::<&str>() else {
+            return Ok(false);
+        };
+        let field = self.borrow_field(py)?;
+        Ok(field.inner.protocol(&self.scheme).contains_key(name))
+    }
+
+    fn __getitem__(&self, py: Python<'_>, name: &str) -> PyResult<String> {
+        let field = self.borrow_field(py)?;
+        let protocol = field.inner.protocol(&self.scheme);
+        protocol
+            .get(name)
+            .map(str::to_owned)
+            // The core names a missing property by the key it is stored under,
+            // which is also the key a caller reads on the field itself.
+            .ok_or_else(|| PyKeyError::new_err(protocol.key(name)))
+    }
+
+    fn __setitem__(&self, py: Python<'_>, name: &str, value: String) -> PyResult<()> {
+        let mut field = self.borrow_field_mut(py)?;
+        field
+            .inner
+            .protocol_mut(&self.scheme)
+            .insert(name, value)
+            .map(|_| ())
+            .map_err(value_error)
+    }
+
+    fn __delitem__(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        let mut field = self.borrow_field_mut(py)?;
+        let mut protocol = field.inner.protocol_mut(&self.scheme);
+        let key = protocol.key(name);
+        protocol
+            .remove(name)
+            .map(|_| ())
+            .ok_or_else(|| PyKeyError::new_err(key))
+    }
+
+    #[pyo3(signature = (name, default=None, /))]
+    fn get(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        let field = self.borrow_field(py)?;
+        Ok(field.inner.protocol(&self.scheme).get(name).map_or_else(
+            || default.unwrap_or_else(|| py.None()),
+            |value| PyString::new(py, value).into_any().unbind(),
+        ))
+    }
+
+    fn keys(&self, py: Python<'_>) -> PyResult<PyFieldPropertyIterator> {
+        let field = self.borrow_field(py)?;
+        Ok(PyFieldPropertyIterator::new(
+            &field.inner,
+            self.scheme.clone(),
+            PropertyIteratorKind::Names,
+        ))
+    }
+
+    fn values(&self, py: Python<'_>) -> PyResult<PyFieldPropertyIterator> {
+        let field = self.borrow_field(py)?;
+        Ok(PyFieldPropertyIterator::new(
+            &field.inner,
+            self.scheme.clone(),
+            PropertyIteratorKind::Values,
+        ))
+    }
+
+    fn items(&self, py: Python<'_>) -> PyResult<PyFieldPropertyIterator> {
+        let field = self.borrow_field(py)?;
+        Ok(PyFieldPropertyIterator::new(
+            &field.inner,
+            self.scheme.clone(),
+            PropertyIteratorKind::Items,
+        ))
+    }
+
+    #[pyo3(signature = (values=None, /, **kwargs))]
+    fn update(
+        &self,
+        py: Python<'_>,
+        values: Option<&Bound<'_, PyAny>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        // Collect before borrowing: the overlay may itself be a view of this
+        // same field, and the core validates the whole overlay atomically.
+        let mut pairs = BTreeMap::new();
+        if let Some(values) = values {
+            extend_metadata_pairs(values, &mut pairs)?;
+        }
+        if let Some(kwargs) = kwargs {
+            for (key, value) in kwargs.iter() {
+                pairs.insert(key.extract()?, value.extract()?);
+            }
+        }
+        let mut field = self.borrow_field_mut(py)?;
+        field
+            .inner
+            .protocol_mut(&self.scheme)
+            .update(pairs)
+            .map_err(value_error)
+    }
+
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
+        let mut field = self.borrow_field_mut(py)?;
+        field.inner.protocol_mut(&self.scheme).clear();
+        Ok(())
+    }
+
+    fn __str__(&self, py: Python<'_>) -> PyResult<String> {
+        let field = self.borrow_field(py)?;
+        Ok(field.inner.protocol(&self.scheme).to_string())
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let field = self.borrow_field(py)?;
+        Ok(format!("{:?}", field.inner.protocol(&self.scheme)))
+    }
+
+    /// Compares the properties two views hold, not the fields behind them.
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let Ok(other) = other.extract::<PyRef<'_, Self>>() else {
+            return Ok(py.NotImplemented());
+        };
+        let left = self.borrow_field(py)?;
+        let right = other.borrow_field(py)?;
+        let equal = left.inner.protocol(&self.scheme) == right.inner.protocol(&other.scheme);
+        Ok(PyBool::new(py, equal).to_owned().into_any().unbind())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MetadataIteratorKind {
     Keys,
+    Values,
+    Items,
+}
+
+#[derive(Clone, Copy)]
+enum PropertyIteratorKind {
+    Names,
     Values,
     Items,
 }
@@ -1020,16 +1422,18 @@ pub(crate) struct PyFieldPropertyIterator {
     scheme: CoreScheme,
     after_name: Option<String>,
     remaining: usize,
+    kind: PropertyIteratorKind,
 }
 
 impl PyFieldPropertyIterator {
-    fn new(field: &CoreField, scheme: CoreScheme) -> Self {
+    fn new(field: &CoreField, scheme: CoreScheme, kind: PropertyIteratorKind) -> Self {
         let remaining = field.property_iter(&scheme).count();
         Self {
             inner: field.clone(),
             scheme,
             after_name: None,
             remaining,
+            kind,
         }
     }
 }
@@ -1049,10 +1453,14 @@ impl PyFieldPropertyIterator {
             return Ok(None);
         };
         let name = name.to_owned();
-        let output = (name.as_str(), value)
-            .into_pyobject(py)?
-            .into_any()
-            .unbind();
+        let output = match self.kind {
+            PropertyIteratorKind::Names => PyString::new(py, &name).into_any().unbind(),
+            PropertyIteratorKind::Values => PyString::new(py, value).into_any().unbind(),
+            PropertyIteratorKind::Items => (name.as_str(), value)
+                .into_pyobject(py)?
+                .into_any()
+                .unbind(),
+        };
         self.after_name = Some(name);
         self.remaining = self.remaining.saturating_sub(1);
         Ok(Some(output))

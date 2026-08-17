@@ -219,8 +219,56 @@ del field["venue"]
 assert "venue" not in field
 ```
 
-Typed identifiers and protocol properties (`id`, `alias`, `content_type`, `etag`, and the rest) are
+Typed identifiers and typed HTTP values (`id`, `alias`, `content_type`, `etag`, and the rest) are
 attributes rather than map keys, because they are validated.
+
+One protocol's properties are a mapping of their own, and it is a live view of the same field rather
+than a copy of part of it.
+
+```python
+from yggdryl import Field
+
+field = Field("price", "int64", nullable=False)
+field.iceberg["doc"] = "closing price"
+field.postgres.update({"type": "numeric"})
+
+assert field.iceberg["doc"] == "closing price"
+assert dict(field.postgres.items()) == {"type": "numeric"}
+assert len(field.iceberg) == 1
+assert "doc" not in field.postgres
+
+# The bare name is all the view needs; the full key is what the field stores.
+assert field.iceberg.key("doc") == "iceberg:doc"
+assert field["iceberg:doc"] == "closing price"
+assert len(field) == 2
+
+del field.iceberg["doc"]
+assert not field.iceberg
+```
+
+Every well-known protocol is an attribute - `iceberg`, `postgres`, `http`, `arrow`, `spark`, `s3`,
+and the rest - and `field.protocol(name)` takes one that is only known at runtime. There is no
+`https` attribute, because HTTPS shares the canonical `http:` namespace.
+
+A schema also says which of its columns a path spells out, which is what a partitioned write and an
+Iceberg spec both read.
+
+```python
+from yggdryl import DataType, Field
+
+schema = Field(
+    "row",
+    DataType.from_fields([
+        Field("year", "int32", nullable=False),
+        Field("price", "int64", nullable=False),
+    ]),
+    nullable=False,
+).with_partition_fields(["year"])
+
+assert schema.partition_field_names == ["year"]
+assert schema.data_type["year"].is_partition
+assert len(schema.without_partition_fields().data_type) == 1
+```
 
 ## Records
 

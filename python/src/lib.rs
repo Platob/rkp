@@ -14,7 +14,7 @@ use crate::codec::{
     codec_encode_writer, codec_infer, codec_infer_path, codec_infer_text, codec_normalize_format,
 };
 use crate::datatype::{PyDataType, PyDataTypeIterator};
-use crate::field::{PyField, PyFieldMetadataIterator, PyFieldPropertyIterator};
+use crate::field::{PyField, PyFieldMetadataIterator, PyFieldPropertyIterator, PyProtocolMetadata};
 use crate::media::{PyMediaType, PyMediaTypeIterator, PyMimeType};
 use crate::uri::{PyUri, PyUriPathIterator, PyUrl, PyUrn};
 
@@ -104,6 +104,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyDataTypeIterator>()?;
     module.add_class::<PyFieldMetadataIterator>()?;
     module.add_class::<PyFieldPropertyIterator>()?;
+    module.add_class::<PyProtocolMetadata>()?;
     module.add_class::<PyDifferenceIterator>()?;
     module.add_class::<PyMimeType>()?;
     module.add_class::<PyMediaType>()?;

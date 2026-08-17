@@ -321,6 +321,71 @@ export declare class Field {
   propertyIter(scheme: string): Array<MetadataEntry>
   /** Remove every property for one protocol without affecting shared keys. */
   clearProperties(scheme: string): void
+  /**
+   * Return a live view of one protocol's properties on this field.
+   *
+   * The scheme accepts every spelling `getProperty` does, and the view keeps
+   * reading and writing this same field.
+   */
+  protocol(scheme: string): JsProtocolMetadata
+  /** The live HTTP and HTTPS representation property view. */
+  get http(): JsProtocolMetadata
+  /** The live file protocol property view. */
+  get file(): JsProtocolMetadata
+  /** The live uniform resource name property view. */
+  get urn(): JsProtocolMetadata
+  /** The live short-spelling `PostgreSQL` property view. */
+  get postgres(): JsProtocolMetadata
+  /** The live long-spelling `PostgreSQL` property view. */
+  get postgresql(): JsProtocolMetadata
+  /** The live `MySQL` property view. */
+  get mysql(): JsProtocolMetadata
+  /** The live Arrow property view. */
+  get arrow(): JsProtocolMetadata
+  /** The live generic SQL property view. */
+  get sql(): JsProtocolMetadata
+  /** The live AWS Glue property view. */
+  get glue(): JsProtocolMetadata
+  /** The live Apache Iceberg property view. */
+  get iceberg(): JsProtocolMetadata
+  /** The live Financial Information eXchange property view. */
+  get fix(): JsProtocolMetadata
+  /** The live Yggdryl field property view. */
+  get field(): JsProtocolMetadata
+  /** The live Yggdryl datatype property view. */
+  get dtype(): JsProtocolMetadata
+  /** The live Amazon S3 property view. */
+  get s3(): JsProtocolMetadata
+  /** The live Google Cloud Storage property view. */
+  get gs(): JsProtocolMetadata
+  /** The live Azure Blob Storage property view. */
+  get az(): JsProtocolMetadata
+  /** The live Apache Spark property view. */
+  get spark(): JsProtocolMetadata
+  /** The live Polars property view. */
+  get polars(): JsProtocolMetadata
+  /** The live pandas property view. */
+  get pandas(): JsProtocolMetadata
+  /** Whether this field carries the values a path spells out. */
+  get isPartition(): boolean
+  /** Mark or unmark this field as one a path spells out. */
+  setPartition(partition: boolean): void
+  /** Return a copy of this field with the partition marker set. */
+  withPartition(partition: boolean): Field
+  /** The struct children that partition the rows, in declaration order. */
+  partitionFields(): Array<Field>
+  /** The names of the struct children that partition the rows. */
+  partitionFieldNames(): Array<string>
+  /** Number of struct children that partition the rows. */
+  get partitionFieldLen(): number
+  /** Whether any struct child partitions the rows. */
+  get hasPartitionFields(): boolean
+  /** Return this struct root holding only the columns a path spells out. */
+  onlyPartitionFields(): Field
+  /** Return this struct root without the columns a path spells out. */
+  withoutPartitionFields(): Field
+  /** Return this struct root with the named children marked as partitions. */
+  withPartitionFields(names: Array<string>): Field
   /** Read one metadata value without materializing the metadata collection. */
   get(key: string): string | null
   /** Insert or replace one metadata value through the native Field API. */
@@ -693,6 +758,48 @@ export declare class PartitionSpec {
   isUnpartitioned(): boolean
 }
 export type JsPartitionSpec = PartitionSpec
+
+/**
+ * One protocol's properties on a field, read and written by bare name.
+ *
+ * The view is live: it holds the `Field` it was taken from and answers every
+ * call through it, so a write through the view is visible on the field and a
+ * write on the field is visible through the view. Nothing is snapshotted, and
+ * the `scheme:` prefix is applied once, by the view.
+ */
+export declare class ProtocolMetadata {
+  /** The protocol this view remembers, in its canonical lowercase spelling. */
+  get scheme(): string
+  /** The canonical key prefix this view applies. */
+  get prefix(): string
+  /** The full metadata key one bare property name is stored under. */
+  key(name: string): string
+  /** Number of properties this protocol holds. */
+  get size(): number
+  /** Read one property value by its bare name. */
+  get(name: string): string | null
+  /** Test whether one property exists. */
+  has(name: string): boolean
+  /** Insert or replace one property through the live field. */
+  set(name: string, value: string): void
+  /** Remove one property and report whether it existed. */
+  delete(name: string): boolean
+  /** Bare property names in deterministic lexical order. */
+  keys(): Array<string>
+  /** Property values in deterministic lexical-name order. */
+  values(): Array<string>
+  /** Bare name/value entries in deterministic lexical order. */
+  entries(): Array<MetadataEntry>
+  /** Overlay several properties atomically, keeping the ones not named. */
+  update(values: Array<MetadataEntry> | Record<string, string>): void
+  /** Remove every property of this protocol, leaving shared keys alone. */
+  clear(): void
+  /** Render this protocol's bare names as the native JSON object text. */
+  toString(): string
+  /** Serialize this protocol's bare names as a JSON object. */
+  toJSON(): any
+}
+export type JsProtocolMetadata = ProtocolMetadata
 
 /** The settings one record read or write takes. */
 export declare class RecordOptions {

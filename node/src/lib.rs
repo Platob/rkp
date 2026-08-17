@@ -41,7 +41,7 @@ pub use codec::{
     yaml_loads_all_native, yaml_loads_native,
 };
 pub use datatype::JsDataType;
-pub use field::{JsField, MetadataEntry};
+pub use field::{JsField, JsProtocolMetadata, MetadataEntry};
 pub use generic::JsRecordOptions;
 pub use iceberg::{
     FieldBound, FieldCount, JsDataFile, JsPartitionSpec, JsTable, ManifestFileView,

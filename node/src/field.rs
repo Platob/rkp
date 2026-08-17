@@ -2,10 +2,12 @@
 
 use std::collections::HashMap;
 
-use napi::bindgen_prelude::{BigInt, ClassInstance, Either, Either4, Env, Error, Result, Unknown};
+use napi::bindgen_prelude::{
+    BigInt, ClassInstance, Either, Either4, Env, Error, Reference, Result, Unknown,
+};
 use napi_derive::napi;
 use yggdryl::arrow::DefaultArrowScalar;
-use yggdryl::{Field as CoreField, Scheme as CoreScheme};
+use yggdryl::{Field as CoreField, ProtocolMetadata as CoreProtocolMetadata, Scheme as CoreScheme};
 
 use crate::{
     JsDifferenceIterator,
@@ -808,6 +810,211 @@ impl JsField {
         Ok(())
     }
 
+    /// Return a live view of one protocol's properties on this field.
+    ///
+    /// The scheme accepts every spelling `getProperty` does, and the view keeps
+    /// reading and writing this same field.
+    #[napi]
+    pub fn protocol(
+        &self,
+        reference: Reference<JsField>,
+        scheme: String,
+    ) -> Result<JsProtocolMetadata> {
+        let scheme = CoreScheme::from_str(&scheme).map_err(napi_error)?;
+        Ok(JsProtocolMetadata::new(reference, scheme))
+    }
+
+    /// The live HTTP and HTTPS representation property view.
+    #[napi(getter)]
+    pub fn http(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::HTTP)
+    }
+
+    /// The live file protocol property view.
+    #[napi(getter)]
+    pub fn file(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::FILE)
+    }
+
+    /// The live uniform resource name property view.
+    #[napi(getter)]
+    pub fn urn(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::URN)
+    }
+
+    /// The live short-spelling `PostgreSQL` property view.
+    #[napi(getter)]
+    pub fn postgres(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::POSTGRES)
+    }
+
+    /// The live long-spelling `PostgreSQL` property view.
+    #[napi(getter)]
+    pub fn postgresql(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::POSTGRESQL)
+    }
+
+    /// The live `MySQL` property view.
+    #[napi(getter)]
+    pub fn mysql(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::MYSQL)
+    }
+
+    /// The live Arrow property view.
+    #[napi(getter)]
+    pub fn arrow(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::ARROW)
+    }
+
+    /// The live generic SQL property view.
+    #[napi(getter)]
+    pub fn sql(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::SQL)
+    }
+
+    /// The live AWS Glue property view.
+    #[napi(getter)]
+    pub fn glue(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::GLUE)
+    }
+
+    /// The live Apache Iceberg property view.
+    #[napi(getter)]
+    pub fn iceberg(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::ICEBERG)
+    }
+
+    /// The live Financial Information eXchange property view.
+    #[napi(getter)]
+    pub fn fix(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::FIX)
+    }
+
+    /// The live Yggdryl field property view.
+    #[napi(getter)]
+    pub fn field(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::FIELD)
+    }
+
+    /// The live Yggdryl datatype property view.
+    #[napi(getter)]
+    pub fn dtype(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::DTYPE)
+    }
+
+    /// The live Amazon S3 property view.
+    #[napi(getter)]
+    pub fn s3(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::S3)
+    }
+
+    /// The live Google Cloud Storage property view.
+    #[napi(getter)]
+    pub fn gs(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::GS)
+    }
+
+    /// The live Azure Blob Storage property view.
+    #[napi(getter)]
+    pub fn az(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::AZ)
+    }
+
+    /// The live Apache Spark property view.
+    #[napi(getter)]
+    pub fn spark(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::SPARK)
+    }
+
+    /// The live Polars property view.
+    #[napi(getter)]
+    pub fn polars(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::POLARS)
+    }
+
+    /// The live pandas property view.
+    #[napi(getter)]
+    pub fn pandas(&self, reference: Reference<JsField>) -> JsProtocolMetadata {
+        JsProtocolMetadata::new(reference, CoreScheme::PANDAS)
+    }
+
+    /// Whether this field carries the values a path spells out.
+    #[napi(getter)]
+    pub fn is_partition(&self) -> bool {
+        self.inner.is_partition()
+    }
+
+    /// Mark or unmark this field as one a path spells out.
+    #[napi]
+    pub fn set_partition(&mut self, partition: bool) {
+        self.inner.set_partition(partition);
+    }
+
+    /// Return a copy of this field with the partition marker set.
+    #[napi]
+    pub fn with_partition(&self, partition: bool) -> Self {
+        Self::from_core(self.inner.clone().with_partition(partition))
+    }
+
+    /// The struct children that partition the rows, in declaration order.
+    #[napi]
+    pub fn partition_fields(&self) -> Vec<JsField> {
+        self.inner
+            .partition_fields()
+            .cloned()
+            .map(Self::from_core)
+            .collect()
+    }
+
+    /// The names of the struct children that partition the rows.
+    #[napi]
+    pub fn partition_field_names(&self) -> Vec<String> {
+        self.inner
+            .partition_field_names()
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    /// Number of struct children that partition the rows.
+    #[napi(getter)]
+    pub fn partition_field_len(&self) -> u32 {
+        u32::try_from(self.inner.partition_field_len()).unwrap_or(u32::MAX)
+    }
+
+    /// Whether any struct child partitions the rows.
+    #[napi(getter)]
+    pub fn has_partition_fields(&self) -> bool {
+        self.inner.has_partition_fields()
+    }
+
+    /// Return this struct root holding only the columns a path spells out.
+    #[napi]
+    pub fn only_partition_fields(&self) -> Result<Self> {
+        self.inner
+            .only_partition_fields()
+            .map(Self::from_core)
+            .map_err(napi_error)
+    }
+
+    /// Return this struct root without the columns a path spells out.
+    #[napi]
+    pub fn without_partition_fields(&self) -> Result<Self> {
+        self.inner
+            .without_partition_fields()
+            .map(Self::from_core)
+            .map_err(napi_error)
+    }
+
+    /// Return this struct root with the named children marked as partitions.
+    #[napi]
+    pub fn with_partition_fields(&self, names: Vec<String>) -> Result<Self> {
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.inner
+            .with_partition_fields(&names)
+            .map(Self::from_core)
+            .map_err(napi_error)
+    }
+
     /// Read one metadata value without materializing the metadata collection.
     #[napi]
     pub fn get(&self, key: String) -> Option<String> {
@@ -986,5 +1193,154 @@ impl JsField {
     #[napi(js_name = "toJSON")]
     pub fn to_json(&self) -> Result<serde_json::Value> {
         serde_json::to_value(&self.inner).map_err(napi_error)
+    }
+}
+
+/// One protocol's properties on a field, read and written by bare name.
+///
+/// The view is live: it holds the `Field` it was taken from and answers every
+/// call through it, so a write through the view is visible on the field and a
+/// write on the field is visible through the view. Nothing is snapshotted, and
+/// the `scheme:` prefix is applied once, by the view.
+#[napi(js_name = "ProtocolMetadata")]
+pub struct JsProtocolMetadata {
+    field: Reference<JsField>,
+    scheme: CoreScheme,
+}
+
+impl JsProtocolMetadata {
+    fn new(field: Reference<JsField>, scheme: CoreScheme) -> Self {
+        Self { field, scheme }
+    }
+
+    /// Borrow the core read view, which reads the live field's metadata.
+    fn view(&self) -> CoreProtocolMetadata<'_> {
+        self.field.inner.protocol(&self.scheme)
+    }
+}
+
+#[napi]
+impl JsProtocolMetadata {
+    /// The protocol this view remembers, in its canonical lowercase spelling.
+    #[napi(getter)]
+    pub fn scheme(&self) -> String {
+        self.scheme.as_str().to_owned()
+    }
+
+    /// The canonical key prefix this view applies.
+    #[napi(getter)]
+    pub fn prefix(&self) -> String {
+        self.view().prefix().to_owned()
+    }
+
+    /// The full metadata key one bare property name is stored under.
+    #[napi]
+    pub fn key(&self, name: String) -> String {
+        self.view().key(&name)
+    }
+
+    /// Number of properties this protocol holds.
+    #[napi(getter, js_name = "size")]
+    pub fn property_len(&self) -> u32 {
+        u32::try_from(self.view().len()).unwrap_or(u32::MAX)
+    }
+
+    /// Read one property value by its bare name.
+    #[napi]
+    pub fn get(&self, name: String) -> Option<String> {
+        self.view().get(&name).map(ToOwned::to_owned)
+    }
+
+    /// Test whether one property exists.
+    #[napi]
+    pub fn has(&self, name: String) -> bool {
+        self.view().contains_key(&name)
+    }
+
+    /// Insert or replace one property through the live field.
+    #[napi]
+    pub fn set(&mut self, name: String, value: String) -> Result<()> {
+        self.field
+            .inner
+            .protocol_mut(&self.scheme)
+            .insert(&name, value)
+            .map(|_| ())
+            .map_err(napi_error)
+    }
+
+    /// Remove one property and report whether it existed.
+    #[napi]
+    pub fn delete(&mut self, name: String) -> bool {
+        self.field
+            .inner
+            .protocol_mut(&self.scheme)
+            .remove(&name)
+            .is_some()
+    }
+
+    /// Bare property names in deterministic lexical order.
+    #[napi]
+    pub fn keys(&self) -> Vec<String> {
+        self.view()
+            .iter()
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    }
+
+    /// Property values in deterministic lexical-name order.
+    #[napi]
+    pub fn values(&self) -> Vec<String> {
+        self.view()
+            .iter()
+            .map(|(_, value)| value.to_owned())
+            .collect()
+    }
+
+    /// Bare name/value entries in deterministic lexical order.
+    #[napi]
+    pub fn entries(&self) -> Vec<MetadataEntry> {
+        self.view()
+            .iter()
+            .map(|(name, value)| MetadataEntry {
+                key: name.to_owned(),
+                value: value.to_owned(),
+            })
+            .collect()
+    }
+
+    /// Overlay several properties atomically, keeping the ones not named.
+    #[napi]
+    pub fn update(
+        &mut self,
+        values: Either<Vec<MetadataEntry>, HashMap<String, String>>,
+    ) -> Result<()> {
+        self.field
+            .inner
+            .protocol_mut(&self.scheme)
+            .update(metadata_pairs(values))
+            .map_err(napi_error)
+    }
+
+    /// Remove every property of this protocol, leaving shared keys alone.
+    #[napi]
+    pub fn clear(&mut self) {
+        self.field.inner.protocol_mut(&self.scheme).clear();
+    }
+
+    /// Render this protocol's bare names as the native JSON object text.
+    #[napi]
+    pub fn to_string(&self) -> String {
+        self.view().to_string()
+    }
+
+    /// Serialize this protocol's bare names as a JSON object.
+    #[napi(js_name = "toJSON")]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.view()
+                .iter()
+                .map(|(name, value)| (name.to_owned(), serde_json::Value::String(value.to_owned())))
+                .collect(),
+        )
     }
 }

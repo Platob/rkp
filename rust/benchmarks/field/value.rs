@@ -81,6 +81,52 @@ pub fn benchmarks(criterion: &mut Criterion) {
             }
         });
     });
+    group.bench_function("protocol_view_hit", |bencher| {
+        bencher.iter(|| {
+            black_box(&property_field)
+                .postgres()
+                .get(black_box("table"))
+        });
+    });
+    group.bench_function("protocol_view_hit_wide", |bencher| {
+        bencher.iter(|| {
+            black_box(&wide_property_field)
+                .postgres()
+                .get(black_box("table"))
+        });
+    });
+    group.bench_function("protocol_view_len_1024", |bencher| {
+        bencher.iter(|| black_box(&protocol_properties).postgres().len());
+    });
+    let partitioned = Field::new(
+        "row",
+        DataType::from_fields((0..64).map(|index| {
+            let column = DataType::Int64.required_field(format!("column-{index:02}"));
+            if index % 8 == 0 {
+                column.with_partition(true)
+            } else {
+                column
+            }
+        }))
+        .expect("the generated columns are unique"),
+        false,
+    );
+    group.bench_function("partition_field_names_64", |bencher| {
+        bencher.iter(|| {
+            black_box(&partitioned)
+                .partition_field_names()
+                .for_each(|name| {
+                    black_box(name);
+                });
+        });
+    });
+    group.bench_function("without_partition_fields_64", |bencher| {
+        bencher.iter(|| {
+            black_box(&partitioned)
+                .without_partition_fields()
+                .expect("the generated root subtracts its marked columns")
+        });
+    });
     group.bench_function("typed_location", |bencher| {
         bencher.iter(|| {
             black_box(&property_field)

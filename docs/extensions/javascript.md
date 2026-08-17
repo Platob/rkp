@@ -232,8 +232,58 @@ field.delete('venue')
 assert.ok(!field.has('venue'))
 ```
 
-Typed identifiers and protocol properties (`dictionaryId`, `contentType`, `etag`, and the rest) are
+Typed identifiers and typed HTTP values (`dictionaryId`, `contentType`, `etag`, and the rest) are
 accessors rather than map keys, because they are validated.
+
+One protocol's properties are a `Map` of their own, and it is a live view of the same field rather
+than a copy of part of it.
+
+```javascript
+const { Field } = require('@yggdryl/node')
+const assert = require('node:assert/strict')
+
+const field = new Field('price', 'int64', false)
+field.iceberg.set('doc', 'closing price')
+field.postgres.update({ type: 'numeric' })
+
+assert.equal(field.iceberg.get('doc'), 'closing price')
+assert.deepEqual([...field.postgres], [['type', 'numeric']])
+assert.equal(field.iceberg.size, 1)
+assert.equal(field.postgres.has('doc'), false)
+
+// The bare name is all the view needs; the full key is what the field stores.
+assert.equal(field.iceberg.key('doc'), 'iceberg:doc')
+assert.equal(field.get('iceberg:doc'), 'closing price')
+assert.equal(field.size, 2)
+
+assert.equal(field.iceberg.delete('doc'), true)
+assert.equal(field.iceberg.size, 0)
+```
+
+Every well-known protocol is a getter - `iceberg`, `postgres`, `http`, `arrow`, `spark`, `s3`, and
+the rest - and `field.protocol(name)` takes one that is only known at runtime. There is no `https`
+getter, because HTTPS shares the canonical `http:` namespace.
+
+A schema also says which of its columns a path spells out, which is what a partitioned write and an
+Iceberg spec both read.
+
+```javascript
+const { DataType, Field } = require('@yggdryl/node')
+const assert = require('node:assert/strict')
+
+const schema = new Field(
+  'row',
+  DataType.fromFields([
+    new Field('year', 'int32', false),
+    new Field('price', 'int64', false),
+  ]),
+  false,
+).withPartitionFields(['year'])
+
+assert.deepEqual(schema.partitionFieldNames(), ['year'])
+assert.equal(schema.dataType.getByName('year').isPartition, true)
+assert.equal(schema.withoutPartitionFields().dataType.length, 1)
+```
 
 ## Arrow
 

@@ -14,6 +14,7 @@ from yggdryl import (
     IOBase,
     MediaType,
     MimeType,
+    ProtocolMetadata,
     Record,
     RecordOptions,
     Uri,
@@ -103,6 +104,9 @@ default_data_type_hint: object = DataType("int32").default_pyhint()
 default_field_hint: object = field.default_pyhint()
 arrow_compatible: DataType = DataType("uint32").to_scheme_compat("arrow")
 spark_compatible: Field = field.to_scheme_compat("spark")
+polars_compatible: Field = field.to_scheme_compat("polars")
+pandas_compatible: Field = field.to_scheme_compat("pandas")
+iceberg_compatible: Field = field.to_scheme_compat("iceberg")
 typed_id: Int32Field = fields.int32("id", nullable=False)
 typed_id_kind: Literal["int32"] = typed_id.data_type.id
 typed_id_value: int | None = typed_id.default_pyvalue()
@@ -162,6 +166,8 @@ hint_is_a_runtime_typing_object: type[int] = (
     typed_id.default_pyhint()  # type: ignore[assignment]
 )
 invalid_time_unit = DataType.time(1)  # type: ignore[arg-type]
+# ``mysql`` is a metadata namespace, not one of the five compatibility targets.
+invalid_compatibility_target = field.to_scheme_compat("mysql")  # type: ignore[arg-type]
 inferred_dictionary: Field = fields.dictionary("labels", int, str)
 inferred_mapping: Field = fields.map_of("counts", str, pa.int32())
 field_differences: list[str] = list(field.show_diffs(typed_id, False))
@@ -185,6 +191,35 @@ alias: str | None = field.alias
 location: Url | None = field.location
 property_value: str | None = field.get_property("postgres", "type")
 properties: list[tuple[str, str]] = list(field.property_iter("postgres"))
+iceberg_properties: ProtocolMetadata = field.iceberg
+postgres_properties: ProtocolMetadata = field.protocol("POSTGRES")
+protocol_scheme: str = iceberg_properties.scheme
+protocol_prefix: str = iceberg_properties.prefix
+protocol_key: str = iceberg_properties.key("doc")
+iceberg_properties["doc"] = "closing price"
+iceberg_properties.update({"schema-id": "3"}, snapshot="9")
+protocol_names: list[str] = list(iceberg_properties)
+protocol_values: list[str] = list(iceberg_properties.values())
+protocol_entries: list[tuple[str, str]] = list(iceberg_properties.items())
+protocol_value: object = iceberg_properties.get("doc")
+protocol_present: bool = "doc" in iceberg_properties
+protocol_len: int = len(iceberg_properties)
+del iceberg_properties["doc"]
+iceberg_properties.clear()
+
+partitioned: Field = Field(
+    "row",
+    DataType.from_fields([fields.int32("year", nullable=False)]),
+    nullable=False,
+).with_partition_fields(["year"])
+partition_children: list[Field] = partitioned.partition_fields
+partition_names: list[str] = partitioned.partition_field_names
+partition_count: int = partitioned.partition_field_len
+partition_present: bool = partitioned.has_partition_fields
+partition_only: Field = partitioned.only_partition_fields()
+partition_rest: Field = partitioned.without_partition_fields()
+partition_marked: bool = partition_children[0].is_partition
+partition_children[0].set_partition(False)
 accept: str | None = field.accept
 content_length: int | None = field.content_length
 content_type: str | None = field.content_type
@@ -203,6 +238,23 @@ assert alias
 assert location
 assert property_value
 assert properties
+assert postgres_properties
+assert protocol_scheme == "iceberg"
+assert protocol_prefix == "iceberg"
+assert protocol_key == "iceberg:doc"
+assert protocol_names == ["doc", "schema-id", "snapshot"]
+assert protocol_values
+assert protocol_entries
+assert protocol_value == "closing price"
+assert protocol_present
+assert protocol_len == 3
+assert partition_children
+assert partition_names == ["year"]
+assert partition_count == 1
+assert partition_present
+assert partition_only
+assert partition_rest
+assert partition_marked
 assert data_type_scalar
 assert field_scalar
 assert default_data_type_scalar

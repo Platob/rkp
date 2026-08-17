@@ -636,7 +636,7 @@ test('compatibility normalization mirrors core Arrow and conservative Spark poli
   )
   assert.throws(
     () => source.toSchemeCompat('postgres'),
-    /expected one of arrow, spark, polars, pandas, got "postgres"/,
+    /expected one of arrow, spark, polars, pandas, iceberg, got "postgres"/,
   )
 })
 
