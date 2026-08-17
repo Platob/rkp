@@ -1507,3 +1507,25 @@ The Rust 1.85 check covers `yggdryl` with its default Arrow runtime and a
 `--no-default-features --lib` build of the explicit runtime opt-out.
 Remove generated targets, the MkDocs `site/`, virtual environments, native
 binaries, caches, and `node_modules` after validation.
+
+## Releases
+
+- `.github/workflows/release.yml` publishes all three surfaces from one `v*`
+  tag: the `yggdryl` crate to crates.io, wheels (five platforms, CPython
+  3.10-3.14) plus the sdist to PyPI, and `@yggdryl/node` to npm carrying
+  every platform's native module in one package - the generated loader picks
+  the binary at require time. Running the workflow by hand builds and
+  verifies everything without publishing; use that to rehearse.
+- One version, spelled three times: the workspace `Cargo.toml`,
+  `python/pyproject.toml`, and `node/package.json` must agree, and the tag
+  must be `v` plus that version - the preflight job refuses anything else.
+  Bump all three in the same commit; nothing else carries a version.
+- Credentials are repository configuration, never workflow content: the
+  `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN` secrets, and PyPI trusted publishing
+  (OIDC) bound to the `pypi` environment. Do not add a fourth registry or a
+  stored PyPI password.
+- Every built artifact is smoke tested on its own platform before anything
+  publishes - a wheel by an end-to-end table round trip, a native module by
+  the full Node test suite - and the npm publish refuses a package missing
+  any platform binary. Keep it that way: an artifact that was never imported
+  is not released.

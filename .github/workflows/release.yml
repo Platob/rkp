@@ -1,0 +1,279 @@
+name: Release
+
+# One workflow publishes all three package surfaces from one tag: the core
+# crate to crates.io, the Python wheels and sdist to PyPI, and the Node.js
+# package - carrying every platform's native module - to npm. A `v*` tag is
+# the trigger and the single source of truth for the version; running the
+# workflow by hand builds and verifies everything without publishing, so a
+# release can be rehearsed.
+#
+# Credentials, configured once on the repository:
+#   - crates.io: the `CARGO_REGISTRY_TOKEN` secret.
+#   - PyPI: trusted publishing (OIDC) for this repository and workflow,
+#     bound to the `pypi` environment - no stored secret.
+#   - npm: the `NPM_TOKEN` secret, an automation token for `@yggdryl/node`.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a release mid-publish: a half-published version is worse than
+# a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    # The workspace manifest, the Python project, and the npm package each
+    # spell the version; a release where they disagree - or where the tag
+    # names none of them - stops here, before anything is built.
+    name: Versions agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: One version, three manifests, and the tag that names it
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+          import sys
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              workspace = tomllib.load(manifest)["workspace"]["package"]["version"]
+          with open("python/pyproject.toml", "rb") as manifest:
+              python_version = tomllib.load(manifest)["project"]["version"]
+          with open("node/package.json", encoding="utf-8") as manifest:
+              node_version = json.load(manifest)["version"]
+
+          versions = {
+              "Cargo.toml [workspace.package]": workspace,
+              "python/pyproject.toml [project]": python_version,
+              "node/package.json": node_version,
+          }
+          if len(set(versions.values())) != 1:
+              sys.exit(f"expected one version everywhere, got {versions}")
+
+          ref = os.environ.get("GITHUB_REF", "")
+          if ref.startswith("refs/tags/"):
+              tag = ref.removeprefix("refs/tags/")
+              if tag != f"v{workspace}":
+                  sys.exit(f"expected the tag v{workspace}, got {tag}")
+          print(f"releasing {workspace}")
+          EOF
+
+  crate:
+    # crates.io carries only the core: the binding crates are `publish =
+    # false` because their artifacts are the wheel and the npm package. The
+    # dry run always happens, so a hand-run rehearses the same packaging and
+    # verification a tag performs.
+    name: crates.io (yggdryl)
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Package and verify
+        run: cargo publish --locked -p yggdryl --dry-run
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked -p yggdryl
+
+  wheels:
+    # One job per platform, each building a wheel per CPython the project
+    # supports. The interpreters are named bare so maturin resolves them from
+    # the manylinux image on Linux and from the setup-python tool cache on
+    # macOS and Windows; 3.12 is listed last so it is the default `python`
+    # the smoke test runs under, where PyArrow wheels are certain to exist.
+    name: Wheel (${{ matrix.label }})
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64
+          - label: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64
+          - label: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64
+          - label: macos-aarch64
+            runner: macos-14
+            target: aarch64
+          - label: windows-x64
+            runner: windows-latest
+            target: x64
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.13
+            3.14
+            3.12
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: >-
+            --release --locked --manifest-path python/Cargo.toml --out dist
+            --interpreter 3.10 3.11 3.12 3.13 3.14
+      - name: Smoke test the wheel
+        shell: bash
+        run: |
+          python -m pip install "pyarrow>=18" --only-binary ":all:"
+          python -m pip install --no-index --find-links dist yggdryl
+          python - <<'EOF'
+          import pathlib
+          import tempfile
+
+          import pyarrow as pa
+
+          from yggdryl import IOBase
+          from yggdryl.iceberg import Table, assign_field_ids
+
+          columns = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+          root = pathlib.Path(tempfile.mkdtemp(prefix="yggdryl-release-")) / "smoke"
+          table = Table.create(IOBase(root), assign_field_ids(columns))
+          table.append(pa.record_batch({"id": [1, 2]}, schema=columns))
+          assert table.scan().read_all().column("id").to_pylist() == [1, 2]
+          print("wheel smoke: ok")
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.label }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    # The source distribution carries the whole workspace - maturin includes
+    # the core as a path dependency - so a platform without a wheel can still
+    # build from source.
+    name: Source distribution
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --manifest-path python/Cargo.toml --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-pypi:
+    name: PyPI (yggdryl)
+    needs: [wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted publishing: PyPI accepts this workflow's OIDC token instead
+      # of a stored password.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  node:
+    # Each platform builds and tests its own native module; the npm package
+    # ships every one of them, and the generated loader picks the matching
+    # binary at require time.
+    name: Node binary (${{ matrix.label }})
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x64-gnu
+            runner: ubuntu-latest
+          - label: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+          - label: darwin-x64
+            runner: macos-15-intel
+          - label: darwin-arm64
+            runner: macos-14
+          - label: win32-x64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install Node.js build tooling
+        run: npm ci --prefix node
+      - name: Build the release native module
+        run: npm run build --prefix node
+      - name: Smoke tests against the release binary
+        run: npm test --prefix node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.label }}
+          path: node/*.node
+          if-no-files-found: error
+
+  publish-npm:
+    name: npm (@yggdryl/node)
+    needs: node
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Install Node.js packaging tooling
+        run: npm ci --prefix node
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-*
+          path: node
+          merge-multiple: true
+      - name: Every platform binary is present
+        run: |
+          count=$(ls node/*.node | wc -l)
+          if [ "$count" -ne 5 ]; then
+            echo "expected 5 platform binaries, got $count:"
+            ls node/*.node
+            exit 1
+          fi
+      - name: Publish
+        working-directory: node
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
