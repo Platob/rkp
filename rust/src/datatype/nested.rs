@@ -10,7 +10,7 @@ use ::serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smol_str::format_smolstr;
 
 use crate::enums::UnionMode;
-use crate::{Field, Result};
+use crate::{Error, Field, Result};
 
 use super::DataType;
 use super::scalar::{invalid, validate_non_negative};
@@ -589,6 +589,73 @@ impl DataType {
             Self::Struct(fields) => Some(fields.as_fields()),
             _ => None,
         }
+    }
+
+    /// Returns this datatype with its direct children replaced.
+    ///
+    /// The layout is kept exactly - a list stays a list, a map stays a map with
+    /// the same key ordering, a union keeps its type IDs and mode - and only
+    /// the children change. This is the write side of [`Self::get_field`]: one
+    /// generic walk can rebuild any nested datatype without a match per
+    /// caller.
+    ///
+    /// ```
+    /// use yggdryl::DataType;
+    ///
+    /// # fn main() -> yggdryl::Result<()> {
+    /// let list = DataType::list(DataType::Int32.nullable_field("item"));
+    /// let widened = list.with_fields([DataType::Int64.nullable_field("item")])?;
+    ///
+    /// assert_eq!(widened, DataType::list(DataType::Int64.nullable_field("item")));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the number of children does not match the layout,
+    /// or when the rebuilt datatype is not valid.
+    pub fn with_fields<I>(&self, fields: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = Field>,
+    {
+        let children: Vec<Field> = fields.into_iter().collect();
+        let expected = self.field_len();
+        if children.len() != expected {
+            return Err(Error::InvalidDataType {
+                kind: "DataType",
+                reason: crate::text::expected_got(
+                    format_args!("{expected} children for a {}", self.name()),
+                    format_args!("{}", children.len()),
+                ),
+            });
+        }
+        let mut children = children.into_iter();
+        let mut next = || {
+            children
+                .next()
+                .expect("a child of the arity this layout declares")
+        };
+        Ok(match self {
+            Self::List(_) => Self::list(next()),
+            Self::ListView(_) => Self::list_view(next()),
+            Self::FixedSizeList(_, length) => Self::fixed_size_list(next(), *length)?,
+            Self::LargeList(_) => Self::large_list(next()),
+            Self::LargeListView(_) => Self::large_list_view(next()),
+            Self::Struct(_) => Self::from_fields(children)?,
+            Self::Union(members, mode) => {
+                let ids: Vec<i8> = members.iter().map(|(id, _)| id).collect();
+                Self::union(ids.into_iter().zip(children), *mode)?
+            }
+            Self::Map(map) => Self::map(next(), map.keys_sorted())?,
+            Self::RunEndEncoded(_) => {
+                let run_ends = next();
+                Self::run_end_encoded(run_ends, next())?
+            }
+            // A layout with no children is returned as it is, which is what
+            // matching zero children against zero children means.
+            scalar => scalar.clone(),
+        })
     }
 
     /// Returns the number of direct child fields without allocating.

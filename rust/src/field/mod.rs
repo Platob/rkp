@@ -650,6 +650,107 @@ impl Field {
             .transpose()
     }
 
+    /// Returns the field anywhere in this tree carrying one identifier.
+    ///
+    /// The walk is over every child a datatype has - struct and union members,
+    /// a list's item, a map's entries, a run-end layout's two - because an
+    /// identifier is unique across a whole schema and not only across one
+    /// level of it.
+    ///
+    /// ```
+    /// use yggdryl::DataType;
+    ///
+    /// # fn main() -> yggdryl::Result<()> {
+    /// let mut schema = DataType::from_fields([
+    ///     DataType::Int64.required_field("id"),
+    ///     DataType::list(DataType::Utf8.nullable_field("item")).nullable_field("tags"),
+    /// ])?
+    /// .required_field("row");
+    ///
+    /// assert_eq!(schema.assign_ids(1)?, 4);
+    /// assert_eq!(schema.field_by_id(3).map(yggdryl::Field::name), Some("item"));
+    /// assert_eq!(schema.max_id()?, Some(3));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn field_by_id(&self, id: i32) -> Option<&Self> {
+        if self.id().ok().flatten() == Some(id) {
+            return Some(self);
+        }
+        (0..self.data_type.field_len())
+            .filter_map(|index| self.data_type.get_field(index))
+            .find_map(|child| child.field_by_id(id))
+    }
+
+    /// Returns the highest identifier anywhere in this tree.
+    ///
+    /// A schema evolution numbers above it, so an identifier is never reused
+    /// for a different column.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a stored identifier is not a canonical integer,
+    /// which externally corrupted serialized state can produce.
+    pub fn max_id(&self) -> Result<Option<i32>> {
+        let mut highest = self.id()?;
+        for index in 0..self.data_type.field_len() {
+            let Some(child) = self.data_type.get_field(index) else {
+                continue;
+            };
+            if let Some(id) = child.max_id()? {
+                highest = Some(highest.map_or(id, |current: i32| current.max(id)));
+            }
+        }
+        Ok(highest)
+    }
+
+    /// Numbers every field in this tree that does not already carry an
+    /// identifier, and returns the next unused one.
+    ///
+    /// Children are numbered depth first in declaration order, which is the
+    /// order every format that stores identifiers assigns them in. A field that
+    /// already carries one keeps it, so numbering an evolved schema leaves the
+    /// columns that already existed alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree is not valid or an identifier would
+    /// overflow.
+    pub fn assign_ids(&mut self, start: i32) -> Result<i32> {
+        self.validate()?;
+        let mut next = start;
+        self.assign_child_ids(&mut next)?;
+        Ok(next)
+    }
+
+    /// Number one level of children, then each of their trees.
+    fn assign_child_ids(&mut self, next: &mut i32) -> Result<()> {
+        let count = self.data_type.field_len();
+        if count == 0 {
+            return Ok(());
+        }
+        let mut children = Vec::with_capacity(count);
+        for index in 0..count {
+            let Some(child) = self.data_type.get_field(index) else {
+                continue;
+            };
+            let mut child = child.clone();
+            if child.id()?.is_none() {
+                child.set_id(*next);
+                *next = next.checked_add(1).ok_or_else(|| Error::InvalidRecord {
+                    path: format_smolstr!("$.{}", child.name()),
+                    reason: crate::text::expected_got(
+                        format_args!("a field identifier below {}", i32::MAX),
+                        format_args!("an overflow"),
+                    ),
+                })?;
+            }
+            child.assign_child_ids(next)?;
+            children.push(child);
+        }
+        self.set_data_type(self.data_type.with_fields(children)?)
+    }
+
     /// Returns whether this field participates in caller-side initialization.
     ///
     /// The reserved `field:init` metadata key is absent for an ordinary field,

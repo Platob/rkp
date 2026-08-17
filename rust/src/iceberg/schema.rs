@@ -136,9 +136,7 @@ pub fn schema_to_json(root: &Field) -> Result<Value> {
 /// identifier would overflow.
 pub fn assign_field_ids(root: &mut Field, start: i32) -> Result<i32> {
     root.require_struct()?;
-    let mut next = start;
-    assign_children(root, &mut next)?;
-    Ok(next)
+    root.assign_ids(start)
 }
 
 /// Return the highest field identifier anywhere in a schema tree.
@@ -150,44 +148,7 @@ pub fn assign_field_ids(root: &mut Field, start: i32) -> Result<i32> {
 ///
 /// Returns an error when a stored identifier is not a canonical integer.
 pub fn last_field_id(root: &Field) -> Result<i32> {
-    let mut highest = 0;
-    highest_id(root, &mut highest)?;
-    Ok(highest)
-}
-
-/// Walk a field tree, remembering the largest identifier seen.
-fn highest_id(field: &Field, highest: &mut i32) -> Result<()> {
-    if let Some(id) = field.id()? {
-        *highest = (*highest).max(id);
-    }
-    if let Some(children) = field.data_type().as_fields() {
-        for child in children {
-            highest_id(child, highest)?;
-        }
-    }
-    Ok(())
-}
-
-/// Number one field and then its children, depth first.
-fn assign_children(field: &mut Field, next: &mut i32) -> Result<()> {
-    let Some(fields) = field.data_type().as_fields() else {
-        return Ok(());
-    };
-    let mut children = fields.to_vec();
-    for child in &mut children {
-        if child.id()?.is_none() {
-            child.set_id(*next);
-            *next = next.checked_add(1).ok_or_else(|| {
-                invalid(format_smolstr!(
-                    "expected a field identifier below {}, got an overflow",
-                    i32::MAX
-                ))
-            })?;
-        }
-        assign_children(child, next)?;
-    }
-    field.set_data_type(DataType::from_fields(children)?)?;
-    Ok(())
+    Ok(root.max_id()?.unwrap_or_default())
 }
 
 /// Build a struct field from an Iceberg `fields` array.

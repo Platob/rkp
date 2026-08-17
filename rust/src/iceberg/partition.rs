@@ -396,7 +396,7 @@ impl PartitionSpec {
             }
             // A spec can name a column of a nested struct, which no path spells
             // out and no top-level marker describes; such a field is left alone.
-            let Some(source) = find_by_id(schema, field.source_id) else {
+            let Some(source) = schema.field_by_id(field.source_id) else {
                 continue;
             };
             if schema.get_field_by_name(source.name()).is_some() {
@@ -592,23 +592,11 @@ impl PartitionSpec {
 
 /// Find the schema column one partition field reads.
 fn source_column(schema: &Field, source_id: i32) -> Result<&Field> {
-    find_by_id(schema, source_id).ok_or_else(|| {
+    schema.field_by_id(source_id).ok_or_else(|| {
         invalid(format_smolstr!(
             "expected a schema column with field id {source_id} to partition on, got none"
         ))
     })
-}
-
-/// Walk a field tree looking for one identifier.
-fn find_by_id(field: &Field, id: i32) -> Option<&Field> {
-    if field.id().ok().flatten() == Some(id) {
-        return Some(field);
-    }
-    field
-        .data_type()
-        .as_fields()?
-        .iter()
-        .find_map(|child| find_by_id(child, id))
 }
 
 /// Narrow one required integer key of a partition field.

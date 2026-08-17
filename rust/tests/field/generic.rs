@@ -1166,3 +1166,85 @@ fn unmarking_a_partition_column_removes_the_marker_rather_than_storing_a_default
         .is_partition()
     );
 }
+
+#[test]
+fn one_walk_numbers_finds_and_bounds_every_identifier_in_a_tree() {
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::list(DataType::Utf8.nullable_field("item")).nullable_field("tags"),
+        DataType::from_fields([DataType::Int32.required_field("depth")])
+            .unwrap()
+            .nullable_field("book"),
+    ])
+    .unwrap()
+    .required_field("row");
+
+    // Numbering is depth first in declaration order, over every child a
+    // layout has - a list's item and a map's entries included.
+    assert_eq!(schema.assign_ids(1).unwrap(), 6);
+    assert_eq!(schema.max_id().unwrap(), Some(5));
+    assert_eq!(schema.field_by_id(1).map(Field::name), Some("id"));
+    assert_eq!(schema.field_by_id(3).map(Field::name), Some("item"));
+    assert_eq!(schema.field_by_id(5).map(Field::name), Some("depth"));
+    assert_eq!(schema.field_by_id(9), None);
+
+    // A field that already carries an identifier keeps it, so evolving a
+    // schema never renumbers the columns that were already there.
+    let mut evolved = schema
+        .clone()
+        .try_with_data_type(
+            DataType::from_fields(
+                schema
+                    .fields()
+                    .iter()
+                    .cloned()
+                    .chain([DataType::Utf8.nullable_field("venue")]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(evolved.assign_ids(schema.max_id().unwrap().unwrap() + 1).unwrap(), 7);
+    assert_eq!(evolved.field_by_id(1).map(Field::name), Some("id"));
+    assert_eq!(evolved.field_by_id(6).map(Field::name), Some("venue"));
+}
+
+#[test]
+fn a_datatype_rebuilds_any_layout_from_replacement_children() {
+    let list = DataType::list(DataType::Int32.nullable_field("item"));
+    assert_eq!(
+        list.with_fields([DataType::Int64.nullable_field("item")])
+            .unwrap(),
+        DataType::list(DataType::Int64.nullable_field("item"))
+    );
+
+    // A union keeps its type ids and its mode; only the members change.
+    let union = DataType::union(
+        [
+            (7_i8, DataType::Int64.nullable_field("number")),
+            (9_i8, DataType::Utf8.nullable_field("text")),
+        ],
+        yggdryl::UnionMode::Dense,
+    )
+    .unwrap();
+    let rebuilt = union
+        .with_fields([
+            DataType::Int32.nullable_field("number"),
+            DataType::Utf8.nullable_field("text"),
+        ])
+        .unwrap();
+    assert_eq!(rebuilt.to_string(), union.to_string().replace("int64", "int32"));
+
+    // The arity is the layout's, and a mismatch says which was expected.
+    let message = list
+        .with_fields([
+            DataType::Int64.nullable_field("item"),
+            DataType::Int64.nullable_field("extra"),
+        ])
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("1 children"), "{message}");
+    assert!(message.contains("got 2"), "{message}");
+
+    // A scalar has no children, so replacing none of them is itself.
+    assert_eq!(DataType::Int64.with_fields([]).unwrap(), DataType::Int64);
+}
