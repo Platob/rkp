@@ -21,6 +21,74 @@ export declare class BatchReader {
 export type JsBatchReader = BatchReader
 
 /**
+ * A warehouse folder of namespaces of Iceberg tables.
+ *
+ * The catalog is storage and nothing else: a dotted name like `"nyc.taxis"`
+ * names the folder `nyc/taxis` under the warehouse handle, and constructing
+ * one touches nothing at all. There is no service in between, so two catalogs
+ * over the same folder see the same tables.
+ */
+export declare class Catalog {
+  /**
+   * Describe a catalog over a warehouse folder, touching nothing.
+   *
+   * `warehouse` accepts whatever names a location - a path or URL string, a
+   * native `Url`, or a handle - the same inputs `Table.create`'s root takes.
+   */
+  constructor(warehouse: LocationInput)
+  /**
+   * Create the named table, writing its first metadata document.
+   *
+   * `schema` is a root `Field`, a field expression, or an array of child
+   * `Field`s assembled under a root named `row`. Unnumbered columns are
+   * numbered, and the partition spec is derived from the columns the schema
+   * itself marks - a schema that marks none produces an unpartitioned
+   * table.
+   */
+  createTable(name: string, schema: TableSchemaInput): Table
+  /** Open the named table. */
+  table(name: string): Table
+  /** Return whether the named table exists. */
+  hasTable(name: string): boolean
+  /**
+   * Open the named table if it exists, creating it otherwise.
+   *
+   * An existing table is opened as it is - `schema` describes only the
+   * table this call would create.
+   */
+  openOrCreateTable(name: string, schema: TableSchemaInput): Table
+  /**
+   * Append `data` to the named table, creating it on first write.
+   *
+   * A table that is not there yet takes its schema from the reader, so a
+   * caller who only has rows and a name needs nothing else. Returns the
+   * table so the caller can keep going.
+   */
+  append(name: string, data: BatchReader): Table
+  /**
+   * Replace the named table's rows with `data`, creating it on first write.
+   *
+   * An existing table keeps its previous snapshot readable; only the
+   * current pointer moves. Returns the table so the caller can keep going.
+   */
+  overwrite(name: string, data: BatchReader): Table
+  /**
+   * List the namespaces one level below `parent`, as sorted dotted names.
+   *
+   * Omitting `parent` lists the warehouse's own child folders. A parent
+   * that does not exist lists nothing rather than failing.
+   */
+  listNamespaces(parent?: string | undefined | null): Array<string>
+  /**
+   * List the tables in a namespace, as sorted dotted names.
+   *
+   * A namespace that does not exist lists nothing rather than failing.
+   */
+  listTables(namespace: string): Array<string>
+}
+export type JsCatalog = Catalog
+
+/**
  * One live data file of the current snapshot, with the spec that placed it.
  *
  * This is a class rather than a plain object because a partition value crosses
@@ -879,6 +947,36 @@ export declare class RecordOptions {
 }
 export type JsRecordOptions = RecordOptions
 
+/**
+ * A recording of column operations against a table's current schema.
+ *
+ * The loader hands one out from `table.updateSchema()` and wraps each method
+ * to return the builder, so a chain reads as one sentence. Nothing is checked
+ * while recording: `commit()` replays the recording onto a fresh core
+ * `SchemaUpdate`, which is what makes the operations apply to the schema the
+ * table has *then* and report the first failure with its core message.
+ */
+export declare class SchemaUpdate {
+  /** Start an empty recording. */
+  constructor()
+  /**
+   * Record a new column under `parent` - `""` for the root, a dotted path
+   * for a nested struct.
+   */
+  addColumn(parent: string, field: FieldInput): void
+  /** Record the removal of the column at `path`, retiring its identifier. */
+  dropColumn(path: string): void
+  /** Record a rename of the column at `path`; its identifier is kept. */
+  renameColumn(path: string, name: string): void
+  /** Record a new `iceberg:doc` documentation string on the column at `path`. */
+  updateDoc(path: string, doc: string): void
+  /** Record that the column at `path` becomes optional. */
+  makeNullable(path: string): void
+  /** Record a type promotion on the column at `path`. */
+  updateType(path: string, dataType: DataTypeInput): void
+}
+export type JsSchemaUpdate = SchemaUpdate
+
 /** An Iceberg table reached entirely through one container handle. */
 export declare class Table {
   /**
@@ -946,6 +1044,68 @@ export declare class Table {
   overwrite(batches: BatchReader): void
   /** Add a schema, make it current, and write a new metadata document. */
   evolveSchema(schema: Field): number
+  /**
+   * Read one retained snapshot's rows: time travel as an ordinary scan.
+   *
+   * `snapshotId` is the identifier a snapshot reports, as a `bigint` or as
+   * a number no larger than 2^53. `filters` is the same `(column, value)`
+   * pair vocabulary `childrenWhere` uses, and `schema` keeps the columns it
+   * names, exactly as on [`scan`](Self::scan). The rows are read as the
+   * schema the snapshot was written under.
+   */
+  scanAt(snapshotId: SnapshotIdInput, filters?: ScanFilters | undefined | null, schema?: FieldInput | undefined | null): BatchReader
+  /**
+   * Return the retained snapshot a branch or tag names.
+   *
+   * A name the table does not have is refused naming the refs it does.
+   */
+  snapshotByRef(name: string): SnapshotView
+  /**
+   * The size a data file aims for, in bytes.
+   *
+   * The table property `write.target-file-size-bytes` decides, falling back
+   * to the schema root's protocol property of the same name, then to
+   * Iceberg's own 512 MiB default. A present-but-unparseable value throws
+   * naming the key and the value rather than silently using the default.
+   */
+  get targetFileSize(): number
+  /**
+   * Merge the current snapshot's undersized data files, per partition.
+   *
+   * The commit is one `replace` snapshot, so the pre-compaction snapshot
+   * stays readable through [`scanAt`](Self::scan_at). A table with nothing
+   * to compact commits nothing and reports zeros.
+   */
+  compact(): Compaction
+  /**
+   * Render when each snapshot became current, oldest first.
+   *
+   * The columns are `made_current_at`, `snapshot_id`, `parent_id`, and
+   * `is_current_ancestor`, the names `PyIceberg`'s `history` table uses.
+   */
+  inspectHistory(): BatchReader
+  /**
+   * Render every retained snapshot with its operation and summary.
+   *
+   * The columns are `committed_at`, `snapshot_id`, `parent_id`,
+   * `operation`, `manifest_list`, and the free-form `summary` map.
+   */
+  inspectSnapshots(): BatchReader
+  /**
+   * Render the live data files of the current snapshot.
+   *
+   * The columns are `file_path`, `file_format`, `spec_id`, the rendered
+   * `partition` chain, `record_count`, and `file_size_in_bytes`.
+   */
+  inspectFiles(): BatchReader
+  /**
+   * Set and remove table properties as one metadata-only commit.
+   *
+   * `updates` is a mapping of properties to set and `removes` lists the
+   * keys to drop, in that order. Passing neither commits nothing at all: a
+   * commit that changes no property would still cost a metadata document.
+   */
+  updateProperties(updates?: PropertyUpdates | undefined | null, removes?: Array<string> | undefined | null): void
   /** Return where the table lives, so a table prints as its location. */
   toString(): string
 }
@@ -1366,6 +1526,21 @@ export declare function codecInferFormat(path: string): string
 
 /** Parse a format alias and return its stable native spelling. */
 export declare function codecNormalizeFormat(format: string): string
+
+/**
+ * What one `compact` call rewrote.
+ *
+ * The sizes cross as numbers because a data file already reports
+ * `fileSizeInBytes` as one, and the two must agree.
+ */
+export interface Compaction {
+  /** How many live data files were read and replaced. */
+  filesBefore: number
+  /** How many data files the rewrite produced in their place. */
+  filesAfter: number
+  /** The recorded size of the replaced files, in bytes. */
+  bytesRewritten: number
+}
 
 /** One per-column bound a manifest records, as its encoded bytes. */
 export interface FieldBound {

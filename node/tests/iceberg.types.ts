@@ -2,11 +2,14 @@ import { Table as ArrowTable } from 'apache-arrow'
 
 import {
   BatchReader,
+  DataType,
   Field,
   IOBase,
   Url,
   Value,
   iceberg,
+  type Catalog,
+  type Compaction,
   type PartitionInput,
   type DataFile,
   type FieldBound,
@@ -14,6 +17,7 @@ import {
   type ManifestFileView,
   type PartitionFieldView,
   type PartitionSpec,
+  type SchemaUpdate,
   type SnapshotView,
   type Table,
 } from '..'
@@ -93,3 +97,56 @@ const manifestPath: string = manifest.manifestPath
 const addedSnapshotId: bigint = manifest.addedSnapshotId
 const addedFilesCount: number = manifest.addedFilesCount
 const manifestContent: string = manifest.content
+
+const catalog: Catalog = new iceberg.Catalog('file:///lake/warehouse')
+const fromHandle: Catalog = new iceberg.Catalog(new IOBase('file:///lake/warehouse'))
+const fromField: Table = catalog.createTable('nyc.taxis', numbered)
+const fromExpression: Table = catalog.createTable(
+  'nyc.taxis',
+  'row: struct<id int64, venue utf8> not null',
+)
+const fromChildren: Table = catalog.createTable('nyc.taxis', [schema, schema])
+const openedByName: Table = catalog.table('nyc.taxis')
+const present: boolean = catalog.hasTable('nyc.taxis')
+const openedOrCreated: Table = catalog.openOrCreateTable('nyc.taxis', numbered)
+const appended: Table = catalog.append('nyc.taxis', arrowTable)
+const replaced: Table = catalog.overwrite('nyc.taxis', BatchReader.from(arrowTable))
+const namespaces: string[] = catalog.listNamespaces()
+const nested: string[] = catalog.listNamespaces('nyc')
+const tables: string[] = catalog.listTables('nyc')
+
+const atBigint: BatchReader = created.scanAt(1n)
+const atNumber: BatchReader = created.scanAt(1)
+const atFiltered: BatchReader = created.scanAt(1n, { venue: 'XNAS' })
+const atMapped: BatchReader = created.scanAt(1n, new Map([['venue', 'XNAS']]), numbered)
+const atProjected: BatchReader = created.scanAt(1n, [['venue', 'XNAS']], 'id: int64')
+
+const byRef: SnapshotView = created.snapshotByRef('main')
+const target: number = created.targetFileSize
+const compaction: Compaction = created.compact()
+const filesBefore: number = compaction.filesBefore
+const filesAfter: number = compaction.filesAfter
+const bytesRewritten: number = compaction.bytesRewritten
+const history: BatchReader = created.inspectHistory()
+const snapshotsReader: BatchReader = created.inspectSnapshots()
+const filesReader: BatchReader = created.inspectFiles()
+
+created.updateProperties({ 'commit.retry.num-retries': '4' })
+created.updateProperties(new Map([['a', 'b']]), ['c'])
+created.updateProperties(undefined, ['a'])
+created.updateProperties()
+
+const builder: SchemaUpdate = created.updateSchema()
+const chained: SchemaUpdate = builder
+  .addColumn('', 'price: float64')
+  .addColumn('quote', schema)
+  .dropColumn('venue')
+  .renameColumn('id', 'tradeId')
+  .updateDoc('tradeId', 'the identifier')
+  .makeNullable('tradeId')
+  .updateType('tradeId', DataType.from('int64'))
+  .updateType('price', 'float64')
+const committed: number = chained.commit()
+
+iceberg.canPromote('int32', 'int64')
+iceberg.canPromote(DataType.from('float32'), DataType.from('float64'))

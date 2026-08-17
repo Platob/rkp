@@ -1709,14 +1709,98 @@ installRecords({
   Table: binding.Table,
 })
 
+// A retained snapshot is read with the vocabulary the rest of the package
+// already speaks: filters are the pairs `childrenWhere` takes, in any of the
+// three ways JavaScript spells a set of them.
+const nativeScanAt = binding.Table.prototype.scanAt
+Object.defineProperty(binding.Table.prototype, 'scanAt', {
+  configurable: true,
+  value(snapshotId, filters, schema) {
+    return nativeScanAt.call(this, snapshotId, partitionFilters(filters), schema)
+  },
+})
+
+// Property updates arrive as whatever spells string pairs - an object, a Map,
+// or entries - through the same normalization Field metadata updates use.
+const nativeUpdateProperties = binding.Table.prototype.updateProperties
+Object.defineProperty(binding.Table.prototype, 'updateProperties', {
+  configurable: true,
+  value(updates, removes) {
+    return nativeUpdateProperties.call(
+      this,
+      updates == null ? undefined : normalizeMetadata(updates),
+      removes,
+    )
+  },
+})
+
+// A schema evolution reads as one chained sentence. The native recorder holds
+// the operations and the native commit replays them, so this wrapper only adds
+// the chaining Node-API cannot spell: each call returns the builder, and
+// `commit()` carries the table the chain started from.
+const NativeSchemaUpdate = binding.SchemaUpdate
+const nativeCommitSchemaUpdate = binding.Table.prototype._commitSchemaUpdateNative
+delete binding.Table.prototype._commitSchemaUpdateNative
+Object.defineProperty(binding.Table.prototype, 'updateSchema', {
+  configurable: true,
+  value() {
+    const table = this
+    const recorder = new NativeSchemaUpdate()
+    const builder = {
+      addColumn(parent, field) {
+        recorder.addColumn(parent, field)
+        return builder
+      },
+      dropColumn(path) {
+        recorder.dropColumn(path)
+        return builder
+      },
+      renameColumn(path, name) {
+        recorder.renameColumn(path, name)
+        return builder
+      },
+      updateDoc(path, doc) {
+        recorder.updateDoc(path, doc)
+        return builder
+      },
+      makeNullable(path) {
+        recorder.makeNullable(path)
+        return builder
+      },
+      updateType(path, dataType) {
+        recorder.updateType(path, dataType)
+        return builder
+      },
+      commit() {
+        return nativeCommitSchemaUpdate.call(table, recorder)
+      },
+    }
+    return builder
+  },
+})
+
+// A catalog write takes exactly what a table write takes: `BatchReader.from`
+// is the one inference point for anything that names a stream of batches.
+for (const name of ['append', 'overwrite']) {
+  const native = binding.Catalog.prototype[name]
+  Object.defineProperty(binding.Catalog.prototype, name, {
+    configurable: true,
+    value(tableName, data) {
+      return native.call(this, tableName, BatchReader.from(data))
+    },
+  })
+}
+
 // `yggdryl::iceberg` is a module in the core, so it is one here too: a table
 // format sits on top of the record encodings rather than beside them.
 const nativeSchemaFromJson = binding.icebergSchemaFromJsonNative
 const iceberg = Object.freeze({
+  Catalog: binding.Catalog,
   Table: binding.Table,
   PartitionSpec: binding.PartitionSpec,
   DataFile: binding.DataFile,
   assignFieldIds: binding.icebergAssignFieldIdsNative,
+  canPromote: binding.icebergCanPromoteNative,
   // A metadata document is whatever the JSON facade decoded, so a plain object
   // crosses through the one conversion `Value.fromJs` already owns.
   schemaFromJson(name, document) {
@@ -1731,15 +1815,20 @@ const iceberg = Object.freeze({
 // The Iceberg values are reached through the namespace and nowhere else, so a
 // table format has exactly one spelling here, as it does in the core.
 for (const name of [
+  'Catalog',
   'DataFile',
   'DifferenceIterator',
+  'JsCatalog',
   'JsDataFile',
   'JsDifferenceIterator',
   'JsPartitionSpec',
+  'JsSchemaUpdate',
   'JsTable',
   'PartitionSpec',
+  'SchemaUpdate',
   'Table',
   'icebergAssignFieldIdsNative',
+  'icebergCanPromoteNative',
   'icebergSchemaFromJsonNative',
   'icebergSchemaToJsonNative',
 ]) {

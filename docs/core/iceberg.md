@@ -951,55 +951,131 @@ than believe.
 
 ## Time travel and the inspection tables
 
-!!! note "Rust only"
-    Time travel and the inspection tables are core surfaces the bindings do
-    not project yet.
+!!! note "All three"
+    `scan_at` / `scanAt`, `snapshot_by_ref` / `snapshotByRef`, and the three
+    inspection readers cross into both bindings as ordinary record-batch
+    readers.
 
 Nothing a commit writes is mutated in place, so every retained snapshot is still a complete table.
 Reading one is an ordinary scan with the snapshot named:
 
-```rust
-use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
-use yggdryl::local::Folder;
-use yggdryl::DataType;
+=== "Rust"
 
-let root = std::env::temp_dir().join("yggdryl-doc-time-travel");
-let _ = std::fs::remove_dir_all(&root);
+    ```rust
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
 
-let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
-    .required_field("row");
-assign_field_ids(&mut schema, 1)?;
-let mut table = Table::create(
-    Folder::new(&root)?,
-    FormatVersion::V2,
-    schema.clone(),
-    PartitionSpec::unpartitioned(),
-)?;
+    let root = std::env::temp_dir().join("yggdryl-doc-time-travel");
+    let _ = std::fs::remove_dir_all(&root);
 
-let arrow_schema = schema.to_arrow_schema()?;
-let one = arrow_array::RecordBatch::try_new(
-    std::sync::Arc::clone(&arrow_schema),
-    vec![std::sync::Arc::new(arrow_array::Int64Array::from(vec![1]))],
-)?;
-table.append(yggdryl::arrow::batch_reader(std::sync::Arc::clone(&arrow_schema), [one]))?;
-let past = table.current_snapshot().expect("one commit").snapshot_id;
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    let mut table = Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
 
-let nine = arrow_array::RecordBatch::try_new(
-    std::sync::Arc::clone(&arrow_schema),
-    vec![std::sync::Arc::new(arrow_array::Int64Array::from(vec![9]))],
-)?;
-table.overwrite(yggdryl::arrow::batch_reader(arrow_schema, [nine]))?;
+    let arrow_schema = schema.to_arrow_schema()?;
+    let one = arrow_array::RecordBatch::try_new(
+        std::sync::Arc::clone(&arrow_schema),
+        vec![std::sync::Arc::new(arrow_array::Int64Array::from(vec![1]))],
+    )?;
+    table.append(yggdryl::arrow::batch_reader(std::sync::Arc::clone(&arrow_schema), [one]))?;
+    let past = table.current_snapshot().expect("one commit").snapshot_id;
 
-// The present shows the overwrite; the retained snapshot shows what was.
-assert_eq!(table.scan(None)?.count(), 1);
-let history = table.scan_at(past, &[], None)?.next().expect("one batch")?;
-assert_eq!(history.num_rows(), 1);
+    let nine = arrow_array::RecordBatch::try_new(
+        std::sync::Arc::clone(&arrow_schema),
+        vec![std::sync::Arc::new(arrow_array::Int64Array::from(vec![9]))],
+    )?;
+    table.overwrite(yggdryl::arrow::batch_reader(arrow_schema, [nine]))?;
 
-// Planning history prunes exactly as planning the present does.
-assert_eq!(table.plan_at(past, &[])?.tasks.len(), 1);
+    // The present shows the overwrite; the retained snapshot shows what was.
+    assert_eq!(table.scan(None)?.count(), 1);
+    let history = table.scan_at(past, &[], None)?.next().expect("one batch")?;
+    assert_eq!(history.num_rows(), 1);
 
-let _ = std::fs::remove_dir_all(&root);
-```
+    // Planning history prunes exactly as planning the present does.
+    assert_eq!(table.plan_at(past, &[])?.tasks.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import shutil
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids
+
+    columns = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+    root = pathlib.Path(tempfile.mkdtemp(prefix="yggdryl-doc-")) / "trades"
+
+    table = Table.create(IOBase(root), assign_field_ids(columns))
+    table.append(pa.record_batch({"id": [1]}, schema=columns))
+    past = table.current_snapshot.snapshot_id
+    table.overwrite(pa.record_batch({"id": [9]}, schema=columns))
+
+    # The present shows the overwrite; the retained snapshot shows what was.
+    assert table.scan().read_all().column("id").to_pylist() == [9]
+    assert table.scan_at(past).read_all().column("id").to_pylist() == [1]
+
+    # A branch or tag resolves by name, and every commit moves `main`.
+    assert table.snapshot_by_ref("main").snapshot_id == table.current_snapshot.snapshot_id
+
+    # The inspection readers render the table's own record as record batches.
+    assert table.inspect_history().read_all().num_rows == 2
+    assert table.inspect_snapshots().read_all().column("operation").to_pylist() == [
+        "append",
+        "overwrite",
+    ]
+    assert table.inspect_files().read_all().num_rows == 1
+
+    shutil.rmtree(root.parent)
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const schema = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int64')], { nullable: false }),
+    )
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-doc-')), 'trades')
+
+    const table = iceberg.Table.create(root, schema)
+    table.append(new arrow.Table({ id: arrow.vectorFromArray([1n], new arrow.Int64()) }))
+    const past = table.currentSnapshot.snapshotId
+    table.overwrite(new arrow.Table({ id: arrow.vectorFromArray([9n], new arrow.Int64()) }))
+
+    // The present shows the overwrite; the retained snapshot shows what was.
+    assert.deepEqual(table.scan().toTable().getChild('id').toArray(), BigInt64Array.from([9n]))
+    assert.deepEqual(table.scanAt(past).toTable().getChild('id').toArray(), BigInt64Array.from([1n]))
+
+    // A branch or tag resolves by name, and every commit moves `main`.
+    assert.equal(table.snapshotByRef('main').snapshotId, table.currentSnapshot.snapshotId)
+
+    // The inspection readers render the table's own record as record batches.
+    assert.equal(table.inspectHistory().toTable().numRows, 2)
+    assert.equal(table.inspectSnapshots().toTable().getChild('operation').get(1), 'overwrite')
+    assert.equal(table.inspectFiles().toTable().numRows, 1)
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
 
 A snapshot is read as the schema that was current when it was written, so a column added later does
 not appear and a column dropped later still does. A branch or tag resolves with `snapshot_by_ref`,
@@ -1224,60 +1300,147 @@ assert_eq!(rows, 1);
 
 ## A warehouse of tables
 
-!!! note "Rust only"
-    The catalog is a core surface the bindings do not project yet.
+!!! note "All three"
+    The catalog crosses whole: Python has it as `yggdryl.iceberg.Catalog` and
+    JavaScript as `iceberg.Catalog`, over the same warehouse folder and the
+    same dotted names.
 
 A caller who has rows and a dotted name should need nothing else. `Catalog` is that surface: one
 warehouse folder, namespaces as nested folders, and a table per name - `HadoopCatalog`'s layout,
 reached through [`IOBase`](io.md) and nothing else.
 
-```rust
-use std::sync::Arc;
+=== "Rust"
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
-use yggdryl::iceberg::Catalog;
-use yggdryl::local::Folder;
-use yggdryl::DataType;
+    ```rust
+    use std::sync::Arc;
 
-let warehouse = std::env::temp_dir().join("yggdryl-doc-warehouse");
-let _ = std::fs::remove_dir_all(&warehouse);
-let catalog = Catalog::new(Folder::new(&warehouse)?);
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use yggdryl::iceberg::Catalog;
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
 
-// Rows and a name are enough: the first append creates the table with the
-// schema the rows carry, and the second appends to it.
-let schema = DataType::from_fields([
-    DataType::Int64.required_field("id"),
-    DataType::Utf8.nullable_field("venue"),
-])?
-.required_field("row")
-.with_partition_fields(&["venue"])?;
-let arrow_schema = schema.to_arrow_schema()?;
-let rows = |ids: &[i64], venues: &[&str]| {
-    RecordBatch::try_new(
-        Arc::clone(&arrow_schema),
-        vec![
-            Arc::new(Int64Array::from(ids.to_vec())),
-            Arc::new(StringArray::from(venues.to_vec())),
-        ],
+    let warehouse = std::env::temp_dir().join("yggdryl-doc-warehouse");
+    let _ = std::fs::remove_dir_all(&warehouse);
+    let catalog = Catalog::new(Folder::new(&warehouse)?);
+
+    // Rows and a name are enough: the first append creates the table with the
+    // schema the rows carry, and the second appends to it.
+    let schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Utf8.nullable_field("venue"),
+    ])?
+    .required_field("row")
+    .with_partition_fields(&["venue"])?;
+    let arrow_schema = schema.to_arrow_schema()?;
+    let rows = |ids: &[i64], venues: &[&str]| {
+        RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(venues.to_vec())),
+            ],
+        )
+    };
+    let first = rows(&[1, 2], &["XNAS", "XNYS"])?;
+    let table = catalog.append("nyc.trades", yggdryl::arrow::batch_reader(first.schema(), [first]))?;
+    let rows_read: usize = table.scan(None)?.map(|batch| batch.map(|b| b.num_rows())).sum::<Result<usize, _>>()?;
+    assert_eq!(rows_read, 2);
+
+    let second = rows(&[3], &["XNAS"])?;
+    catalog.append("nyc.trades", yggdryl::arrow::batch_reader(second.schema(), [second]))?;
+
+    // The partition marks the schema carried became the table's spec.
+    let reopened = catalog.table("nyc.trades")?;
+    assert_eq!(reopened.metadata().default_spec()?.fields[0].name, "venue");
+    assert!(catalog.has_table("nyc.trades")?);
+    assert_eq!(catalog.list_namespaces(None)?, ["nyc"]);
+    assert_eq!(catalog.list_tables("nyc")?, ["nyc.trades"]);
+
+    let _ = std::fs::remove_dir_all(&warehouse);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import shutil
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import DataType, Field
+    from yggdryl.iceberg import Catalog
+
+    warehouse = pathlib.Path(tempfile.mkdtemp(prefix="yggdryl-doc-")) / "warehouse"
+    catalog = Catalog(warehouse)
+
+    # Rows and a name are enough: the first append creates the table with the
+    # schema the rows carry, and the second appends to it.
+    marked = Field(
+        "row",
+        DataType.from_fields([
+            Field("id", "int64", nullable=False),
+            Field("venue", "string"),
+        ]),
+        nullable=False,
+    ).with_partition_fields(["venue"])
+    columns = pa.schema([child.to_arrow() for child in marked.data_type])
+
+    table = catalog.append(
+        "nyc.trades", pa.table({"id": [1, 2], "venue": ["XNAS", "XNYS"]}, schema=columns)
     )
-};
-let first = rows(&[1, 2], &["XNAS", "XNYS"])?;
-let table = catalog.append("nyc.trades", yggdryl::arrow::batch_reader(first.schema(), [first]))?;
-let rows_read: usize = table.scan(None)?.map(|batch| batch.map(|b| b.num_rows())).sum::<Result<usize, _>>()?;
-assert_eq!(rows_read, 2);
+    assert table.scan().read_all().num_rows == 2
 
-let second = rows(&[3], &["XNAS"])?;
-catalog.append("nyc.trades", yggdryl::arrow::batch_reader(second.schema(), [second]))?;
+    catalog.append("nyc.trades", pa.table({"id": [3], "venue": ["XNAS"]}, schema=columns))
 
-// The partition marks the schema carried became the table's spec.
-let reopened = catalog.table("nyc.trades")?;
-assert_eq!(reopened.metadata().default_spec()?.fields[0].name, "venue");
-assert!(catalog.has_table("nyc.trades")?);
-assert_eq!(catalog.list_namespaces(None)?, ["nyc"]);
-assert_eq!(catalog.list_tables("nyc")?, ["nyc.trades"]);
+    # The partition marks the schema carried became the table's spec.
+    reopened = catalog.table("nyc.trades")
+    assert [field.name for field in reopened.spec.fields] == ["venue"]
+    assert reopened.scan().read_all().num_rows == 3
+    assert catalog.has_table("nyc.trades")
+    assert catalog.list_namespaces() == ["nyc"]
+    assert catalog.list_tables("nyc") == ["nyc.trades"]
 
-let _ = std::fs::remove_dir_all(&warehouse);
-```
+    shutil.rmtree(warehouse.parent)
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const warehouse = fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-doc-'))
+    const catalog = new iceberg.Catalog(warehouse)
+
+    // The explicit spelling: the schema is numbered here, and its partition
+    // marks become the identity spec.
+    const marked = fields
+      .struct('row', [Field.from('id: int64'), Field.from('venue: utf8')], { nullable: false })
+      .withPartitionFields(['venue'])
+    catalog.createTable('nyc.trades', marked)
+
+    const rows = (ids, venues) =>
+      new arrow.Table({
+        id: arrow.vectorFromArray(ids, new arrow.Int64()),
+        venue: arrow.vectorFromArray(venues, new arrow.Utf8()),
+      })
+    const table = catalog.append('nyc.trades', rows([1n, 2n], ['XNAS', 'XNYS']))
+    assert.equal(table.scan().toTable().numRows, 2)
+    assert.equal(catalog.append('nyc.trades', rows([3n], ['XNAS'])).scan().toTable().numRows, 3)
+
+    // The dotted name is the folder nyc/trades, and the marks became the spec.
+    assert.ok(catalog.hasTable('nyc.trades'))
+    assert.deepEqual(catalog.table('nyc.trades').spec.fields.map((field) => field.name), ['venue'])
+    assert.deepEqual(catalog.listNamespaces(), ['nyc'])
+    assert.deepEqual(catalog.listTables('nyc'), ['nyc.trades'])
+
+    fs.rmSync(warehouse, { recursive: true, force: true })
+    ```
 
 `create_table` is the explicit spelling - it numbers an unnumbered schema, derives the identity spec
 from the schema's own [partition marks](field.md#a-field-can-be-a-partition-column), and refuses a
@@ -1291,9 +1454,10 @@ is future work behind an HTTP storage backend.
 
 ## Data files aim at a size
 
-!!! note "Rust only"
-    The size target and compaction are core surfaces the bindings do not
-    project yet.
+!!! note "All three"
+    The bindings read the target as `target_file_size` / `targetFileSize` and
+    rewrite with `compact()`, which reports the same three numbers in each
+    language's casing.
 
 One key names the target: the table property `write.target-file-size-bytes`, falling back to the
 schema root's `iceberg:write.target-file-size-bytes` protocol property, then Iceberg's 512 MiB
@@ -1301,47 +1465,123 @@ default. A partition's stream rolls to a new data file at the batch boundary tha
 target - sized by Arrow in-memory bytes, so Parquet's compression lands files under the target
 rather than at it - and a table that has accumulated small files rewrites them:
 
-```rust
-use std::sync::Arc;
+=== "Rust"
 
-use arrow_array::{Int64Array, RecordBatch};
-use yggdryl::iceberg::{Catalog, FormatVersion};
-use yggdryl::local::Folder;
-use yggdryl::DataType;
+    ```rust
+    use std::sync::Arc;
 
-let warehouse = std::env::temp_dir().join("yggdryl-doc-compaction");
-let _ = std::fs::remove_dir_all(&warehouse);
-let catalog = Catalog::new(Folder::new(&warehouse)?);
+    use arrow_array::{Int64Array, RecordBatch};
+    use yggdryl::iceberg::{Catalog, FormatVersion};
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
 
-let schema = DataType::from_fields([DataType::Int64.required_field("id")])?
-    .required_field("row");
-let arrow_schema = schema.to_arrow_schema()?;
-let one = |id: i64| {
-    RecordBatch::try_new(
-        Arc::clone(&arrow_schema),
-        vec![Arc::new(Int64Array::from(vec![id]))],
-    )
-};
+    let warehouse = std::env::temp_dir().join("yggdryl-doc-compaction");
+    let _ = std::fs::remove_dir_all(&warehouse);
+    let catalog = Catalog::new(Folder::new(&warehouse)?);
 
-// Five appends, five snapshots, five small files.
-let mut table = catalog.create_table("tiny.rows", schema)?;
-for id in 0..5 {
-    let batch = one(id)?;
-    table.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
-}
-assert_eq!(table.inspect_files()?.next().expect("one batch")?.num_rows(), 5);
+    let schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    let arrow_schema = schema.to_arrow_schema()?;
+    let one = |id: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![id]))],
+        )
+    };
 
-// Compaction rewrites the small groups as one replace commit and reports it.
-let compaction = table.compact()?;
-assert_eq!(compaction.files_before, 5);
-assert_eq!(compaction.files_after, 1);
-assert_eq!(table.scan(None)?.map(|batch| batch.map(|b| b.num_rows())).sum::<Result<usize, _>>()?, 5);
+    // Five appends, five snapshots, five small files.
+    let mut table = catalog.create_table("tiny.rows", schema)?;
+    for id in 0..5 {
+        let batch = one(id)?;
+        table.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+    }
+    assert_eq!(table.inspect_files()?.next().expect("one batch")?.num_rows(), 5);
 
-// Nothing to do is a no-op that commits nothing.
-assert_eq!(table.compact()?, yggdryl::iceberg::Compaction::default());
+    // Compaction rewrites the small groups as one replace commit and reports it.
+    let compaction = table.compact()?;
+    assert_eq!(compaction.files_before, 5);
+    assert_eq!(compaction.files_after, 1);
+    assert_eq!(table.scan(None)?.map(|batch| batch.map(|b| b.num_rows())).sum::<Result<usize, _>>()?, 5);
 
-let _ = std::fs::remove_dir_all(&warehouse);
-```
+    // Nothing to do is a no-op that commits nothing.
+    assert_eq!(table.compact()?, yggdryl::iceberg::Compaction::default());
+
+    let _ = std::fs::remove_dir_all(&warehouse);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import shutil
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl.iceberg import Catalog
+
+    warehouse = pathlib.Path(tempfile.mkdtemp(prefix="yggdryl-doc-")) / "warehouse"
+    catalog = Catalog(warehouse)
+
+    # The default target is Iceberg's own 512 MiB.
+    columns = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+    table = catalog.create_table("tiny.rows", columns)
+    assert table.target_file_size == 512 * 1024 * 1024
+
+    # Five appends, five snapshots, five small files.
+    for value in range(5):
+        table.append(pa.record_batch({"id": [value]}, schema=columns))
+    assert table.inspect_files().read_all().num_rows == 5
+
+    # Compaction rewrites the small groups as one replace commit and reports it.
+    compaction = table.compact()
+    assert compaction.files_before == 5
+    assert compaction.files_after == 1
+    assert compaction.bytes_rewritten > 0
+    assert table.scan().read_all().num_rows == 5
+
+    # Nothing to do is a no-op that commits nothing.
+    done = table.compact()
+    assert (done.files_before, done.files_after, done.bytes_rewritten) == (0, 0, 0)
+
+    shutil.rmtree(warehouse.parent)
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, iceberg } = require('@yggdryl/node')
+
+    const warehouse = fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-doc-'))
+    const catalog = new iceberg.Catalog(warehouse)
+
+    // The default target is Iceberg's own 512 MiB.
+    const table = catalog.createTable('tiny.rows', [Field.from('id: int64')])
+    assert.equal(table.targetFileSize, 512 * 1024 * 1024)
+
+    // Five appends, five snapshots, five small files.
+    for (const value of [0n, 1n, 2n, 3n, 4n]) {
+      table.append(new arrow.Table({ id: arrow.vectorFromArray([value], new arrow.Int64()) }))
+    }
+    assert.equal(table.inspectFiles().toTable().numRows, 5)
+
+    // Compaction rewrites the small groups as one replace commit and reports it.
+    const compaction = table.compact()
+    assert.equal(compaction.filesBefore, 5)
+    assert.equal(compaction.filesAfter, 1)
+    assert.ok(compaction.bytesRewritten > 0)
+    assert.equal(table.scan().toTable().numRows, 5)
+
+    // Nothing to do is a no-op that commits nothing.
+    assert.deepEqual(table.compact(), { filesBefore: 0, filesAfter: 0, bytesRewritten: 0 })
+
+    fs.rmSync(warehouse, { recursive: true, force: true })
+    ```
 
 Compaction groups live files by partition, touches only groups holding at least two files with one
 under the target, and carries every other file into the new snapshot exactly as a merge carries the
@@ -1350,10 +1590,10 @@ never rewrites history.
 
 ## The Spark quickstart, locally
 
-!!! note "Rust only"
-    The same walk runs from the bindings through the record surface; the
-    evolution and time-travel steps are core surfaces the bindings do not
-    project yet.
+!!! note "All three"
+    The same walk now runs from Python and JavaScript: the catalog, the writes,
+    the schema evolution, and the look back each have their three-language form
+    in the sections above, so the quickstart itself is shown once, in Rust.
 
 The scenario the [Spark quickstart](https://iceberg.apache.org/spark-quickstart/) walks - create
 `nyc.taxis`, insert, read, update, delete, evolve, look back - runs against this module with no
@@ -1751,59 +1991,143 @@ Writing a schema whose columns were never numbered fails, and says so:
 
 ## Evolving a schema
 
-!!! note "Rust only"
-    Column-level evolution is a core surface the bindings do not project yet.
+!!! note "All three"
+    Python records the chain on `update_schema()` as a context manager,
+    JavaScript on a builder ending in `commit()`, and `can_promote` /
+    `canPromote` answers the promotion list everywhere.
 
 A column change is a new schema, and `SchemaUpdate` is how one is built from the current one:
 record the operations, apply, and commit the result. Only the promotions Iceberg allows are
 accepted, so a change that would reinterpret stored values is refused naming both sides.
 
-```rust
-use yggdryl::iceberg::{can_promote, FormatVersion, PartitionSpec, SchemaUpdate, Table, assign_field_ids};
-use yggdryl::local::Folder;
-use yggdryl::DataType;
+=== "Rust"
 
-let root = std::env::temp_dir().join("yggdryl-doc-evolution");
-let _ = std::fs::remove_dir_all(&root);
-let mut schema = DataType::from_fields([
-    DataType::Int32.required_field("id"),
-    DataType::Utf8.nullable_field("symbol"),
-])?
-.required_field("row");
-assign_field_ids(&mut schema, 1)?;
-let mut table = Table::create(
-    Folder::new(&root)?,
-    FormatVersion::V2,
-    schema,
-    PartitionSpec::unpartitioned(),
-)?;
+    ```rust
+    use yggdryl::iceberg::{can_promote, FormatVersion, PartitionSpec, SchemaUpdate, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
 
-// Legal promotions pass; anything else is refused naming both sides.
-assert!(can_promote(&DataType::Int32, &DataType::Int64).is_ok());
-assert!(can_promote(&DataType::decimal(10, 2)?, &DataType::decimal(18, 2)?).is_ok());
-let message = can_promote(&DataType::Int64, &DataType::Int32).unwrap_err().to_string();
-assert!(message.contains("int64") && message.contains("int32"));
+    let root = std::env::temp_dir().join("yggdryl-doc-evolution");
+    let _ = std::fs::remove_dir_all(&root);
+    let mut schema = DataType::from_fields([
+        DataType::Int32.required_field("id"),
+        DataType::Utf8.nullable_field("symbol"),
+    ])?
+    .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    let mut table = Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema,
+        PartitionSpec::unpartitioned(),
+    )?;
 
-// Widen id, rename symbol, add venue - one evolved schema, one commit.
-let mut update = SchemaUpdate::for_metadata(table.metadata())?;
-update.update_type("id", DataType::Int64);
-update.rename_column("symbol", "ticker");
-update.add_column("", DataType::Utf8.nullable_field("venue"));
-let evolved = update.apply()?;
+    // Legal promotions pass; anything else is refused naming both sides.
+    assert!(can_promote(&DataType::Int32, &DataType::Int64).is_ok());
+    assert!(can_promote(&DataType::decimal(10, 2)?, &DataType::decimal(18, 2)?).is_ok());
+    let message = can_promote(&DataType::Int64, &DataType::Int32).unwrap_err().to_string();
+    assert!(message.contains("int64") && message.contains("int32"));
 
-table.commit_changes(|metadata| {
-    let schema_id = metadata.add_schema(evolved.clone())?;
-    metadata.set_current_schema(schema_id)
-})?;
+    // Widen id, rename symbol, add venue - one evolved schema, one commit.
+    let mut update = SchemaUpdate::for_metadata(table.metadata())?;
+    update.update_type("id", DataType::Int64);
+    update.rename_column("symbol", "ticker");
+    update.add_column("", DataType::Utf8.nullable_field("venue"));
+    let evolved = update.apply()?;
 
-let current = table.schema()?;
-assert_eq!(current.get_field_by_name("id").expect("the column").data_type(), &DataType::Int64);
-// A renamed column keeps its identifier: the name is a label, the id is the column.
-assert_eq!(current.get_field_by_name("ticker").expect("the column").id()?, Some(2));
-assert_eq!(current.get_field_by_name("venue").expect("the column").id()?, Some(3));
+    table.commit_changes(|metadata| {
+        let schema_id = metadata.add_schema(evolved.clone())?;
+        metadata.set_current_schema(schema_id)
+    })?;
 
-let _ = std::fs::remove_dir_all(&root);
-```
+    let current = table.schema()?;
+    assert_eq!(current.get_field_by_name("id").expect("the column").data_type(), &DataType::Int64);
+    // A renamed column keeps its identifier: the name is a label, the id is the column.
+    assert_eq!(current.get_field_by_name("ticker").expect("the column").id()?, Some(2));
+    assert_eq!(current.get_field_by_name("venue").expect("the column").id()?, Some(3));
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import shutil
+    import tempfile
+
+    import pyarrow as pa
+    import pytest
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids, can_promote
+
+    # Legal promotions pass; anything else is refused naming both sides.
+    assert can_promote("int32", "int64") is None
+    assert can_promote("decimal128(10, 2)", "decimal128(18, 2)") is None
+    with pytest.raises(ValueError, match="int64 to int32"):
+        can_promote("int64", "int32")
+
+    columns = pa.schema([
+        pa.field("id", pa.int32(), nullable=False),
+        pa.field("symbol", pa.string()),
+    ])
+    root = pathlib.Path(tempfile.mkdtemp(prefix="yggdryl-doc-")) / "trades"
+    table = Table.create(IOBase(root), assign_field_ids(columns))
+
+    # Widen id, rename symbol, add venue - one evolved schema, one commit.
+    with table.update_schema() as update:
+        update.update_type("id", "int64").rename_column("symbol", "ticker")
+        update.add_column("", "venue: string")
+
+    children = list(table.schema.data_type)
+    assert [child.name for child in children] == ["id", "ticker", "venue"]
+    assert str(children[0].data_type) == "int64"
+    # A renamed column keeps its identifier: the name is a label, the id is the column.
+    assert [child.id for child in children] == [1, 2, 3]
+
+    shutil.rmtree(root.parent)
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    // Legal promotions pass; anything else is refused naming both sides.
+    iceberg.canPromote('int32', 'int64')
+    iceberg.canPromote('decimal128(10, 2)', 'decimal128(18, 2)')
+    assert.throws(() => iceberg.canPromote('int64', 'int32'), /int64 to int32/)
+
+    const declared = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int32'), Field.from('symbol: utf8')], {
+        nullable: false,
+      }),
+    )
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-doc-')), 'trades')
+    const table = iceberg.Table.create(root, declared)
+
+    // Widen id, rename symbol, add venue - one evolved schema, one commit.
+    const schemaId = table
+      .updateSchema()
+      .updateType('id', 'int64')
+      .renameColumn('symbol', 'ticker')
+      .addColumn('', 'venue: utf8')
+      .commit()
+    assert.equal(schemaId, 1)
+
+    const evolved = table.schema
+    assert.deepEqual(Array.from(evolved.dataType, (child) => child.name), ['id', 'ticker', 'venue'])
+    assert.equal(String(evolved.dataType.at(0).dataType), 'int64')
+    // A renamed column keeps its identifier: the name is a label, the id is the column.
+    assert.deepEqual(Array.from(evolved.dataType, (child) => child.id), [1, 2, 3])
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
 
 `TableMetadata` carries the rest of the update vocabulary - `set_property`/`remove_property`,
 `set_location`, `assign_uuid`, `upgrade_format_version`, `set_snapshot_ref`/`remove_snapshot_ref`,

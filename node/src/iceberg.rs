@@ -8,23 +8,100 @@
 
 use std::collections::HashMap;
 
-use napi::bindgen_prelude::{BigInt, Buffer, ClassInstance, Either, Result};
+use napi::bindgen_prelude::{BigInt, Buffer, ClassInstance, Either, Either3, Result};
 use napi_derive::napi;
-use yggdryl::Field as CoreField;
 use yggdryl::generic::Holder;
 use yggdryl::iceberg::{
-    DataFile, FormatVersion, ManifestContent, ManifestFile, PartitionSpec as CorePartitionSpec,
-    Snapshot, Table as CoreTable, assign_field_ids, schema_from_json, schema_to_json,
+    Catalog as CoreCatalog, DataFile, FormatVersion, ManifestContent, ManifestFile,
+    PartitionSpec as CorePartitionSpec, SchemaUpdate as CoreSchemaUpdate, Snapshot,
+    Table as CoreTable, assign_field_ids, can_promote, schema_from_json, schema_to_json,
 };
+use yggdryl::{DataType as CoreDataType, Field as CoreField};
 
 use crate::arrow::JsBatchReader;
 use crate::codec::JsCodecValue;
-use crate::field::JsField;
+use crate::datatype::{JsDataType, data_type_from_input};
+use crate::field::{JsField, MetadataEntry};
 use crate::io::{JsIOBase, LocationInput, folder_from_input};
 use crate::napi_error;
+use crate::uri::PartitionEntry;
 
 /// A partition spec, or the column names one would be built from.
 pub type PartitionInput<'a> = Either<ClassInstance<'a, JsPartitionSpec>, Vec<String>>;
+
+/// A native root `Field`, a field expression, or the child fields of a row.
+pub type TableSchemaInput<'a> =
+    Either3<ClassInstance<'a, JsField>, String, Vec<ClassInstance<'a, JsField>>>;
+
+/// A native `Field` or the field expression naming one.
+pub type FieldInput<'a> = Either<ClassInstance<'a, JsField>, String>;
+
+/// A native `DataType` or the type expression naming one.
+pub type DataTypeInput<'a> = Either<ClassInstance<'a, JsDataType>, String>;
+
+/// A retained snapshot id: the `bigint` a snapshot reports, or a safe number.
+pub type SnapshotIdInput = Either<BigInt, f64>;
+
+/// Scan filters: `(column, value)` text pairs as entries or as one mapping.
+pub type ScanFilters = Either<Vec<PartitionEntry>, HashMap<String, String>>;
+
+/// Table property updates: ordered entries or one plain mapping.
+pub type PropertyUpdates = Either<Vec<MetadataEntry>, HashMap<String, String>>;
+
+/// The root name a schema assembled from bare child fields is given.
+///
+/// It matches the name the core catalog gives a schema inferred from an
+/// incoming reader, so both spellings of "just the columns" agree.
+const ROOT_NAME: &str = "row";
+
+/// Read the schema an input names: a root `Field` as it stands, an expression
+/// through the core parser, or bare children assembled under a `row` root.
+fn schema_from_input(value: TableSchemaInput<'_>) -> Result<CoreField> {
+    match value {
+        Either3::A(field) => Ok(field.inner.clone()),
+        Either3::B(text) => CoreField::from_str(&text).map_err(napi_error),
+        Either3::C(children) => {
+            let fields = children.iter().map(|child| child.inner.clone());
+            Ok(CoreDataType::from_fields(fields)
+                .map_err(napi_error)?
+                .required_field(ROOT_NAME))
+        }
+    }
+}
+
+/// Read the field an input names, exactly as `Field.from` infers one.
+fn field_from_input(value: FieldInput<'_>) -> Result<CoreField> {
+    match value {
+        Either::A(field) => Ok(field.inner.clone()),
+        Either::B(text) => CoreField::from_str(&text).map_err(napi_error),
+    }
+}
+
+/// Read a snapshot id exactly: a `bigint` as is, a number below 2^53.
+fn snapshot_id_from_input(value: SnapshotIdInput) -> Result<i64> {
+    match value {
+        Either::A(value) => {
+            let (id, lossless) = value.get_i64();
+            if !lossless {
+                return Err(napi_error("snapshotId must fit in a signed 64-bit integer"));
+            }
+            Ok(id)
+        }
+        Either::B(value) => crate::exact_i64(value, "snapshotId"),
+    }
+}
+
+/// Collect scan filters into owned `(column, value)` pairs.
+fn filter_pairs(filters: Option<ScanFilters>) -> Vec<(String, String)> {
+    match filters {
+        None => Vec::new(),
+        Some(Either::A(entries)) => entries
+            .into_iter()
+            .map(|entry| (entry.column, entry.value))
+            .collect(),
+        Some(Either::B(values)) => values.into_iter().collect(),
+    }
+}
 
 /// Read the format version a number names, defaulting to v2.
 fn format_version(value: Option<u32>) -> Result<FormatVersion> {
@@ -608,10 +685,385 @@ impl JsTable {
             .map_err(napi_error)
     }
 
+    /// Read one retained snapshot's rows: time travel as an ordinary scan.
+    ///
+    /// `snapshotId` is the identifier a snapshot reports, as a `bigint` or as
+    /// a number no larger than 2^53. `filters` is the same `(column, value)`
+    /// pair vocabulary `childrenWhere` uses, and `schema` keeps the columns it
+    /// names, exactly as on [`scan`](Self::scan). The rows are read as the
+    /// schema the snapshot was written under.
+    #[napi]
+    pub fn scan_at(
+        &self,
+        snapshot_id: SnapshotIdInput,
+        filters: Option<ScanFilters>,
+        schema: Option<FieldInput<'_>>,
+    ) -> Result<JsBatchReader> {
+        let root_name = self.root_name()?;
+        let snapshot_id = snapshot_id_from_input(snapshot_id)?;
+        let pairs = filter_pairs(filters);
+        let borrowed: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_str()))
+            .collect();
+        let schema = schema.map(field_from_input).transpose()?;
+        let reader = self
+            .inner
+            .scan_at(snapshot_id, &borrowed, schema.as_ref())
+            .map_err(napi_error)?;
+        Ok(JsBatchReader::from_core(reader, &root_name))
+    }
+
+    /// Return the retained snapshot a branch or tag names.
+    ///
+    /// A name the table does not have is refused naming the refs it does.
+    #[napi]
+    pub fn snapshot_by_ref(&self, name: String) -> Result<SnapshotView> {
+        self.inner
+            .snapshot_by_ref(&name)
+            .map(snapshot_view)
+            .map_err(napi_error)
+    }
+
+    /// The size a data file aims for, in bytes.
+    ///
+    /// The table property `write.target-file-size-bytes` decides, falling back
+    /// to the schema root's protocol property of the same name, then to
+    /// Iceberg's own 512 MiB default. A present-but-unparseable value throws
+    /// naming the key and the value rather than silently using the default.
+    #[napi(getter)]
+    pub fn target_file_size(&self) -> Result<i64> {
+        let target = self.inner.target_file_size().map_err(napi_error)?;
+        Ok(i64::try_from(target).unwrap_or(i64::MAX))
+    }
+
+    /// Merge the current snapshot's undersized data files, per partition.
+    ///
+    /// The commit is one `replace` snapshot, so the pre-compaction snapshot
+    /// stays readable through [`scanAt`](Self::scan_at). A table with nothing
+    /// to compact commits nothing and reports zeros.
+    #[napi]
+    pub fn compact(&mut self) -> Result<Compaction> {
+        let outcome = self.inner.compact().map_err(napi_error)?;
+        Ok(Compaction {
+            files_before: i64::try_from(outcome.files_before).unwrap_or(i64::MAX),
+            files_after: i64::try_from(outcome.files_after).unwrap_or(i64::MAX),
+            bytes_rewritten: outcome.bytes_rewritten,
+        })
+    }
+
+    /// Render when each snapshot became current, oldest first.
+    ///
+    /// The columns are `made_current_at`, `snapshot_id`, `parent_id`, and
+    /// `is_current_ancestor`, the names `PyIceberg`'s `history` table uses.
+    #[napi]
+    pub fn inspect_history(&self) -> Result<JsBatchReader> {
+        let reader = self.inner.inspect_history().map_err(napi_error)?;
+        Ok(JsBatchReader::from_core(reader, "history"))
+    }
+
+    /// Render every retained snapshot with its operation and summary.
+    ///
+    /// The columns are `committed_at`, `snapshot_id`, `parent_id`,
+    /// `operation`, `manifest_list`, and the free-form `summary` map.
+    #[napi]
+    pub fn inspect_snapshots(&self) -> Result<JsBatchReader> {
+        let reader = self.inner.inspect_snapshots().map_err(napi_error)?;
+        Ok(JsBatchReader::from_core(reader, "snapshots"))
+    }
+
+    /// Render the live data files of the current snapshot.
+    ///
+    /// The columns are `file_path`, `file_format`, `spec_id`, the rendered
+    /// `partition` chain, `record_count`, and `file_size_in_bytes`.
+    #[napi]
+    pub fn inspect_files(&self) -> Result<JsBatchReader> {
+        let reader = self.inner.inspect_files().map_err(napi_error)?;
+        Ok(JsBatchReader::from_core(reader, "files"))
+    }
+
+    /// Set and remove table properties as one metadata-only commit.
+    ///
+    /// `updates` is a mapping of properties to set and `removes` lists the
+    /// keys to drop, in that order. Passing neither commits nothing at all: a
+    /// commit that changes no property would still cost a metadata document.
+    #[napi]
+    pub fn update_properties(
+        &mut self,
+        updates: Option<PropertyUpdates>,
+        removes: Option<Vec<String>>,
+    ) -> Result<()> {
+        let updates: Vec<(String, String)> = match updates {
+            None => Vec::new(),
+            Some(Either::A(entries)) => entries
+                .into_iter()
+                .map(|entry| (entry.key, entry.value))
+                .collect(),
+            Some(Either::B(values)) => values.into_iter().collect(),
+        };
+        let removes = removes.unwrap_or_default();
+        if updates.is_empty() && removes.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .commit_changes(|metadata| {
+                for (key, value) in updates {
+                    metadata.set_property(key, value)?;
+                }
+                for key in &removes {
+                    metadata.remove_property(key);
+                }
+                Ok(())
+            })
+            .map_err(napi_error)
+    }
+
+    /// The native half of `updateSchema().commit()`.
+    ///
+    /// The recorded operations are replayed onto a fresh core `SchemaUpdate`
+    /// built from the metadata the table holds *now*, the evolved schema is
+    /// added and made current, and one new metadata document is written. The
+    /// wrapper needs no refresh: a failed commit leaves the table as it was.
+    #[napi(js_name = "_commitSchemaUpdateNative", skip_typescript)]
+    pub fn commit_schema_update(&mut self, update: &JsSchemaUpdate) -> Result<i32> {
+        let mut evolution =
+            CoreSchemaUpdate::for_metadata(self.inner.metadata()).map_err(napi_error)?;
+        for op in &update.ops {
+            match op {
+                SchemaOp::AddColumn { parent, field } => {
+                    evolution.add_column(parent, field.clone());
+                }
+                SchemaOp::DropColumn { path } => evolution.drop_column(path),
+                SchemaOp::RenameColumn { path, name } => {
+                    evolution.rename_column(path, name.clone());
+                }
+                SchemaOp::UpdateDoc { path, doc } => evolution.update_doc(path, doc.clone()),
+                SchemaOp::MakeNullable { path } => evolution.make_nullable(path),
+                SchemaOp::UpdateType { path, data_type } => {
+                    evolution.update_type(path, data_type.clone());
+                }
+            }
+        }
+        let evolved = evolution.apply().map_err(napi_error)?;
+        self.inner.evolve_schema(evolved).map_err(napi_error)
+    }
+
     /// Return where the table lives, so a table prints as its location.
     #[napi]
     pub fn to_string(&self) -> String {
         self.location()
+    }
+}
+
+/// What one `compact` call rewrote.
+///
+/// The sizes cross as numbers because a data file already reports
+/// `fileSizeInBytes` as one, and the two must agree.
+#[napi(object)]
+pub struct Compaction {
+    /// How many live data files were read and replaced.
+    pub files_before: i64,
+    /// How many data files the rewrite produced in their place.
+    pub files_after: i64,
+    /// The recorded size of the replaced files, in bytes.
+    pub bytes_rewritten: i64,
+}
+
+/// One recorded column operation, held as native values until a commit.
+enum SchemaOp {
+    /// Append a column under a parent path, `""` naming the root itself.
+    AddColumn { parent: String, field: CoreField },
+    /// Remove a column, retiring its identifier forever.
+    DropColumn { path: String },
+    /// Rename a column, keeping its identifier.
+    RenameColumn { path: String, name: String },
+    /// Set a column's `iceberg:doc` documentation string.
+    UpdateDoc { path: String, doc: String },
+    /// Relax a required column to optional.
+    MakeNullable { path: String },
+    /// Promote a column's type, checked when the update is applied.
+    UpdateType {
+        path: String,
+        data_type: CoreDataType,
+    },
+}
+
+/// A recording of column operations against a table's current schema.
+///
+/// The loader hands one out from `table.updateSchema()` and wraps each method
+/// to return the builder, so a chain reads as one sentence. Nothing is checked
+/// while recording: `commit()` replays the recording onto a fresh core
+/// `SchemaUpdate`, which is what makes the operations apply to the schema the
+/// table has *then* and report the first failure with its core message.
+#[napi(js_name = "SchemaUpdate")]
+#[derive(Default)]
+pub struct JsSchemaUpdate {
+    /// The recorded operations, in call order.
+    ops: Vec<SchemaOp>,
+}
+
+#[napi]
+impl JsSchemaUpdate {
+    /// Start an empty recording.
+    #[napi(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a new column under `parent` - `""` for the root, a dotted path
+    /// for a nested struct.
+    #[napi]
+    pub fn add_column(&mut self, parent: String, field: FieldInput<'_>) -> Result<()> {
+        let field = field_from_input(field)?;
+        self.ops.push(SchemaOp::AddColumn { parent, field });
+        Ok(())
+    }
+
+    /// Record the removal of the column at `path`, retiring its identifier.
+    #[napi]
+    pub fn drop_column(&mut self, path: String) {
+        self.ops.push(SchemaOp::DropColumn { path });
+    }
+
+    /// Record a rename of the column at `path`; its identifier is kept.
+    #[napi]
+    pub fn rename_column(&mut self, path: String, name: String) {
+        self.ops.push(SchemaOp::RenameColumn { path, name });
+    }
+
+    /// Record a new `iceberg:doc` documentation string on the column at `path`.
+    #[napi]
+    pub fn update_doc(&mut self, path: String, doc: String) {
+        self.ops.push(SchemaOp::UpdateDoc { path, doc });
+    }
+
+    /// Record that the column at `path` becomes optional.
+    #[napi]
+    pub fn make_nullable(&mut self, path: String) {
+        self.ops.push(SchemaOp::MakeNullable { path });
+    }
+
+    /// Record a type promotion on the column at `path`.
+    #[napi]
+    pub fn update_type(&mut self, path: String, data_type: DataTypeInput<'_>) -> Result<()> {
+        let data_type = data_type_from_input(data_type)?;
+        self.ops.push(SchemaOp::UpdateType { path, data_type });
+        Ok(())
+    }
+}
+
+/// A warehouse folder of namespaces of Iceberg tables.
+///
+/// The catalog is storage and nothing else: a dotted name like `"nyc.taxis"`
+/// names the folder `nyc/taxis` under the warehouse handle, and constructing
+/// one touches nothing at all. There is no service in between, so two catalogs
+/// over the same folder see the same tables.
+#[napi(js_name = "Catalog")]
+pub struct JsCatalog {
+    inner: CoreCatalog<Holder>,
+}
+
+#[napi]
+impl JsCatalog {
+    /// Describe a catalog over a warehouse folder, touching nothing.
+    ///
+    /// `warehouse` accepts whatever names a location - a path or URL string, a
+    /// native `Url`, or a handle - the same inputs `Table.create`'s root takes.
+    #[napi(constructor)]
+    pub fn new(warehouse: LocationInput<'_>) -> Result<Self> {
+        Ok(Self {
+            inner: CoreCatalog::new(folder_from_input(warehouse)?),
+        })
+    }
+
+    /// Create the named table, writing its first metadata document.
+    ///
+    /// `schema` is a root `Field`, a field expression, or an array of child
+    /// `Field`s assembled under a root named `row`. Unnumbered columns are
+    /// numbered, and the partition spec is derived from the columns the schema
+    /// itself marks - a schema that marks none produces an unpartitioned
+    /// table.
+    #[napi]
+    pub fn create_table(&self, name: String, schema: TableSchemaInput<'_>) -> Result<JsTable> {
+        self.inner
+            .create_table(&name, schema_from_input(schema)?)
+            .map(JsTable::from_core)
+            .map_err(napi_error)
+    }
+
+    /// Open the named table.
+    #[napi]
+    pub fn table(&self, name: String) -> Result<JsTable> {
+        self.inner
+            .table(&name)
+            .map(JsTable::from_core)
+            .map_err(napi_error)
+    }
+
+    /// Return whether the named table exists.
+    #[napi]
+    pub fn has_table(&self, name: String) -> Result<bool> {
+        self.inner.has_table(&name).map_err(napi_error)
+    }
+
+    /// Open the named table if it exists, creating it otherwise.
+    ///
+    /// An existing table is opened as it is - `schema` describes only the
+    /// table this call would create.
+    #[napi]
+    pub fn open_or_create_table(
+        &self,
+        name: String,
+        schema: TableSchemaInput<'_>,
+    ) -> Result<JsTable> {
+        self.inner
+            .open_or_create_table(&name, schema_from_input(schema)?)
+            .map(JsTable::from_core)
+            .map_err(napi_error)
+    }
+
+    /// Append `data` to the named table, creating it on first write.
+    ///
+    /// A table that is not there yet takes its schema from the reader, so a
+    /// caller who only has rows and a name needs nothing else. Returns the
+    /// table so the caller can keep going.
+    #[napi]
+    pub fn append(&self, name: String, data: &mut JsBatchReader) -> Result<JsTable> {
+        self.inner
+            .append(&name, data.take()?)
+            .map(JsTable::from_core)
+            .map_err(napi_error)
+    }
+
+    /// Replace the named table's rows with `data`, creating it on first write.
+    ///
+    /// An existing table keeps its previous snapshot readable; only the
+    /// current pointer moves. Returns the table so the caller can keep going.
+    #[napi]
+    pub fn overwrite(&self, name: String, data: &mut JsBatchReader) -> Result<JsTable> {
+        self.inner
+            .overwrite(&name, data.take()?)
+            .map(JsTable::from_core)
+            .map_err(napi_error)
+    }
+
+    /// List the namespaces one level below `parent`, as sorted dotted names.
+    ///
+    /// Omitting `parent` lists the warehouse's own child folders. A parent
+    /// that does not exist lists nothing rather than failing.
+    #[napi]
+    pub fn list_namespaces(&self, parent: Option<String>) -> Result<Vec<String>> {
+        self.inner
+            .list_namespaces(parent.as_deref())
+            .map_err(napi_error)
+    }
+
+    /// List the tables in a namespace, as sorted dotted names.
+    ///
+    /// A namespace that does not exist lists nothing rather than failing.
+    #[napi]
+    pub fn list_tables(&self, namespace: String) -> Result<Vec<String>> {
+        self.inner.list_tables(&namespace).map_err(napi_error)
     }
 }
 
@@ -640,4 +1092,17 @@ pub fn iceberg_schema_to_json(schema: &JsField) -> Result<JsCodecValue> {
     schema_to_json(&schema.inner)
         .map(JsCodecValue::from_core)
         .map_err(napi_error)
+}
+
+/// Check one type change against the promotions Iceberg allows.
+///
+/// Returns nothing on a legal promotion and throws the core message naming
+/// both sides for every other change.
+#[napi(js_name = "icebergCanPromoteNative", skip_typescript)]
+pub fn iceberg_can_promote(from_type: DataTypeInput<'_>, to_type: DataTypeInput<'_>) -> Result<()> {
+    can_promote(
+        &data_type_from_input(from_type)?,
+        &data_type_from_input(to_type)?,
+    )
+    .map_err(napi_error)
 }

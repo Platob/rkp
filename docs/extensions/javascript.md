@@ -466,11 +466,65 @@ assert.equal(table.scan().toTable().numRows, 2)
 fs.rmSync(path.dirname(root), { recursive: true, force: true })
 ```
 
-`iceberg.Table`, `iceberg.PartitionSpec`, and `iceberg.DataFile` are the classes;
-`iceberg.assignFieldIds`, `iceberg.schemaFromJson`, and `iceberg.schemaToJson` are the functions. A
-snapshot and a manifest arrive as plain objects, because they are records of what happened rather
-than values with behaviour, and a 64-bit identifier crosses as a `bigint` so a snapshot id past 2^53
-is exact.
+`iceberg.Table`, `iceberg.Catalog`, `iceberg.PartitionSpec`, and `iceberg.DataFile` are the
+classes; `iceberg.assignFieldIds`, `iceberg.canPromote`, `iceberg.schemaFromJson`, and
+`iceberg.schemaToJson` are the functions. A snapshot and a manifest arrive as plain objects,
+because they are records of what happened rather than values with behaviour, and a 64-bit
+identifier crosses as a `bigint` so a snapshot id past 2^53 is exact.
+
+## An Iceberg table end to end
+
+A warehouse is one `iceberg.Catalog` over a folder, and a dotted name is all a writer needs: the
+first append creates the table from the rows' own schema. Every rows argument here is widened by
+`BatchReader.from` exactly as it is on `IOBase`, so an Apache Arrow JS table appends directly. A
+column change is a chain recorded on `updateSchema()` and committed once, `compact()` rewrites
+undersized files as one `replace` snapshot and reports what it rewrote, and `scanAt` reads any
+retained snapshot - named by a `bigint` or an exact `number` - as a complete table.
+
+```javascript
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const arrow = require('apache-arrow')
+const { iceberg } = require('@yggdryl/node')
+
+const warehouse = fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-doc-'))
+const catalog = new iceberg.Catalog(warehouse)
+
+// Rows and a dotted name are enough: the first append creates the table.
+const rows = (ids, venues) =>
+  new arrow.Table({
+    id: arrow.vectorFromArray(ids, new arrow.Int64()),
+    venue: arrow.vectorFromArray(venues, new arrow.Utf8()),
+  })
+const table = catalog.append('nyc.trades', rows([1n, 2n], ['XNAS', 'XNYS']))
+const past = table.currentSnapshot.snapshotId
+table.append(rows([3n], ['XASE']))
+assert.deepEqual(catalog.listTables('nyc'), ['nyc.trades'])
+assert.equal(table.scan().toTable().numRows, 3)
+
+// A column change is a chain recorded on the update, committed once.
+table.updateSchema().addColumn('', 'price: float64').commit()
+assert.equal(table.scan().toTable().getChild('price').get(0), null)
+
+// Undersized files rewrite as one replace commit that reports itself.
+const compaction = table.compact()
+assert.equal(compaction.filesBefore, 2)
+assert.equal(compaction.filesAfter, 1)
+assert.equal(table.scan().toTable().numRows, 3)
+
+// And nothing rewrote history: the first snapshot reads as it was written.
+assert.deepEqual(
+  table.scanAt(past).toTable().getChild('id').toArray(),
+  BigInt64Array.from([1n, 2n]),
+)
+
+fs.rmSync(warehouse, { recursive: true, force: true })
+```
+
+The walk is the same in every language: the [iceberg](../core/iceberg.md) page shows each of these
+steps beside its Rust and Python form.
 
 ## Errors
 

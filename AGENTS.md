@@ -1184,8 +1184,9 @@ These rules apply to both the Python and JavaScript extensions.
   found. A foreign codec name crosses as the text that format's own parser
   accepts, never as its `Display` when the two disagree.
 - **A table format is a module, not a pile of top-level names.**
-  `yggdryl::iceberg` is `yggdryl.iceberg`, holding `Table`, `PartitionSpec`,
-  `PartitionField`, `Snapshot`, `ManifestFile`, `DataFile`, `assign_field_ids`,
+  `yggdryl::iceberg` is `yggdryl.iceberg`, holding `Table`, `Catalog`,
+  `Compaction`, `SchemaUpdate`, `PartitionField`, `PartitionSpec`, `Snapshot`,
+  `ManifestFile`, `DataFile`, `assign_field_ids`, `can_promote`,
   `schema_from_json`, and `schema_to_json` and nothing else. A table is built
   from an `IOBase` handle and from nothing else, a scan is a
   `pyarrow.RecordBatchReader`, and the metadata values are read-only views of
@@ -1193,6 +1194,24 @@ These rules apply to both the Python and JavaScript extensions.
   arguments in the same order - a spec or the column names, then the format
   version - so a table written from one language reads the same call from the
   other.
+- **The bindings commit granularly, never through a closure.** Core
+  `commit_changes` takes a function; across FFI the same intent is
+  `update_properties(updates, removes)` (one commit, nothing when both are
+  empty) and `update_schema()` - a builder that records `add_column`,
+  `drop_column`, `rename_column`, `update_doc`, `make_nullable`, and
+  `update_type` calls, then `commit` replays them onto a fresh core
+  `SchemaUpdate`, adds and selects the schema, and writes one document. In
+  Python the builder is a context manager that commits on clean exit and
+  discards on exception; a spent builder refuses further use. Time travel is
+  `scan_at(snapshot_id, filters, schema)`, refs resolve with
+  `snapshot_by_ref`, compaction is `compact()` returning the counts, and the
+  inspection tables come back as the language's record-reader shape under the
+  same column names as the core.
+- **The catalog crosses with its inference.** `Catalog(warehouse)` accepts a
+  handle or anything that names a folder; `create_table` accepts a native
+  Field, an expression, an Arrow schema, or an iterable of Fields;
+  `append`/`overwrite` accept exactly what `Table.append` accepts and return
+  the table. Names stay dotted in both languages.
 
 ### Python records and annotations
 
@@ -1378,10 +1397,12 @@ These rules apply to both the Python and JavaScript extensions.
   crosses as the text that format's own parser accepts, never as its `Display`
   when the two disagree.
 - **A table format is a namespace, not a pile of top-level classes.**
-  `yggdryl::iceberg` is `iceberg` in the loader, holding `Table`,
-  `PartitionSpec`, `DataFile`, `assignFieldIds`, `schemaFromJson`, and
-  `schemaToJson` and nothing else, and those names appear nowhere else on the
-  package. A snapshot and a manifest arrive as plain objects, because they
+  `yggdryl::iceberg` is `iceberg` in the loader, holding `Table`, `Catalog`,
+  `PartitionSpec`, `DataFile`, `assignFieldIds`, `canPromote`,
+  `schemaFromJson`, and `schemaToJson` and nothing else, and those names
+  appear nowhere else on the package. The schema-update builder is reached
+  only through `table.updateSchema()`, and a compaction report is a plain
+  object, because it records what happened rather than carrying behavior. A snapshot and a manifest arrive as plain objects, because they
   record what happened rather than carry behavior; a 64-bit identifier crosses
   as a `bigint`, because a snapshot id past 2^53 is exact and a number is not.
   Both bindings take the same arguments in the same order - a spec or the

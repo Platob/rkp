@@ -105,4 +105,17 @@ benchmark('iceberg/scan_pushdown', () =>
 benchmark('iceberg/data_files', () => iceTable.dataFiles())
 benchmark('iceberg/open', () => iceberg.Table.open(lake))
 
+// A catalog append crosses the whole boundary a caller with only rows and a
+// name uses: resolve the dotted name against the warehouse, locate the table
+// there, and commit one snapshot. The rows stay small so the number reports
+// that path rather than Parquet encoding.
+const catalog = new iceberg.Catalog(path.join(root, 'warehouse'))
+const catalogRows = arrow.tableToIPC(
+  new arrow.Table({
+    id: arrow.vectorFromArray([1n, 2n, 3n, 4n], new arrow.Int64()),
+  }),
+)
+catalog.append('bench.trades', catalogRows)
+benchmark('iceberg/catalog_append', () => catalog.append('bench.trades', catalogRows))
+
 fs.rmSync(root, { recursive: true, force: true })
