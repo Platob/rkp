@@ -338,6 +338,25 @@ that compiles annotations into native values.
   table's own record renders as record batches through `inspect_history`,
   `inspect_snapshots`, and `inspect_files`, under PyIceberg's column names;
   never add a second, struct-shaped spelling of the same report.
+- **A catalog is a warehouse folder, reached through `IOBase` and nothing
+  else.** `iceberg::Catalog` maps a dotted name (`nyc.taxis`) onto nested
+  folders, creates a table from a schema whose own partition marks supply the
+  spec, and answers create-or-append (`append`) and `overwrite` so a caller
+  who only has rows and a name needs nothing else. It holds no network code
+  and no transaction protocol; a REST catalog remains future work behind an
+  HTTP storage backend. Drop and rename are deliberately absent until the
+  storage contract gains delete and move primitives - name that reason, do not
+  emulate them.
+- **A data file has a target size, and one key names it.** The table property
+  `write.target-file-size-bytes` - falling back to the schema root's
+  `iceberg:write.target-file-size-bytes` protocol property, then Iceberg's 512
+  MiB default - rolls a partition's stream into multiple files at batch
+  boundaries, sized by Arrow in-memory bytes (so Parquet lands under the
+  target, and the docs say so). `Table::compact` rewrites the small-file
+  groups the same rolling way, commits as `replace` carrying every untouched
+  file, reports what it rewrote, and is a no-op that commits nothing when
+  there is nothing to do. A present-but-unparseable size is a typed error
+  naming key and value, never a silent default.
 - **An exchange format is validated against an outside implementation.** Round
   tripping through this crate's own reader proves only that the reader and the
   writer agree with each other. `scripts/check_iceberg_interop.py` and the
