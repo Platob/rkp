@@ -1,0 +1,1579 @@
+//! Iceberg schemas, metadata, manifests, partitions, and whole tables.
+
+use std::sync::Arc;
+
+use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
+
+use crate::io::IOBase;
+use crate::local::Folder;
+use crate::{DataType, Field, Value};
+
+use super::{
+    FormatVersion, PartitionSpec, Table, Transform, assign_field_ids, schema_from_json,
+    schema_to_json,
+};
+
+/// Build a scratch directory unique to this test and this process.
+fn root(label: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("yggdryl-iceberg-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    path
+}
+
+/// The three-column trade schema every table test writes.
+fn trade_schema() -> Field {
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Utf8.nullable_field("symbol"),
+        DataType::Utf8.nullable_field("venue"),
+    ])
+    .unwrap()
+    .required_field("row");
+    assign_field_ids(&mut schema, 1).unwrap();
+    schema.insert_metadata("iceberg:schema-id", "0").unwrap();
+    schema
+}
+
+/// Build one batch of trades against [`trade_schema`].
+fn trades(ids: &[i64], symbols: &[Option<&str>], venues: &[Option<&str>]) -> RecordBatch {
+    let schema = trade_schema().to_arrow_schema().unwrap();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(symbols.to_vec())),
+            Arc::new(StringArray::from(venues.to_vec())),
+        ],
+    )
+    .unwrap()
+}
+
+/// Collect every row of a scan as `(id, symbol, venue)` triples.
+fn collect(reader: crate::arrow::BatchReader) -> Vec<(i64, Option<String>, Option<String>)> {
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone();
+        let symbols = batch.column_by_name("symbol").map(|column| {
+            column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        });
+        let venues = batch.column_by_name("venue").map(|column| {
+            column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        });
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row),
+                symbols
+                    .as_ref()
+                    .filter(|column| !column.is_null(row))
+                    .map(|column| column.value(row).to_owned()),
+                venues
+                    .as_ref()
+                    .filter(|column| !column.is_null(row))
+                    .map(|column| column.value(row).to_owned()),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+mod schema_documents {
+    use super::{Value, assign_field_ids, schema_from_json, schema_to_json};
+    use crate::DataType;
+
+    #[test]
+    fn a_nested_schema_round_trips_through_json() {
+        let document = crate::json::from_str(
+            r#"{
+                "type": "struct",
+                "schema-id": 3,
+                "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"},
+                    {"id": 2, "name": "symbol", "required": false, "type": "string",
+                     "doc": "ticker"},
+                    {"id": 3, "name": "legs", "required": false, "type": {
+                        "type": "list", "element-id": 4, "element": {
+                            "type": "struct", "fields": [
+                                {"id": 5, "name": "price", "required": true,
+                                 "type": "decimal(18, 4)"}
+                            ]
+                        }, "element-required": true
+                    }},
+                    {"id": 6, "name": "tags", "required": false, "type": {
+                        "type": "map", "key-id": 7, "key": "string",
+                        "value-id": 8, "value": "int", "value-required": false
+                    }}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let schema = schema_from_json("row", &document).unwrap();
+        assert_eq!(schema.field_len(), 4);
+        assert!(!schema.is_nullable());
+        assert_eq!(
+            schema.fields()[1].get_metadata("iceberg:doc"),
+            Some("ticker")
+        );
+
+        // Requirement inverts into nullability.
+        assert!(!schema.fields()[0].is_nullable());
+        assert!(schema.fields()[1].is_nullable());
+
+        assert_eq!(schema_to_json(&schema).unwrap(), document);
+    }
+
+    #[test]
+    fn identifiers_are_assigned_depth_first_and_never_reassigned() {
+        let inner = DataType::from_fields([DataType::Int64.required_field("price")]).unwrap();
+        let mut schema = DataType::from_fields([
+            DataType::Int64.required_field("id"),
+            inner.nullable_field("leg"),
+        ])
+        .unwrap()
+        .required_field("row");
+
+        assert_eq!(assign_field_ids(&mut schema, 1).unwrap(), 4);
+        assert_eq!(schema.fields()[0].id().unwrap(), Some(1));
+        assert_eq!(schema.fields()[1].id().unwrap(), Some(2));
+        assert_eq!(schema.fields()[1].fields()[0].id().unwrap(), Some(3));
+        assert_eq!(super::super::last_field_id(&schema).unwrap(), 3);
+
+        // A second pass changes nothing, because every field already has an id.
+        assert_eq!(assign_field_ids(&mut schema, 100).unwrap(), 100);
+        assert_eq!(schema.fields()[0].id().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn writing_a_schema_without_identifiers_says_what_to_call() {
+        let schema = DataType::from_fields([DataType::Int64.required_field("id")])
+            .unwrap()
+            .required_field("row");
+
+        let message = schema_to_json(&schema).unwrap_err().to_string();
+        assert!(message.contains("assign_field_ids"), "{message}");
+    }
+
+    #[test]
+    fn a_schema_document_that_is_not_a_struct_is_rejected() {
+        let message =
+            schema_from_json("row", &crate::json::from_str(r#"{"type":"list"}"#).unwrap())
+                .unwrap_err()
+                .to_string();
+        assert!(message.contains("\"struct\""), "{message}");
+
+        let message = schema_from_json("row", &crate::json::from_str("[1, 2]").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("got sequence"), "{message}");
+    }
+
+    #[test]
+    fn a_field_missing_its_required_flag_is_rejected() {
+        let document = crate::json::from_str(
+            r#"{"type":"struct","fields":[{"id":1,"name":"id","type":"long"}]}"#,
+        )
+        .unwrap();
+        let message = schema_from_json("row", &document).unwrap_err().to_string();
+        assert!(message.contains("required"), "{message}");
+    }
+
+    #[test]
+    fn an_iceberg_schema_projects_into_arrow_with_its_identifiers() {
+        let document = crate::json::from_str(
+            r#"{"type":"struct","fields":[{"id":7,"name":"id","required":true,"type":"long"}]}"#,
+        )
+        .unwrap();
+        let schema = schema_from_json("row", &document).unwrap();
+
+        // The field id travels as Parquet metadata, which is what a data file needs.
+        let arrow = schema.to_arrow_schema().unwrap();
+        assert_eq!(
+            arrow
+                .field(0)
+                .metadata()
+                .get("PARQUET:field_id")
+                .map(String::as_str),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn the_v3_default_values_survive_a_round_trip() {
+        let document = crate::json::from_str(
+            r#"{"type":"struct","fields":[
+                {"id":1,"name":"venue","required":false,"type":"string",
+                 "initial-default":"XNAS","write-default":"XNAS"}
+            ]}"#,
+        )
+        .unwrap();
+        let schema = schema_from_json("row", &document).unwrap();
+        assert_eq!(
+            schema.fields()[0].get_metadata("iceberg:initial-default"),
+            Some("\"XNAS\"")
+        );
+        assert_eq!(schema_to_json(&schema).unwrap(), document);
+    }
+
+    #[test]
+    fn a_schema_document_reads_through_the_core_json_parser() {
+        // The point of the port: no second JSON value model reaches this module.
+        let document: Value = crate::json::from_str(
+            r#"{"type":"struct","fields":[{"id":1,"name":"id","required":true,"type":"long"}]}"#,
+        )
+        .unwrap();
+        assert!(document.contains_key("fields"));
+        assert!(schema_from_json("row", &document).is_ok());
+    }
+}
+
+mod types {
+    use super::super::PrimitiveType;
+    use crate::{DataType, TimeUnit};
+
+    #[test]
+    fn every_primitive_type_round_trips_through_its_name() {
+        let names = [
+            "boolean",
+            "int",
+            "long",
+            "float",
+            "double",
+            "decimal(18, 4)",
+            "date",
+            "time",
+            "timestamp",
+            "timestamptz",
+            "timestamp_ns",
+            "timestamptz_ns",
+            "unknown",
+            "string",
+            "uuid",
+            "binary",
+        ];
+
+        for name in names {
+            let parsed =
+                PrimitiveType::from_str(name).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(parsed.to_string(), name, "{name}");
+            parsed
+                .to_data_type()
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+
+        let fixed = PrimitiveType::from_str("fixed[16]").unwrap();
+        assert_eq!(fixed.to_string(), "fixed[16]");
+        assert_eq!(
+            fixed.to_data_type().unwrap(),
+            DataType::fixed_size_binary(16).unwrap()
+        );
+    }
+
+    #[test]
+    fn iceberg_temporal_types_are_microsecond_precision_unless_v3_says_otherwise() {
+        assert_eq!(
+            PrimitiveType::Timestamp.to_data_type().unwrap(),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            PrimitiveType::TimestampNs.to_data_type().unwrap(),
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        assert_eq!(
+            PrimitiveType::Time.to_data_type().unwrap(),
+            DataType::time(TimeUnit::Microsecond).unwrap()
+        );
+        // A v3 unknown column has no width at all, which Arrow spells as null.
+        assert_eq!(
+            PrimitiveType::Unknown.to_data_type().unwrap(),
+            DataType::Null
+        );
+    }
+
+    #[test]
+    fn a_datatype_iceberg_cannot_express_is_named_rather_than_widened() {
+        let message = PrimitiveType::from_data_type(&DataType::Int8)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("int8"), "{message}");
+        assert!(message.contains("expected"), "{message}");
+    }
+
+    #[test]
+    fn a_malformed_type_name_reports_what_was_expected() {
+        let message = PrimitiveType::from_str("decimal(18)")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("decimal(precision, scale)"), "{message}");
+
+        let message = PrimitiveType::from_str("varchar").unwrap_err().to_string();
+        assert!(message.contains("\"varchar\""), "{message}");
+    }
+}
+
+mod avro_container {
+    use crate::io::{Buffer, IOBase};
+    use crate::{MediaType, MimeType, Value};
+
+    /// A record schema exercising every branch the manifests use.
+    fn schema() -> Value {
+        crate::json::from_str(
+            r#"{"type":"record","name":"row","fields":[
+                {"name":"code","type":"int","field-id":1},
+                {"name":"name","type":"string","field-id":2},
+                {"name":"score","type":["null","double"],"default":null,"field-id":3},
+                {"name":"raw","type":["null","bytes"],"default":null,"field-id":4},
+                {"name":"tags","type":{"type":"array","element-id":6,"items":"long"},
+                 "field-id":5},
+                {"name":"nested","type":{"type":"record","name":"inner","fields":[
+                    {"name":"flag","type":"boolean","field-id":8}
+                ]},"field-id":7}
+            ]}"#,
+        )
+        .unwrap()
+    }
+
+    fn buffer() -> Buffer {
+        let mut buffer = Buffer::new();
+        buffer.set_media_type(MediaType::new(MimeType::AVRO));
+        buffer
+    }
+
+    #[test]
+    fn a_container_round_trips_every_encoded_branch() {
+        let schema = schema();
+        let row = crate::json::from_str(
+            r#"{"code":-7,"name":"AAPL","score":1.5,"raw":null,"tags":[1,2,300000],
+                "nested":{"flag":true}}"#,
+        )
+        .unwrap();
+        let empty = crate::json::from_str(
+            r#"{"code":0,"name":"","score":null,"raw":null,"tags":[],
+                "nested":{"flag":false}}"#,
+        )
+        .unwrap();
+
+        let mut handle = buffer();
+        super::super::avro::write_container(
+            &mut handle,
+            &schema,
+            &[("format-version", "2".to_owned())],
+            &[row.clone(), empty.clone()],
+        )
+        .unwrap();
+
+        let container = super::super::avro::read_container(&handle).unwrap();
+        assert_eq!(container.get("format-version"), Some("2"));
+        assert_eq!(container.rows.len(), 2);
+        assert_eq!(
+            container.rows[0].get_key_str("code").unwrap().as_i64(),
+            Some(-7)
+        );
+        assert_eq!(
+            container.rows[0].get_key_str("name").unwrap().as_str(),
+            Some("AAPL")
+        );
+        assert_eq!(
+            container.rows[0].get_key_str("score").unwrap().as_f64(),
+            Some(1.5)
+        );
+        assert!(container.rows[0].get_key_str("raw").unwrap().is_null());
+        assert_eq!(container.rows[0].get_key_str("tags").unwrap().len(), 3);
+        assert_eq!(
+            container.rows[1].get_key_str("tags").unwrap().len(),
+            0,
+            "an empty array is one zero-count block"
+        );
+        assert_eq!(
+            container.rows[1]
+                .get_key_str("nested")
+                .and_then(|nested| nested.get_key_str("flag"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn an_empty_container_is_a_header_with_no_blocks() {
+        let mut handle = buffer();
+        super::super::avro::write_container(&mut handle, &schema(), &[], &[]).unwrap();
+        let container = super::super::avro::read_container(&handle).unwrap();
+        assert!(container.rows.is_empty());
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_container_say_what_was_expected() {
+        let mut handle = buffer();
+        handle.write_all_bytes(b"not avro at all").unwrap();
+        let message = super::super::avro::read_container(&handle)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("Avro object container"), "{message}");
+    }
+
+    #[test]
+    fn a_truncated_container_reports_the_byte_it_ran_out_at() {
+        let mut handle = buffer();
+        super::super::avro::write_container(
+            &mut handle,
+            &schema(),
+            &[],
+            &[crate::json::from_str(
+                r#"{"code":1,"name":"x","score":null,"raw":null,"tags":[],
+                    "nested":{"flag":true}}"#,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+
+        let mut truncated = buffer();
+        let bytes = handle.read_all().unwrap();
+        truncated
+            .write_all_bytes(&bytes[..bytes.len() - 8])
+            .unwrap();
+        let message = super::super::avro::read_container(&truncated)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("avro"), "{message}");
+        assert!(message.contains("expected"), "{message}");
+    }
+}
+
+mod partition_specs {
+    use super::{PartitionSpec, Transform, trade_schema};
+    use crate::Value;
+
+    #[test]
+    fn a_spec_round_trips_through_its_v2_document() {
+        let schema = trade_schema();
+        let spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+        assert_eq!(spec.fields[0].field_id, 1000);
+        assert_eq!(spec.fields[0].source_id, 3);
+
+        let document = spec.to_json().unwrap();
+        assert_eq!(PartitionSpec::from_json(&document).unwrap(), spec);
+    }
+
+    #[test]
+    fn the_bare_v1_array_reads_as_a_spec_with_numbered_fields() {
+        let document =
+            crate::json::from_str(r#"[{"name":"venue","transform":"identity","source-id":3}]"#)
+                .unwrap();
+        let spec = PartitionSpec::from_json(&document).unwrap();
+        assert_eq!(spec.spec_id, 0);
+        assert_eq!(spec.fields[0].field_id, 1000);
+        assert_eq!(spec.fields[0].transform, Transform::Identity);
+    }
+
+    #[test]
+    fn a_hive_directory_is_what_a_partition_tuple_names() {
+        let schema = trade_schema();
+        let spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+        assert_eq!(
+            spec.partition_path(&[Value::from("XNAS")]).unwrap(),
+            "venue=XNAS"
+        );
+        // A null value is spelled `null`, which a path cannot distinguish from
+        // the string; that is why the manifest is the authority.
+        assert_eq!(spec.partition_path(&[Value::Null]).unwrap(), "venue=null");
+    }
+
+    #[test]
+    fn a_transform_that_cannot_place_a_row_is_refused_by_name() {
+        let schema = trade_schema();
+        let mut spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+        spec.fields[0].transform = Transform::Bucket(16);
+
+        let message = spec.require_writable().unwrap_err().to_string();
+        assert!(message.contains("bucket[16]"), "{message}");
+        assert!(message.contains("invertible"), "{message}");
+    }
+
+    #[test]
+    fn a_partition_column_is_nullable_even_when_its_source_is_not() {
+        let schema = trade_schema();
+        let spec = PartitionSpec::identity(1, &schema, &["id"]).unwrap();
+        let partition = spec.partition_field(&schema).unwrap();
+        assert!(!schema.fields()[0].is_nullable());
+        assert!(partition.fields()[0].is_nullable());
+        assert_eq!(partition.fields()[0].id().unwrap(), Some(1000));
+    }
+}
+
+mod table_metadata {
+    use super::super::{Snapshot, TableMetadata};
+    use super::{FormatVersion, PartitionSpec, trade_schema};
+    use smol_str::SmolStr;
+
+    fn metadata(version: FormatVersion) -> TableMetadata {
+        TableMetadata::new(
+            version,
+            "file:///tmp/table",
+            trade_schema(),
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_format_version_round_trips_through_its_document() {
+        for version in [FormatVersion::V1, FormatVersion::V2, FormatVersion::V3] {
+            let original = metadata(version);
+            let document = original.to_json().unwrap();
+            let read = TableMetadata::from_json(&document).unwrap();
+            assert_eq!(read.format_version, version);
+            assert_eq!(read.location, original.location);
+            assert_eq!(read.last_column_id, 3);
+            assert!(read.current_snapshot().is_none());
+        }
+    }
+
+    #[test]
+    fn a_v1_document_carries_the_singular_schema_and_spec_keys() {
+        let document = metadata(FormatVersion::V1).to_json().unwrap();
+        assert!(document.contains_key("schema"), "v1 needs the singular key");
+        assert!(document.contains_key("partition-spec"));
+        assert!(
+            !document.contains_key("last-sequence-number"),
+            "v1 has no sequence numbers"
+        );
+    }
+
+    #[test]
+    fn a_v1_document_written_by_someone_else_reads_without_the_plural_keys() {
+        let document = crate::json::from_str(
+            r#"{"format-version":1,"table-uuid":"u","location":"file:///t",
+                "last-updated-ms":1,"last-column-id":1,
+                "schema":{"type":"struct","fields":[
+                    {"id":1,"name":"id","required":true,"type":"long"}]},
+                "partition-spec":[]}"#,
+        )
+        .unwrap();
+        let metadata = TableMetadata::from_json(&document).unwrap();
+        assert_eq!(metadata.format_version, FormatVersion::V1);
+        assert_eq!(metadata.schemas.len(), 1);
+        assert_eq!(metadata.partition_specs.len(), 1);
+        assert!(metadata.default_spec().unwrap().is_unpartitioned());
+    }
+
+    #[test]
+    fn a_v3_document_carries_its_row_lineage() {
+        let mut metadata = metadata(FormatVersion::V3);
+        metadata.next_row_id = Some(12);
+        metadata.set_current_snapshot(Snapshot {
+            snapshot_id: 5,
+            parent_snapshot_id: None,
+            sequence_number: Some(1),
+            timestamp_ms: 7,
+            manifest_list: SmolStr::new_static("file:///t/metadata/snap.avro"),
+            summary: vec![(
+                SmolStr::new_static("operation"),
+                SmolStr::new_static("append"),
+            )],
+            schema_id: Some(0),
+            first_row_id: Some(0),
+            added_rows: Some(12),
+        });
+
+        let document = metadata.to_json().unwrap();
+        assert_eq!(
+            document
+                .get_key_str("next-row-id")
+                .and_then(|id| id.as_i64()),
+            Some(12)
+        );
+        let read = TableMetadata::from_json(&document).unwrap();
+        let snapshot = read.current_snapshot().unwrap();
+        assert_eq!(snapshot.first_row_id, Some(0));
+        assert_eq!(snapshot.added_rows, Some(12));
+        assert_eq!(snapshot.operation(), "append");
+    }
+
+    #[test]
+    fn a_current_snapshot_of_minus_one_means_there_is_none() {
+        let mut document = metadata(FormatVersion::V2).to_json().unwrap();
+        document = document.with_key("current-snapshot-id", -1_i64).unwrap();
+        let read = TableMetadata::from_json(&document).unwrap();
+        assert!(read.current_snapshot_id.is_none());
+        assert!(read.current_snapshot().is_none());
+    }
+
+    #[test]
+    fn an_evolved_schema_keeps_the_old_one_and_numbers_above_it() {
+        let mut metadata = metadata(FormatVersion::V2);
+        let mut evolved = trade_schema();
+        evolved.remove_metadata("iceberg:schema-id");
+        let mut fields = evolved.fields().to_vec();
+        fields.push(crate::DataType::Int64.nullable_field("quantity"));
+        evolved
+            .set_data_type(crate::DataType::from_fields(fields).unwrap())
+            .unwrap();
+        super::assign_field_ids(&mut evolved, metadata.last_column_id + 1).unwrap();
+
+        let schema_id = metadata.add_schema(evolved).unwrap();
+        assert_eq!(schema_id, 1);
+        assert_eq!(metadata.schemas.len(), 2, "the old schema is retained");
+        assert_eq!(metadata.last_column_id, 4);
+        metadata.current_schema_id = schema_id;
+        assert_eq!(metadata.current_schema().unwrap().field_len(), 4);
+
+        // And the pair survives the document.
+        let read = TableMetadata::from_json(&metadata.to_json().unwrap()).unwrap();
+        assert_eq!(read.schemas.len(), 2);
+        assert_eq!(read.current_schema().unwrap().field_len(), 4);
+        assert_eq!(read.schema_by_id(0).unwrap().field_len(), 3);
+    }
+
+    #[test]
+    fn a_format_version_this_build_does_not_implement_is_named() {
+        let message = FormatVersion::from_number(4).unwrap_err().to_string();
+        assert!(message.contains("got 4"), "{message}");
+    }
+}
+
+mod tables {
+    use super::{
+        Folder, FormatVersion, IOBase, PartitionSpec, Table, collect, root, trade_schema, trades,
+    };
+    use crate::generic::IORecordOptions;
+    use crate::{DataType, Value};
+
+    #[test]
+    fn an_empty_table_has_no_snapshot_and_reads_as_no_rows() {
+        let path = root("empty");
+        let schema = trade_schema();
+        let table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V2,
+            schema,
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap();
+
+        assert!(table.current_snapshot().is_none());
+        assert!(table.manifests().unwrap().is_empty());
+        assert!(table.data_files().unwrap().is_empty());
+        assert_eq!(collect(table.scan(None).unwrap()).len(), 0);
+
+        // The document is on disk and reopening finds it.
+        let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+        assert_eq!(reopened.version(), 1);
+        assert!(reopened.current_snapshot().is_none());
+    }
+
+    #[test]
+    fn an_unpartitioned_table_round_trips_its_rows() {
+        let path = root("unpartitioned");
+        let schema = trade_schema();
+        let mut table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V2,
+            schema.clone(),
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap();
+
+        let batch = trades(
+            &[1, 2, 3],
+            &[Some("AAPL"), Some("MSFT"), Some("AAPL")],
+            &[Some("XNAS"), Some("XNYS"), Some("XNAS")],
+        );
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+
+        let snapshot = table.current_snapshot().expect("a snapshot");
+        assert_eq!(snapshot.operation(), "append");
+        assert_eq!(snapshot.summary_value("added-records"), Some("3"));
+        assert_eq!(table.data_files().unwrap().len(), 1);
+
+        let rows = collect(table.scan(None).unwrap());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1.as_deref(), Some("AAPL"));
+
+        // And a reopened table sees exactly the same thing.
+        let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+        assert_eq!(collect(reopened.scan(None).unwrap()), rows);
+    }
+
+    #[test]
+    fn a_partitioned_write_lays_files_out_the_hive_way() {
+        let path = root("partitioned");
+        let schema = trade_schema();
+        let spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+        let mut table =
+            Table::create(Folder::new(&path).unwrap(), FormatVersion::V2, schema, spec).unwrap();
+
+        let batch = trades(
+            &[1, 2, 3],
+            &[Some("AAPL"), Some("MSFT"), Some("AAPL")],
+            &[Some("XNAS"), Some("XNYS"), Some("XNAS")],
+        );
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+
+        let files = table.data_files().unwrap();
+        assert_eq!(files.len(), 2, "one file per distinct venue");
+
+        // The layout is the `column=value` shape the crate's own Hive reader
+        // already understands.
+        for (file, _) in &files {
+            let url = crate::Url::from_str(&file.file_path).unwrap();
+            let partitions = url.hive_partitions();
+            assert_eq!(partitions.len(), 1, "{}", file.file_path);
+            assert_eq!(partitions[0].0, "venue");
+            assert_eq!(
+                Value::from(partitions[0].1.as_str()),
+                file.partition[0],
+                "the path and the manifest agree"
+            );
+        }
+
+        // And `children_where` selects one partition's leaves from the folder.
+        let folder = Folder::new(&path).unwrap();
+        let selected: Vec<_> = folder
+            .children_where(&[("venue", "XNAS")], false)
+            .unwrap()
+            .collect();
+        assert_eq!(selected.len(), 1);
+
+        let rows = collect(table.scan(None).unwrap());
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn a_null_partition_value_writes_its_own_directory_and_reads_back_null() {
+        let path = root("null-partition");
+        let schema = trade_schema();
+        let spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+        let mut table =
+            Table::create(Folder::new(&path).unwrap(), FormatVersion::V2, schema, spec).unwrap();
+
+        let batch = trades(
+            &[1, 2],
+            &[Some("AAPL"), Some("MSFT")],
+            &[Some("XNAS"), None],
+        );
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+
+        let files = table.data_files().unwrap();
+        assert_eq!(files.len(), 2);
+        let null_file = files
+            .iter()
+            .find(|(file, _)| file.partition[0].is_null())
+            .expect("a file for the null partition");
+        assert!(
+            null_file.0.file_path.contains("venue=null"),
+            "{}",
+            null_file.0.file_path
+        );
+
+        let rows = collect(table.scan(None).unwrap());
+        assert_eq!(rows.len(), 2);
+        let null_row = rows.iter().find(|row| row.0 == 2).unwrap();
+        assert_eq!(null_row.2, None, "the null partition value stays null");
+    }
+
+    #[test]
+    fn appending_keeps_what_is_stored_and_overwriting_replaces_it() {
+        let path = root("append-overwrite");
+        let schema = trade_schema();
+        let mut table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V2,
+            schema,
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap();
+
+        let first = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+        table
+            .append(crate::arrow::batch_reader(first.schema(), [first]))
+            .unwrap();
+        let second = trades(&[2], &[Some("MSFT")], &[Some("XNYS")]);
+        table
+            .append(crate::arrow::batch_reader(second.schema(), [second]))
+            .unwrap();
+        assert_eq!(collect(table.scan(None).unwrap()).len(), 2);
+        assert_eq!(table.manifests().unwrap().len(), 2);
+
+        let replacement = trades(&[9], &[Some("NVDA")], &[Some("XNAS")]);
+        table
+            .overwrite(crate::arrow::batch_reader(
+                replacement.schema(),
+                [replacement],
+            ))
+            .unwrap();
+        let rows = collect(table.scan(None).unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 9);
+
+        // The previous snapshot is still recorded, which is what makes the
+        // overwrite reversible.
+        assert_eq!(table.metadata().snapshots.len(), 3);
+        assert!(
+            table
+                .current_snapshot()
+                .and_then(|snapshot| snapshot.parent_snapshot_id)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_scan_pushes_the_requested_columns_down_to_each_file() {
+        let path = root("pushdown");
+        let schema = trade_schema();
+        let mut table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V2,
+            schema.clone(),
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap();
+        let batch = trades(&[1, 2], &[Some("AAPL"), Some("MSFT")], &[Some("XNAS"); 2]);
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+
+        let mut wanted = schema.without_fields(&["symbol", "venue"]).unwrap();
+        wanted.remove_metadata("iceberg:schema-id");
+        let reader = table.scan(Some(&wanted)).unwrap();
+        assert_eq!(reader.schema().fields().len(), 1);
+        for batch in reader {
+            let batch = batch.unwrap();
+            assert_eq!(batch.num_columns(), 1);
+            assert_eq!(batch.schema().field(0).name(), "id");
+        }
+
+        // The narrowing happens at the file, not after it: the data file still
+        // stores three columns, and the reader the scan opens over it reports
+        // one, which is what a projection mask does rather than a later drop.
+        let file = table.data_files().unwrap()[0].0.file_path.clone();
+        let relative = file.rsplit("/data/").next().unwrap().to_owned();
+        let handle = Folder::new(&path)
+            .unwrap()
+            .child_by(&format!("data/{relative}"))
+            .unwrap();
+        let options = handle.record_options().unwrap();
+        assert_eq!(handle.read_arrow_field(&options).unwrap().field_len(), 3);
+        assert_eq!(
+            handle
+                .read_arrow_batch_reader(&options.with_schema(wanted))
+                .unwrap()
+                .schema()
+                .fields()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_table_whose_schema_evolved_reads_old_files_with_the_new_column_null() {
+        let path = root("evolution");
+        let schema = trade_schema();
+        let mut table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V2,
+            schema.clone(),
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap();
+        let batch = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+
+        let mut evolved = schema.clone();
+        evolved.remove_metadata("iceberg:schema-id");
+        let mut fields = evolved.fields().to_vec();
+        fields.push(DataType::Int64.nullable_field("quantity"));
+        evolved
+            .set_data_type(DataType::from_fields(fields).unwrap())
+            .unwrap();
+        super::assign_field_ids(&mut evolved, 4).unwrap();
+        assert_eq!(table.evolve_schema(evolved).unwrap(), 1);
+        assert_eq!(table.schema().unwrap().field_len(), 4);
+
+        // The file written before the column existed still reads.
+        let mut found = 0;
+        for batch in table.scan(None).unwrap() {
+            let batch = batch.unwrap();
+            assert_eq!(batch.num_columns(), 4);
+            let quantity = batch.column_by_name("quantity").unwrap();
+            assert_eq!(quantity.null_count(), batch.num_rows());
+            found += batch.num_rows();
+        }
+        assert_eq!(found, 1);
+
+        // And new rows carry the new column.
+        let arrow = table.schema().unwrap().to_arrow_schema().unwrap();
+        let widened = arrow_array::RecordBatch::try_new(
+            arrow.clone(),
+            vec![
+                std::sync::Arc::new(arrow_array::Int64Array::from(vec![2_i64])),
+                std::sync::Arc::new(arrow_array::StringArray::from(vec![Some("MSFT")])),
+                std::sync::Arc::new(arrow_array::StringArray::from(vec![Some("XNYS")])),
+                std::sync::Arc::new(arrow_array::Int64Array::from(vec![Some(50_i64)])),
+            ],
+        )
+        .unwrap();
+        table
+            .append(crate::arrow::batch_reader(arrow, [widened]))
+            .unwrap();
+        assert_eq!(collect(table.scan(None).unwrap()).len(), 2);
+    }
+
+    #[test]
+    fn a_manifest_naming_a_file_that_is_not_there_fails_the_scan_not_the_metadata() {
+        let path = root("missing-file");
+        let schema = trade_schema();
+        let mut table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V2,
+            schema,
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap();
+        let batch = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+
+        let file = table.data_files().unwrap()[0].0.file_path.clone();
+        let relative = file.rsplit("/data/").next().unwrap().to_owned();
+        std::fs::remove_file(path.join("data").join(&relative)).unwrap();
+
+        // The metadata still reads: a manifest is metadata, and it still says
+        // what it always said.
+        let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+        assert_eq!(reopened.data_files().unwrap().len(), 1);
+
+        // The read is where absence shows up, and a missing resource is empty
+        // rather than an error, so the scan yields no rows.
+        assert_eq!(collect(reopened.scan(None).unwrap()).len(), 0);
+    }
+
+    #[test]
+    fn a_v1_table_writes_and_reads_without_sequence_numbers() {
+        let path = root("v1");
+        let schema = trade_schema();
+        let mut table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V1,
+            schema,
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap();
+        let batch = trades(&[1, 2], &[Some("AAPL"), None], &[Some("XNAS"), None]);
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+
+        assert_eq!(
+            table.current_snapshot().unwrap().sequence_number,
+            None,
+            "v1 snapshots carry no sequence number"
+        );
+        let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+        assert_eq!(reopened.metadata().format_version, FormatVersion::V1);
+        assert_eq!(collect(reopened.scan(None).unwrap()).len(), 2);
+    }
+
+    #[test]
+    fn a_v3_table_tracks_row_lineage_across_commits() {
+        let path = root("v3");
+        let schema = trade_schema();
+        let mut table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V3,
+            schema,
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap();
+        assert_eq!(table.metadata().next_row_id, Some(0));
+
+        let first = trades(&[1, 2], &[Some("AAPL"), Some("MSFT")], &[Some("XNAS"); 2]);
+        table
+            .append(crate::arrow::batch_reader(first.schema(), [first]))
+            .unwrap();
+        assert_eq!(table.current_snapshot().unwrap().first_row_id, Some(0));
+        assert_eq!(table.current_snapshot().unwrap().added_rows, Some(2));
+        assert_eq!(table.metadata().next_row_id, Some(2));
+
+        let second = trades(&[3], &[Some("NVDA")], &[Some("XNYS")]);
+        table
+            .append(crate::arrow::batch_reader(second.schema(), [second]))
+            .unwrap();
+        assert_eq!(table.current_snapshot().unwrap().first_row_id, Some(2));
+        assert_eq!(table.metadata().next_row_id, Some(3));
+
+        let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+        assert_eq!(reopened.metadata().next_row_id, Some(3));
+        assert_eq!(collect(reopened.scan(None).unwrap()).len(), 3);
+    }
+
+    #[test]
+    fn a_write_against_a_spec_that_cannot_place_a_row_is_refused() {
+        let path = root("unwritable-spec");
+        let schema = trade_schema();
+        let mut spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+        spec.fields[0].transform = super::Transform::Bucket(8);
+        let mut table =
+            Table::create(Folder::new(&path).unwrap(), FormatVersion::V2, schema, spec).unwrap();
+
+        let batch = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+        let message = table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("bucket[8]"), "{message}");
+    }
+
+    #[test]
+    fn a_folder_with_no_metadata_says_so_rather_than_pretending_to_be_a_table() {
+        let path = root("not-a-table");
+        std::fs::create_dir_all(&path).unwrap();
+        let message = Table::open(Folder::new(&path).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("metadata document"), "{message}");
+    }
+
+    #[test]
+    fn a_manifest_describes_itself_well_enough_to_be_read_alone() {
+        let path = root("self-describing");
+        let schema = trade_schema();
+        let spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+        let mut table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V2,
+            schema,
+            spec.clone(),
+        )
+        .unwrap();
+        let batch = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+
+        let manifest = table.manifests().unwrap().remove(0);
+        let name = manifest
+            .manifest_path
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let handle = Folder::new(&path)
+            .unwrap()
+            .child_by(&format!("metadata/{name}"))
+            .unwrap();
+
+        // The spec comes back out of the manifest's own Avro header.
+        assert_eq!(super::super::read_manifest_spec(&handle).unwrap(), spec);
+        let entries = super::super::read_manifest(&handle).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, super::super::EntryStatus::Added);
+        assert_eq!(entries[0].data_file.record_count, 1);
+        assert_eq!(
+            entries[0].data_file.file_format,
+            super::super::FileFormat::Parquet
+        );
+        // Statistics are keyed by field id, which is what a planner needs.
+        assert!(
+            entries[0]
+                .data_file
+                .value_counts
+                .iter()
+                .any(|(id, count)| *id == 1 && *count == 1)
+        );
+    }
+}
+
+mod planning {
+    use super::{
+        Field, FormatVersion, IOBase, PartitionSpec, Table, collect, root, trade_schema, trades,
+    };
+    use crate::DataType;
+    use crate::local::Folder;
+
+    /// A table partitioned by venue, with one commit per venue.
+    ///
+    /// One commit is one manifest, so this is also the smallest table whose
+    /// manifest list has something to prune.
+    fn venues(label: &str) -> (std::path::PathBuf, Table<Folder>) {
+        let path = root(label);
+        let schema = trade_schema();
+        let spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+        let mut table =
+            Table::create(Folder::new(&path).unwrap(), FormatVersion::V2, schema, spec).unwrap();
+        for (id, symbol, venue) in [
+            (1_i64, "AAPL", "XNAS"),
+            (2, "MSFT", "XNYS"),
+            (3, "VOD", "XLON"),
+        ] {
+            let batch = trades(&[id], &[Some(symbol)], &[Some(venue)]);
+            table
+                .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+                .unwrap();
+        }
+        (path, table)
+    }
+
+    #[test]
+    fn a_partition_filter_skips_the_manifests_its_summaries_exclude() {
+        let (_path, table) = venues("plan-manifests");
+
+        let whole = table.plan(&[]).unwrap();
+        assert_eq!(whole.tasks.len(), 3);
+        assert_eq!(whole.manifests_read, 3);
+        assert_eq!(whole.manifests_skipped(), 0);
+
+        let filtered = table.plan(&[("venue", "XNYS")]).unwrap();
+        assert_eq!(filtered.tasks.len(), 1);
+        assert_eq!(filtered.record_count(), 1);
+        // Two manifests were excluded by their summaries alone, so two Avro
+        // files were never opened.
+        assert_eq!(filtered.manifests_skipped(), 2);
+        assert_eq!(filtered.manifests_read, 1);
+        assert_eq!(filtered.files_skipped(), 0);
+    }
+
+    #[test]
+    fn a_filtered_read_never_opens_the_files_the_metadata_excluded() {
+        let (path, table) = venues("plan-untouched");
+        let excluded = table
+            .plan(&[("venue", "XLON")])
+            .unwrap()
+            .tasks
+            .remove(0)
+            .entry
+            .data_file
+            .file_path
+            .clone();
+
+        // Replacing the excluded file's bytes with nonsense is the one proof
+        // that the read never reaches it.
+        let relative = excluded.rsplit("/data/").next().unwrap().to_owned();
+        let mut handle = Folder::new(&path)
+            .unwrap()
+            .child_by(&format!("data/{relative}"))
+            .unwrap();
+        handle.write_all_bytes(b"not a parquet file").unwrap();
+
+        assert_eq!(
+            collect(table.scan_where(&[("venue", "XNAS")], None).unwrap()),
+            vec![(1, Some("AAPL".to_owned()), Some("XNAS".to_owned()))]
+        );
+        assert!(
+            table.scan(None).unwrap().any(|batch| batch.is_err()),
+            "the unfiltered scan does read the file the filtered one skipped"
+        );
+    }
+
+    #[test]
+    fn a_filter_on_a_stored_column_prunes_by_statistics_and_then_by_row() {
+        let path = root("plan-statistics");
+        let schema = trade_schema();
+        let mut table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V2,
+            schema,
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap();
+        // Two commits, so two files whose id bounds do not overlap.
+        for ids in [[1_i64, 2], [10, 11]] {
+            let batch = trades(&ids, &[Some("AAPL"), Some("MSFT")], &[None, None]);
+            table
+                .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+                .unwrap();
+        }
+
+        let plan = table.plan(&[("id", "10")]).unwrap();
+        assert_eq!(plan.tasks.len(), 1, "the file whose id bounds exclude 10");
+        assert_eq!(plan.files_skipped(), 1);
+        // A statistic bounds a file rather than selecting a row, so the file
+        // that survived is still filtered down to the row that matches.
+        assert_eq!(
+            collect(table.scan_where(&[("id", "10")], None).unwrap()),
+            vec![(10, Some("AAPL".to_owned()), None)]
+        );
+    }
+
+    #[test]
+    fn a_filter_column_the_read_never_asked_for_is_read_and_then_dropped() {
+        let (_path, table) = venues("plan-projection");
+        let target = DataType::from_fields([DataType::Int64.required_field("id")])
+            .unwrap()
+            .required_field("row");
+
+        let reader = table
+            .scan_where(&[("symbol", "MSFT")], Some(&target))
+            .unwrap();
+        let batches: Vec<_> = reader.map(Result::unwrap).collect();
+        let rows: i64 = batches
+            .iter()
+            .map(|batch| i64::try_from(batch.num_rows()).unwrap())
+            .sum();
+        assert_eq!(rows, 1);
+        // The projection is what the caller asked for, not what the filter
+        // needed in order to answer.
+        assert_eq!(batches[0].schema().fields().len(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "id");
+    }
+
+    #[test]
+    fn a_null_partition_value_is_addressed_by_the_text_the_layout_spells() {
+        let path = root("plan-null");
+        let schema = trade_schema();
+        let spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+        let mut table =
+            Table::create(Folder::new(&path).unwrap(), FormatVersion::V2, schema, spec).unwrap();
+        let batch = trades(
+            &[1, 2],
+            &[Some("AAPL"), Some("MSFT")],
+            &[Some("XNAS"), None],
+        );
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+
+        let plan = table.plan(&[("venue", "null")]).unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(
+            collect(table.scan_where(&[("venue", "null")], None).unwrap()),
+            vec![(2, Some("MSFT".to_owned()), None)]
+        );
+    }
+
+    #[test]
+    fn a_filter_naming_a_column_the_schema_does_not_have_lists_the_ones_it_does() {
+        let (_path, table) = venues("plan-unknown");
+        let message = table.plan(&[("exchange", "XNAS")]).unwrap_err().to_string();
+        assert!(message.contains("exchange"), "{message}");
+        assert!(message.contains("id, symbol, venue"), "{message}");
+    }
+
+    #[test]
+    fn a_manifest_list_carries_the_summaries_the_next_plan_prunes_with() {
+        let (_path, table) = venues("plan-summaries");
+        let manifests = table.manifests().unwrap();
+        assert_eq!(manifests.len(), 3);
+        for manifest in &manifests {
+            assert_eq!(manifest.partitions.len(), 1, "one summary per spec field");
+            let summary = &manifest.partitions[0];
+            assert!(!summary.contains_null);
+            assert_eq!(summary.lower_bound, summary.upper_bound);
+            assert!(summary.lower_bound.is_some());
+        }
+        // The bounds are the venue strings themselves, which is the Iceberg
+        // single-value encoding for text.
+        let mut venues: Vec<String> = manifests
+            .iter()
+            .map(|manifest| {
+                String::from_utf8(manifest.partitions[0].lower_bound.clone().unwrap()).unwrap()
+            })
+            .collect();
+        venues.sort();
+        assert_eq!(venues, ["XLON", "XNAS", "XNYS"]);
+    }
+
+    #[test]
+    fn an_entry_inherits_the_sequence_number_its_manifest_records() {
+        let (_path, table) = venues("plan-inheritance");
+        let plan = table.plan(&[]).unwrap();
+        let mut numbers: Vec<i64> = plan
+            .tasks
+            .iter()
+            .map(|task| task.entry.sequence_number.unwrap())
+            .collect();
+        numbers.sort_unstable();
+        // Three commits, three sequence numbers, none of them written into the
+        // entries themselves.
+        assert_eq!(numbers, [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_scan_root_the_caller_declares_is_what_the_reader_reports() {
+        let (_path, table) = venues("plan-schema");
+        let target: Field = DataType::from_fields([
+            DataType::Utf8.nullable_field("venue"),
+            DataType::Int64.required_field("id"),
+        ])
+        .unwrap()
+        .required_field("row");
+        let reader = table.scan(Some(&target)).unwrap();
+        let schema = reader.schema();
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "venue");
+        assert_eq!(schema.field(1).name(), "id");
+    }
+}
+
+mod handles {
+    use super::{FormatVersion, IOBase, PartitionSpec, Table, collect, root, trade_schema, trades};
+    use crate::generic::{IORecordOptions, RecordOptions};
+    use crate::local::Folder;
+
+    /// Create a venue-partitioned table and return the folder addressing it.
+    fn table(label: &str) -> (std::path::PathBuf, Folder) {
+        let path = root(label);
+        let schema = trade_schema();
+        let spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+        Table::create(Folder::new(&path).unwrap(), FormatVersion::V2, schema, spec).unwrap();
+        let folder = Folder::new(&path).unwrap();
+        (path, folder)
+    }
+
+    /// The options an Iceberg folder is written through, with a declared schema.
+    fn options(folder: &Folder) -> RecordOptions {
+        folder.record_options().unwrap().with_schema(trade_schema())
+    }
+
+    #[test]
+    fn a_table_folder_answers_with_the_encoding_of_its_data_files() {
+        let (_path, folder) = table("handle-options");
+        // Nothing has been written yet, so there is no leaf to read a media
+        // type off; the metadata still knows what the rows will be.
+        assert_eq!(
+            folder.record_options().unwrap().mime_type(),
+            crate::MimeType::PARQUET
+        );
+    }
+
+    #[test]
+    fn the_three_record_methods_reach_a_table_through_its_snapshots() {
+        let (path, mut folder) = table("handle-three");
+        let options = options(&folder);
+
+        let batch = trades(
+            &[1, 2],
+            &[Some("AAPL"), Some("MSFT")],
+            &[Some("XNAS"), Some("XNYS")],
+        );
+        folder
+            .write_arrow_batch_reader(
+                crate::arrow::batch_reader(batch.schema(), [batch]),
+                &options,
+            )
+            .unwrap();
+        assert_eq!(
+            collect(folder.read_arrow_batch_reader(&options).unwrap()).len(),
+            2
+        );
+
+        let batch = trades(&[3], &[Some("VOD")], &[Some("XLON")]);
+        folder
+            .append_arrow_batch_reader(
+                crate::arrow::batch_reader(batch.schema(), [batch]),
+                &options,
+            )
+            .unwrap();
+        assert_eq!(
+            collect(folder.read_arrow_batch_reader(&options).unwrap()).len(),
+            3
+        );
+
+        // An overwrite replaces every row, and the table still reads as a table.
+        let batch = trades(&[9], &[Some("BP")], &[Some("XLON")]);
+        folder
+            .write_arrow_batch_reader(
+                crate::arrow::batch_reader(batch.schema(), [batch]),
+                &options,
+            )
+            .unwrap();
+        assert_eq!(
+            collect(folder.read_arrow_batch_reader(&options).unwrap()),
+            vec![(9, Some("BP".to_owned()), Some("XLON".to_owned()))]
+        );
+
+        // Every write was a snapshot, so the table has one commit per call.
+        let table = Table::open(Folder::new(&path).unwrap()).unwrap();
+        assert_eq!(table.metadata().snapshots.len(), 3);
+        assert_eq!(table.current_snapshot().unwrap().operation(), "overwrite");
+    }
+
+    #[test]
+    fn a_write_with_a_match_key_upserts_the_table_through_the_same_surface() {
+        let (_path, mut folder) = table("handle-merge");
+        let options = options(&folder);
+
+        let batch = trades(
+            &[1, 2, 3],
+            &[Some("AAPL"), Some("MSFT"), Some("VOD")],
+            &[Some("XNAS"), Some("XNYS"), Some("XLON")],
+        );
+        folder
+            .write_arrow_batch_reader(
+                crate::arrow::batch_reader(batch.schema(), [batch]),
+                &options,
+            )
+            .unwrap();
+
+        let merge = options.clone().with_merge_by(["id"]);
+        let batch = trades(
+            &[2, 4],
+            &[Some("MSFT.L"), Some("BP")],
+            &[Some("XNYS"), Some("XLON")],
+        );
+        folder
+            .write_arrow_batch_reader(crate::arrow::batch_reader(batch.schema(), [batch]), &merge)
+            .unwrap();
+
+        assert_eq!(
+            collect(folder.read_arrow_batch_reader(&options).unwrap()),
+            vec![
+                (1, Some("AAPL".to_owned()), Some("XNAS".to_owned())),
+                (2, Some("MSFT.L".to_owned()), Some("XNYS".to_owned())),
+                (3, Some("VOD".to_owned()), Some("XLON".to_owned())),
+                (4, Some("BP".to_owned()), Some("XLON".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_merge_reads_only_the_files_whose_statistics_can_hold_a_key() {
+        let path = root("handle-merge-plan");
+        let schema = trade_schema();
+        let mut table = Table::create(
+            Folder::new(&path).unwrap(),
+            FormatVersion::V2,
+            schema,
+            PartitionSpec::unpartitioned(),
+        )
+        .unwrap();
+        for ids in [[1_i64, 2], [10, 11], [20, 21]] {
+            let batch = trades(&ids, &[Some("AAPL"), Some("MSFT")], &[None, None]);
+            table
+                .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+                .unwrap();
+        }
+        let before: Vec<String> = table
+            .data_files()
+            .unwrap()
+            .into_iter()
+            .map(|(file, _)| file.file_path.to_string())
+            .collect();
+        assert_eq!(before.len(), 3);
+
+        let batch = trades(&[11], &[Some("MSFT.L")], &[None]);
+        table
+            .merge(
+                crate::arrow::batch_reader(batch.schema(), [batch]),
+                &["id".to_owned()],
+                true,
+            )
+            .unwrap();
+
+        let after: Vec<String> = table
+            .data_files()
+            .unwrap()
+            .into_iter()
+            .map(|(file, _)| file.file_path.to_string())
+            .collect();
+        // Two of the three files were carried into the new snapshot untouched:
+        // their id bounds cannot hold the key 11, so they were never read and
+        // never rewritten.
+        let carried = before.iter().filter(|path| after.contains(path)).count();
+        assert_eq!(carried, 2, "before {before:?} after {after:?}");
+        assert_eq!(after.len(), 3);
+
+        let mut ids: Vec<i64> = collect(table.scan(None).unwrap())
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2, 10, 11, 20, 21]);
+        assert_eq!(
+            collect(table.scan_where(&[("id", "11")], None).unwrap()),
+            vec![(11, Some("MSFT.L".to_owned()), None)]
+        );
+    }
+
+    #[test]
+    fn a_handle_addressing_one_partition_reads_and_writes_only_that_partition() {
+        let (path, mut folder) = table("handle-partition");
+        let options = options(&folder);
+        let batch = trades(
+            &[1, 2, 3],
+            &[Some("AAPL"), Some("MSFT"), Some("VOD")],
+            &[Some("XNAS"), Some("XNYS"), Some("XLON")],
+        );
+        folder
+            .write_arrow_batch_reader(
+                crate::arrow::batch_reader(batch.schema(), [batch]),
+                &options,
+            )
+            .unwrap();
+
+        // The same address a Hive lake would use, resolved through the table's
+        // metadata rather than by listing the directory.
+        let partition = Folder::new(path.join("data").join("venue=XNYS")).unwrap();
+        assert_eq!(
+            collect(partition.read_arrow_batch_reader(&options).unwrap()),
+            vec![(2, Some("MSFT".to_owned()), Some("XNYS".to_owned()))]
+        );
+
+        // Overwriting one partition leaves every other one where it was.
+        let mut partition = partition;
+        let batch = trades(&[7], &[Some("MSFT")], &[Some("XNYS")]);
+        partition
+            .write_arrow_batch_reader(
+                crate::arrow::batch_reader(batch.schema(), [batch]),
+                &options,
+            )
+            .unwrap();
+        assert_eq!(
+            collect(folder.read_arrow_batch_reader(&options).unwrap()),
+            vec![
+                (1, Some("AAPL".to_owned()), Some("XNAS".to_owned())),
+                (3, Some("VOD".to_owned()), Some("XLON".to_owned())),
+                (7, Some("MSFT".to_owned()), Some("XNYS".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_table_still_reads_as_the_leaves_beneath_it() {
+        let path = root("handle-plain");
+        let lake = Folder::new(&path).unwrap();
+        let mut leaf = lake.child_by("part-0.parquet").unwrap();
+        let batch = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+        let options = RecordOptions::for_media_type(leaf.media_type())
+            .unwrap()
+            .with_schema(trade_schema());
+        leaf.write_arrow_batch_reader(
+            crate::arrow::batch_reader(batch.schema(), [batch]),
+            &options,
+        )
+        .unwrap();
+        leaf.close().unwrap();
+        drop(leaf);
+
+        let lake = Folder::new(&path).unwrap();
+        assert_eq!(
+            collect(lake.read_arrow_batch_reader(&options).unwrap()).len(),
+            1
+        );
+    }
+}

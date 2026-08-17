@@ -1,43 +1,121 @@
-# rkp
+# Yggdryl
 
-`rkp` turns typed Python dataclasses into portable records. One record contract
-can drive JSON and YAML codecs, Apache Arrow schemas and streams, and optional
-Spark, Iceberg, and AWS Glue integrations.
+Arrow-native schemas, byte storage, and structured values, implemented once in Rust and exposed to Python and JavaScript as views of the same values.
 
-```python
-from rkp import Record, field, record
+=== "Rust"
 
+    ```rust
+    use yggdryl::{DataType, Field};
 
-@record(table_name="users")
-class User(Record):
-    identifier: int = field(alias="user_id", seq=1, primary_key=True)
-    name: str
-    email: str | None = None
+    // A non-null struct field is the schema. There is no separate schema type.
+    let schema = Field::new(
+        "row",
+        DataType::from_fields([
+            DataType::Int64.required_field("id"),
+            DataType::Utf8.nullable_field("symbol"),
+        ])?,
+        false,
+    );
 
+    assert_eq!(schema.field_len(), 2);
+    assert_eq!(schema.index_of("symbol"), Some(1));
+    assert!(!schema.fields()[0].is_nullable());
+    ```
 
-user = User.from_dict({"user_id": "7", "name": "Ada"})
-assert user == User(identifier=7, name="Ada")
-assert User.loads_json(user.dumps_json()) == user
-assert User.into_arrow_schema().names == ["user_id", "name", "email"]
-```
+=== "Python"
 
-Arrow is the common protocol boundary. Records can become one batch, bounded
-batches, or a streaming `RecordBatchReader`; Spark, Iceberg, Glue, and ADBC
-reuse the same schema and row representation.
+    ```python
+    from yggdryl import DataType, Field
 
-## Start here
+    # A datatype argument accepts its own expression, so "int64" needs no wrapper.
+    schema = Field(
+        "row",
+        DataType.from_fields(
+            [Field("id", "int64", nullable=False), Field("symbol", "utf8")]
+        ),
+        nullable=False,
+    )
 
-- [Getting started](getting-started.md) installs the core and runs the first
-  example.
-- [Records, fields, and metadata](records.md) defines the shared data contract.
-- [FIX dictionaries](fix.md) generate cached fields, components, repeating groups, and messages.
-- [JSON and YAML](codecs.md) covers strings, paths, streams, and generated
-  record methods.
-- [Arrow](arrow.md) moves from schema inference to lazy batch readers.
-- [Spark](spark.md), [Iceberg](iceberg.md), and [AWS Glue](aws-glue.md) build on
-  that Arrow contract.
-- [PostgreSQL ADBC](integrations.md) demonstrates a live Arrow protocol
-  integration.
-- [Public API](reference/index.md) is a compact signature index.
+    assert len(schema.data_type) == 2
+    assert schema.data_type[1].name == "symbol"
+    assert not schema.data_type[0].nullable
+    ```
 
-The complete runnable examples are in [`docs/examples`](examples/basic.py).
+=== "JavaScript"
+
+    ```javascript
+    const { DataType, Field } = require('@yggdryl/node')
+    const assert = require('node:assert/strict')
+
+    const schema = new Field(
+      'row',
+      DataType.fromFields([
+        new Field('id', 'int64', false),
+        new Field('symbol', 'utf8'),
+      ]),
+      false,
+    )
+
+    assert.equal(schema.dataType.length, 2)
+    assert.equal(schema.dataType.at(1).name, 'symbol')
+    assert.equal(schema.dataType.at(0).nullable, false)
+    ```
+
+## What is here
+
+**A schema is a field.** [`DataType`](core/datatype.md) is the logical type tree and
+[`Field`](core/field.md) adds a name, nullability, and metadata. A non-null struct field describes
+rows, so there is no second schema type to keep in sync, and [casting](core/field.md) reconciles
+incoming Arrow data to it.
+
+**Storage is one trait.** [`IOBase`](core/io.md) addresses bytes positionally and lazily: building
+a handle touches nothing, reading something absent yields nothing, writing creates. An in-memory
+buffer, a [local file or directory](core/local.md), and a
+[compressed view](core/gzip.md) of either are all the same trait, and
+[one enum](core/generic.md) names every implementation.
+
+**Records ride on storage.** Any handle reads and writes Arrow batches, choosing
+[Arrow IPC](core/ipc.md) or [Parquet](core/parquet.md) from its own media type, and
+[Iceberg](core/iceberg.md) reads its schemas as ordinary fields.
+
+**Values are one tree.** [JSON](core/json.md), [YAML](core/yaml.md), and [TOML](core/toml.md) share
+the [structured value](core/text.md), and [URIs](core/uri.md) name where any of it lives.
+
+## Install
+
+=== "Rust"
+
+    ```toml
+    [dependencies]
+    yggdryl = "0.1"
+
+    # Parquet and Iceberg are opt-in; everything else is on by default.
+    # yggdryl = { version = "0.1", features = ["parquet", "iceberg"] }
+    ```
+
+=== "Python"
+
+    ```console
+    pip install yggdryl
+    ```
+
+=== "JavaScript"
+
+    ```console
+    npm install @yggdryl/node
+    ```
+
+Start with [Getting started](getting-started.md), or read the [architecture](architecture.md) for
+the shape of the whole thing first.
+
+<!-- notebooks: generated by scripts/build_docs_notebooks.py -->
+
+## Notebooks
+
+Every example on this page, as a notebook generated from these blocks and
+shipped unexecuted:
+[Rust](notebooks/index-rust.ipynb){ download },
+[Python](notebooks/index-python.ipynb){ download },
+[JavaScript](notebooks/index-javascript.ipynb){ download }.
+
+<!-- /notebooks -->

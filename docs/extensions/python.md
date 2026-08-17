@@ -1,0 +1,411 @@
+# Python
+
+A native view of the same values the Rust core holds, with the protocols Python code expects.
+
+```python
+from yggdryl import DataType, Field, Url
+
+# Every argument accepts the obvious Python spelling of itself.
+schema = Field("row", DataType.from_fields([Field("id", "int64", nullable=False)]), nullable=False)
+location = Url.from_path("C:/market data/trades.arrows")
+
+assert schema.data_type.id == "struct"
+assert str(location) == "file:///C:/market%20data/trades.arrows"
+assert str(location.media_type.base) == "application/vnd.apache.arrow.stream"
+```
+
+This page documents the Python boundary only: what the package adds on top of the core, and how it
+converts what you hand it. The behaviour itself is documented once, on the
+[core pages](../index.md).
+
+## Build from the repository
+
+```console
+cd python
+python -m venv .venv
+.venv/Scripts/python -m pip install maturin pytest pyarrow
+.venv/Scripts/python -m maturin develop
+.venv/Scripts/python -m pytest
+```
+
+On Linux and macOS the interpreter is `.venv/bin/python`.
+
+## What it exposes
+
+| Name | Documented in |
+| --- | --- |
+| `DataType` | [datatype](../core/datatype.md) |
+| `Field`, `fields` | [field](../core/field.md) |
+| `Uri`, `Url`, `Urn` | [uri](../core/uri.md) |
+| `IOBase` | [io](../core/io.md) |
+| `RecordOptions` | [io](../core/io.md), [ipc](../core/ipc.md), [parquet](../core/parquet.md) |
+| `iceberg` | [iceberg](../core/iceberg.md) |
+| `MimeType`, `MediaType`, `Timezone` | [enums](../core/enums.md) |
+| `json`, `toml`, `yaml` | [text](../core/text.md) and the format pages |
+| `Record`, `record`, `from_dict`, `to_dict`, `schema_field`, `schema_fields` | this page |
+
+Compression handles are Rust-only today; the content coding a record encoding applies still comes
+from the handle's own name.
+
+## Inference at the boundary
+
+A constructor accepts the obvious spelling of its argument and converts once, in Rust. There is no
+Python-side parser.
+
+```python
+from yggdryl import DataType, Field, MediaType, MimeType, Url
+
+# A datatype expression is a datatype.
+assert str(Field("id", "int64", nullable=False).data_type) == "int64"
+assert DataType("list<int32>").id == "list"
+
+# A media type is its canonical name.
+assert str(MimeType("application/json")) == "application/json"
+assert str(MediaType("application/json")) == "application/json"
+
+# A path is a location.
+assert str(Url.from_path("C:/tmp/a.json")) == "file:///C:/tmp/a.json"
+```
+
+`from_value` is the generic entry point on every wrapper: it inspects what it was handed - a native
+value, a string, a PyArrow value, a Python type annotation - and dispatches to the matching core
+constructor.
+
+## What a Python value becomes
+
+One pair of Rust functions converts in both directions, so `dumps` and `loads` cannot disagree about
+what a value is. Nine Python types have a native value of their own and cross unchanged.
+
+```python
+import datetime as dt
+import zoneinfo
+from decimal import Decimal
+
+from yggdryl import json
+
+value = {
+    "price": Decimal("10.50"),
+    "on": dt.date(2026, 8, 15),
+    "since_midnight": dt.time(12, 30),
+    "took": dt.timedelta(seconds=90),
+    "at": dt.datetime(2026, 8, 15, 12, 30, tzinfo=zoneinfo.ZoneInfo("Europe/Paris")),
+    "payload": b"\x00\xff",
+}
+
+restored = json.loads(json.dumps(value))
+
+assert restored == value
+# The scale is data, so a price written to two places comes back to two.
+assert str(restored["price"]) == "10.50"
+# A zone survives as the zone, not as the offset it happened to be at.
+assert restored["at"].tzinfo == zoneinfo.ZoneInfo("Europe/Paris")
+```
+
+| Python | Native value | Notes |
+| --- | --- | --- |
+| `None`, `bool`, `int`, `float`, `str`, `bytes` | `Null`, `Bool`, integer, `Float`, `String`, `Bytes` | an `int` up to 128 bits keeps its width |
+| `decimal.Decimal` | `Decimal` | coefficient and scale, never a float |
+| `datetime.date` | `Date` | days since the epoch |
+| `datetime.time` | `Time` | microseconds since midnight |
+| `datetime.datetime` | `Timestamp` | microseconds since the epoch, UTC, plus the zone |
+| `datetime.timedelta` | `Duration` | elapsed microseconds |
+| `list`, `tuple` | `Sequence` | |
+| `dict` | `Mapping` | keys are values too, not only strings |
+
+The four temporal names and `decimal` are the shared cross-language vocabulary, so a document written
+here reads back as a native temporal in Rust and JavaScript rather than as a Python-shaped string.
+
+## What a Python value loses
+
+Everything else is written as the closest natural shape, and its class does not survive the round
+trip. This is a deliberate trade: a name over an untyped payload is not a type, because nothing
+checks that the payload matches the name, so the binding carries the shape and lets the reader supply
+the type.
+
+```python
+import pathlib
+import uuid
+from collections import deque
+
+from yggdryl import json
+
+value = {
+    "tags": {"b", "a"},
+    "queue": deque([1, 2], maxlen=8),
+    "id": uuid.UUID("12345678-1234-5678-1234-567812345678"),
+    "path": pathlib.PurePosixPath("lake/trades.arrow"),
+}
+
+restored = json.loads(json.dumps(value))
+
+assert restored == {
+    "tags": ["a", "b"],
+    "queue": [1, 2],
+    "id": "12345678-1234-5678-1234-567812345678",
+    "path": "lake/trades.arrow",
+}
+```
+
+| Python | Written as | What is lost |
+| --- | --- | --- |
+| `set`, `frozenset` | sequence, sorted | the type, and the original iteration order |
+| `collections.deque` | sequence | the type and `maxlen` |
+| `tuple` | sequence | that it was a tuple |
+| `bytearray`, `memoryview` | bytes | the type |
+| `uuid.UUID` | its text | the type |
+| `pathlib.Path` and any `__fspath__` | its file-system string | the flavour, and on Windows the separator is `\` |
+| `complex` | `[real, imag]` | the type |
+| `range`, `slice` | `[start, stop, step]` | the type |
+| `OrderedDict`, `Counter`, `defaultdict` | mapping | the type, and a `defaultdict`'s factory |
+| a named tuple | mapping of its members | the class |
+| an `enum.Enum` member | its value | the class |
+| a dataclass or record | mapping of its fields | the class |
+| any other object | mapping of its `__dict__` | the class |
+| an `int` wider than 128 bits | its decimal text | that it was a number |
+| `datetime.fold` | nothing | which reading of a repeated hour a *naive* value was |
+| a `tzinfo` on a `datetime.time` | nothing | the zone; a time of day has no zone field |
+
+A `fold` on an *aware* datetime does survive, because the offset it selects is baked into the
+UTC-relative count the value carries.
+
+Two losses are refusals rather than silent damage: a decimal whose coefficient needs more than 128
+bits or whose exponent has no scale in `-128..=127` raises `OverflowError`, and a temporal finer than
+a microsecond - which `datetime` cannot hold - raises `ValueError` instead of truncating.
+
+## Reading a class back
+
+Nothing in a document names a Python class, so the class comes from the call. `cls=` converts the
+decoded mapping through the same safe caster `from_dict` uses, which is the only path that validates
+annotations and never imports a module named by untrusted input.
+
+```python
+from yggdryl import json, record
+
+@record
+class Trade:
+    trade_id: int
+    symbol: str
+
+encoded = Trade(1, "AAPL").into_json()
+
+# Without a target the document is what it says it is: data.
+assert json.loads(encoded) == {"trade_id": 1, "symbol": "AAPL"}
+assert json.loads(encoded, cls=Trade) == Trade(1, "AAPL")
+assert Trade.from_json(encoded) == Trade(1, "AAPL")
+```
+
+A record used as a dictionary *key* is the one shape that reads back asymmetrically: JSON and YAML
+have no unhashable keys, so it decodes as the tuple of its entries, and an annotation naming the
+record type reads that tuple back as the record.
+
+## Field metadata is a mapping
+
+`Field` implements the mapping protocol over its metadata, so ordinary Python idioms work and the
+ordering is the native one.
+
+```python
+from yggdryl import Field
+
+field = Field("trade", "int64", nullable=False, metadata={"source": "book"})
+field["venue"] = "XPAR"
+
+assert field["source"] == "book"
+assert "venue" in field
+assert len(field) == 2
+assert sorted(field.keys()) == ["source", "venue"]
+assert dict(field.items())["venue"] == "XPAR"
+
+del field["venue"]
+assert "venue" not in field
+```
+
+Typed identifiers and protocol properties (`id`, `alias`, `content_type`, `etag`, and the rest) are
+attributes rather than map keys, because they are validated.
+
+## Records
+
+The Python-only records layer compiles class annotations into a native schema field and converts
+instances through the core.
+
+```python
+from yggdryl import record, to_dict
+
+@record
+class Trade:
+    trade_id: int
+    symbol: str
+
+trade = Trade(trade_id=1, symbol="AAPL")
+
+assert to_dict(trade) == {"trade_id": 1, "symbol": "AAPL"}
+assert Trade.schema_field().name == "Trade"
+assert [field.name for field in Trade.schema_fields()] == ["trade_id", "symbol"]
+```
+
+Annotation inference, safe conversion, and Arrow materialization all delegate to the core: the
+Python layer decides *which* core call to make, never how the conversion works.
+
+## Errors
+
+A native error crosses unchanged and arrives as the idiomatic Python exception type - `ValueError`
+for an invalid value, `TypeError` for an unusable argument - carrying the same message the Rust
+error produced, including its path or byte offset.
+
+```python
+from yggdryl import DataType
+
+try:
+    DataType("decimal(0,0)")
+except ValueError as error:
+    assert "precision" in str(error)
+else:
+    raise AssertionError("an invalid precision must be reported")
+```
+
+## `pathlib`-shaped storage
+
+`IOBase` is the core storage handle with the method names `pathlib.Path` already uses. The core
+trait is positional and fully random-access, so there are no modes to open with and no cursor to
+keep - `read_bytes`, `write_bytes`, `iterdir`, `glob`, `mkdir`, `touch`, and `unlink` mean here what
+they mean on a `Path`, and each is answered by the core implementation for the backend the location
+names.
+
+```python
+import pathlib
+import tempfile
+
+from yggdryl import IOBase, Url
+
+root = pathlib.Path(tempfile.mkdtemp())
+
+# Construction touches nothing, so a missing location is empty, not an error.
+handle = IOBase(root / "trades.arrows")
+assert not handle.exists()
+assert handle.read_bytes() == b""
+
+handle.write_text("AAPL")
+assert handle.read_text() == "AAPL"
+assert handle.size == 4
+
+# Random access needs no mode.
+handle.pwrite(0, b"MSFT")
+assert handle.pread(0, 4) == b"MSFT"
+
+# Children resolve the way they do for a Path.
+lake = IOBase(root / "lake" / "year=2024")
+lake.mkdir()
+(lake / "part-0.arrows").touch()
+assert [entry.name for entry in lake.iterdir()] == ["part-0.arrows"]
+assert len(IOBase(root / "lake").rglob("*.arrows")) == 1
+```
+
+`Url` answers the `PurePath` half under the same names - `name`, `stem`, `suffix`, `suffixes`,
+`parts`, `parent`, `parents`, `joinpath`, `/`, `with_name`, `with_stem`, `with_suffix`, `match`,
+`relative_to`, `is_relative_to`, `as_posix`, `as_uri` - plus `exists`, `is_dir`, and `is_file` for a
+local URL.
+
+```python
+from yggdryl import Url
+
+url = Url("file:///lake/trades/part-0.tar.gz")
+
+assert url.name == "part-0.tar.gz"
+assert url.suffix == ".gz"
+assert url.suffixes == (".tar", ".gz")
+assert url.parts == ("lake", "trades", "part-0.tar.gz")
+assert str(url.parent) == "file:///lake/trades"
+assert str(url.with_suffix(".parquet")) == "file:///lake/trades/part-0.tar.parquet"
+assert url.match("*.gz")
+assert url.relative_to(Url("file:///lake")) == "trades/part-0.tar.gz"
+```
+
+Where a `Path` would raise, this raises the same thing: `relative_to` on a location outside the
+root is a `ValueError`, and `touch` on a directory is an `IsADirectoryError`. Where the two differ,
+the difference is the point - a URL carries a scheme, so the same code addresses a local directory
+and, when that backend lands, a bucket.
+
+A Hive layout is readable from either side: `handle.partitions` and `url.partitions` return the
+`column=value` pairs the path spells out, and `handle.children_where({"year": "2024"})` yields the
+leaves carrying them, ready to rewrite.
+
+## Records cross as PyArrow readers
+
+The same handle reads and writes records. A read returns a `pyarrow.RecordBatchReader` and a write
+takes anything PyArrow exports an Arrow C stream from, so batches cross without a copy in either
+direction and a resource larger than memory is never materialized to move it.
+
+```python
+import pathlib
+import tempfile
+
+import pyarrow as pa
+
+from yggdryl import IOBase
+
+schema = pa.schema([
+    pa.field("id", pa.int64(), nullable=False),
+    pa.field("venue", pa.string(), nullable=False),
+])
+batch = pa.record_batch({"id": [1, 2], "venue": ["XNAS", "XNYS"]}, schema=schema)
+
+root = pathlib.Path(tempfile.mkdtemp())
+
+# The handle's name picks the encoding; no call takes a format argument.
+for name in ("trades.arrows", "trades.parquet"):
+    with IOBase(root / name) as handle:
+        handle.write_arrow_batch_reader(batch)
+        assert handle.read_arrow_batch_reader().read_all() == pa.Table.from_batches([batch])
+
+# A schema on the options selects and casts in one pass: the columns it leaves
+# out are skipped rather than read and discarded.
+handle = IOBase(root / "trades.parquet")
+options = handle.record_options()
+options.schema = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+assert handle.read_arrow_batch_reader(options=options).schema.names == ["id"]
+```
+
+`record_options()` is the settings value for whichever encoding the media type names, and it is what
+carries a Parquet row-group size or page compression. `with` is the scoped pair: leaving the block
+publishes the resource at its exact length, which is what another reader needs to find a footer.
+
+An Iceberg table is the same handle one level up.
+
+```python
+import pathlib
+import tempfile
+
+import pyarrow as pa
+
+from yggdryl import IOBase
+from yggdryl.iceberg import Table, assign_field_ids
+
+columns = pa.schema([
+    pa.field("id", pa.int64(), nullable=False),
+    pa.field("venue", pa.string()),
+])
+
+# Iceberg resolves a column by identifier, so a schema is numbered first.
+table = Table.create(
+    IOBase(pathlib.Path(tempfile.mkdtemp()) / "trades"),
+    assign_field_ids(columns),
+    ["venue"],
+)
+table.append(pa.record_batch({"id": [1, 2], "venue": ["XNAS", None]}, schema=columns))
+
+assert table.scan().read_all().num_rows == 2
+# The manifest is the authority on a partition value, not the directory name.
+assert sorted(str(file.partition[0]) for file, _ in table.data_files()) == [
+    "None",
+    "XNAS",
+]
+```
+
+<!-- notebooks: generated by scripts/build_docs_notebooks.py -->
+
+## Notebooks
+
+Every example on this page, as a notebook generated from these blocks and
+shipped unexecuted:
+[Python](../notebooks/extensions_python-python.ipynb){ download }.
+
+<!-- /notebooks -->
