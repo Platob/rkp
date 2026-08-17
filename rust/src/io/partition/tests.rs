@@ -151,6 +151,7 @@ mod lake {
 
     use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 
+    use crate::DataType;
     use crate::generic::{Holder, IORecordOptions};
 
     /// Build an empty `lake/` under the temp directory and hold it as a folder.
@@ -426,6 +427,83 @@ mod lake {
                 (2024, "01".to_owned(), 30),
             ]
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_declared_schema_lays_an_empty_folder_out_by_its_partition_fields() {
+        let (root, mut handle) = lake("declared-schema");
+        // Nothing is on disk, so nothing spells a layout. The schema does: it
+        // marks the two columns a path is supposed to carry.
+        let field = schema().with_partition_fields(&["year", "month"]).unwrap();
+        let full = with_partitions(&prices(), &partitions(), Some(&field)).unwrap();
+
+        handle
+            .write_arrow_batch_reader(
+                crate::arrow::batch_reader(full.schema(), [full]),
+                &options(Some(field.clone())),
+            )
+            .unwrap();
+
+        // The directories were created from the declaration, and the leaf keeps
+        // only the column the path does not carry.
+        assert!(root.join("year=2024").join("month=01").is_dir());
+        assert!(
+            root.join("year=2024")
+                .join("month=01")
+                .join("part-0.arrows")
+                .is_file()
+        );
+        assert_eq!(
+            rows(&handle, &field),
+            vec![
+                (2024, "01".to_owned(), 10),
+                (2024, "01".to_owned(), 20),
+                (2024, "01".to_owned(), 30),
+            ]
+        );
+
+        // Reading the tree back reports the same layout without being told it.
+        let derived = handle.read_arrow_field(&options(None)).unwrap();
+        assert_eq!(
+            derived.partition_field_names().collect::<Vec<_>>(),
+            ["year", "month"]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_declared_layout_that_contradicts_the_stored_one_is_refused_by_name() {
+        let (root, mut handle) = lake("contradicting-layout");
+        seed(&root, "year=2024/month=01", &prices());
+
+        // The tree is laid out by year and month; the schema says venue. One
+        // write cannot mean both, so it says so instead of choosing.
+        let field = schema()
+            .try_with_data_type(
+                DataType::from_fields([
+                    DataType::Int64.required_field("price"),
+                    DataType::Int32.required_field("year"),
+                    DataType::Utf8.required_field("month"),
+                    DataType::Utf8.required_field("venue"),
+                ])
+                .unwrap(),
+            )
+            .unwrap()
+            .with_partition_fields(&["venue"])
+            .unwrap();
+        let full = with_partitions(&prices(), &partitions(), Some(&field)).unwrap();
+        let error = handle
+            .write_arrow_batch_reader(
+                crate::arrow::batch_reader(full.schema(), [full]),
+                &options(Some(field)),
+            )
+            .expect_err("two layouts in one tree");
+        let message = error.to_string();
+        assert!(message.contains("year, month"), "{message}");
+        assert!(message.contains("venue"), "{message}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

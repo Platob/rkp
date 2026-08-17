@@ -45,9 +45,12 @@ pub use error::{Error, Result};
 #[cfg(feature = "arrow")]
 pub use field::cast::{ArrowCast, ArrowFieldType};
 pub use field::{
-    Differences, Field, FieldRef, FieldType, OwnedDifferences, TypedField, TypedFieldRef,
+    AnyType, Differences, Field, FieldRef, FieldType, OwnedDifferences, PartitionFieldNames,
+    PartitionFields, TypedField, TypedFieldRef,
 };
-pub use metadata::{Metadata, MetadataIntoIter, MetadataIter, PropertyIter};
+pub use metadata::{
+    Metadata, MetadataIntoIter, MetadataIter, PropertyIter, ProtocolMetadata, ProtocolMetadataMut,
+};
 pub(crate) use text::stable_hash_display;
 pub use text::{Children, Float, Format, Limits, TypedValue, Value, ValueIter};
 pub use uri::{

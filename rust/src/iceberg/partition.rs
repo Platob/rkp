@@ -23,6 +23,15 @@ use crate::{DataType, Error, Field, Result, Value};
 /// The identifier Iceberg assigns to the first partition field of a table.
 pub const FIRST_PARTITION_ID: i32 = 1000;
 
+/// The Iceberg property naming how a partition value is derived.
+const TRANSFORM: &str = "transform";
+
+/// The Iceberg property naming the schema column a partition field reads.
+const SOURCE_ID: &str = "partition-source-id";
+
+/// The Iceberg property naming the spec a partition tuple belongs to.
+const SPEC_ID: &str = "spec-id";
+
 /// How a source column value becomes a partition value.
 ///
 /// ```
@@ -300,6 +309,103 @@ impl PartitionSpec {
         Ok(Self { spec_id, fields })
     }
 
+    /// Build a spec from the columns a schema already marks as partitions.
+    ///
+    /// A [`Field`] says which of its children a path spells out, so a caller
+    /// who declared that on the schema does not declare it again here. The
+    /// marked columns become identity partition fields in declaration order,
+    /// and a schema that marks none produces the unpartitioned spec.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the field is not a struct root, or when a marked
+    /// column carries no field identifier.
+    pub fn from_schema(spec_id: i32, schema: &Field) -> Result<Self> {
+        schema.require_struct()?;
+        let columns: Vec<&str> = schema.partition_field_names().collect();
+        Self::identity(spec_id, schema, &columns)
+    }
+
+    /// Read a spec back off the partition tuple it describes.
+    ///
+    /// This is the inverse of [`Self::partition_field`]: the tuple carries the
+    /// transform, the source column, and the spec identifier as Iceberg
+    /// properties, so a caller holding the tuple holds the spec and does not
+    /// need the table metadata beside it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the field is not a struct, or when a child is
+    /// missing its field identifier, source identifier, or transform.
+    pub fn from_field(partition: &Field) -> Result<Self> {
+        partition.require_struct()?;
+        let spec_id = partition.iceberg().get(SPEC_ID).map_or(Ok(0), |id| {
+            id.parse::<i32>().map_err(|_| {
+                invalid(format_smolstr!(
+                    "expected an integer iceberg:{SPEC_ID} on a partition tuple, got {id:?}"
+                ))
+            })
+        })?;
+        let mut fields = Vec::with_capacity(partition.field_len());
+        for child in partition.fields() {
+            let name = child.name();
+            let field_id = child.id()?.ok_or_else(|| {
+                invalid(format_smolstr!(
+                    "expected a PARQUET:field_id on the partition field {name:?}, got none"
+                ))
+            })?;
+            let source_id = child
+                .iceberg()
+                .get(SOURCE_ID)
+                .and_then(|id| id.parse::<i32>().ok())
+                .ok_or_else(|| {
+                    invalid(format_smolstr!(
+                        "expected an integer iceberg:{SOURCE_ID} on the partition field {name:?}"
+                    ))
+                })?;
+            let transform = child
+                .iceberg()
+                .get(TRANSFORM)
+                .map_or(Ok(Transform::Identity), Transform::from_str)?;
+            fields.push(PartitionField {
+                source_id,
+                field_id,
+                name: SmolStr::new(name),
+                transform,
+            });
+        }
+        Ok(Self { spec_id, fields })
+    }
+
+    /// Return `schema` with the columns this spec partitions on marked.
+    ///
+    /// Only an identity transform marks a column: it is the one transform whose
+    /// partition value *is* the column's value, so it is the only one a path can
+    /// spell and a reader can invert. A schema carrying the marks says how it is
+    /// laid out without a spec beside it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the field is not a struct root, or when a source
+    /// column is missing from it.
+    pub fn mark_partitions(&self, schema: &Field) -> Result<Field> {
+        let mut columns = Vec::with_capacity(self.fields.len());
+        for field in &self.fields {
+            if field.transform != Transform::Identity {
+                continue;
+            }
+            // A spec can name a column of a nested struct, which no path spells
+            // out and no top-level marker describes; such a field is left alone.
+            let Some(source) = find_by_id(schema, field.source_id) else {
+                continue;
+            };
+            if schema.get_field_by_name(source.name()).is_some() {
+                columns.push(source.name());
+            }
+        }
+        schema.with_partition_fields(&columns)
+    }
+
     /// Return whether this spec places every file in one partition.
     pub fn is_unpartitioned(&self) -> bool {
         self.fields.is_empty()
@@ -345,12 +451,16 @@ impl PartitionSpec {
     /// Return the non-null struct Field the partition tuple has.
     ///
     /// This is the schema of a manifest's `partition` column, which is what
-    /// makes a partition value readable without consulting the path.
+    /// makes a partition value readable without consulting the path. Each child
+    /// also carries what produced it - the transform, the source column's
+    /// identifier, and the partition marker every path-borne column carries - so
+    /// the tuple describes itself and [`Self::from_field`] reads this spec back
+    /// out of it.
     ///
     /// # Errors
     ///
-    /// Returns an error when a source column is missing from `schema` or a
-    /// transform cannot apply to it.
+    /// Returns an error when a source column is missing from `schema`, a
+    /// transform cannot apply to it, or a property cannot be recorded.
     pub fn partition_field(&self, schema: &Field) -> Result<Field> {
         let mut children = Vec::with_capacity(self.fields.len());
         for field in &self.fields {
@@ -360,13 +470,20 @@ impl PartitionSpec {
             // spec can retire a field, and `void` produces nothing but null.
             let mut child = Field::new(field.name.as_str(), data_type, true);
             child.set_id(field.field_id);
+            child.set_partition(true);
+            child
+                .iceberg_mut()
+                .insert(SOURCE_ID, field.source_id.to_string())?;
+            child
+                .iceberg_mut()
+                .insert(TRANSFORM, field.transform.to_string())?;
             children.push(child);
         }
-        Ok(Field::new(
-            "partition",
-            DataType::from_fields(children)?,
-            false,
-        ))
+        let mut partition = Field::new("partition", DataType::from_fields(children)?, false);
+        partition
+            .iceberg_mut()
+            .insert(SPEC_ID, self.spec_id.to_string())?;
+        Ok(partition)
     }
 
     /// Return the Hive-style directory chain one partition tuple names.

@@ -109,3 +109,90 @@ fn serde_reads_a_pairing_back_through_the_validating_constructor() {
         br#"{"data_type":{"type":"int64"},"value":{"type":"string","value":"seven"}}"#;
     assert!(serde_json::from_slice::<TypedValue>(contradiction).is_err());
 }
+
+#[test]
+fn a_marker_narrows_a_pairing_to_one_datatype_at_compile_time() {
+    use crate::generic::{Int64Value, Utf8Value};
+
+    let price = Int64Value::new(Value::from(7_i64)).unwrap();
+    assert_eq!(price.data_type(), &DataType::Int64);
+    assert_eq!(price.value(), &Value::I64(7));
+
+    // The marker is checked, and the value is still checked against it.
+    assert!(Int64Value::try_from_parts(DataType::Int64, Value::from(7_i64)).is_ok());
+    assert!(Int64Value::new(Value::from("seven")).is_err());
+    let wrong = Int64Value::try_from_parts(DataType::Utf8, Value::from("seven"))
+        .expect_err("utf8 is not the int64 marker");
+    let message = wrong.to_string();
+    assert!(
+        message.contains("int64") && message.contains("utf8"),
+        "the failure must name both markers, got {message}"
+    );
+
+    // A value that names its own datatype still has to name this one.
+    assert_eq!(
+        Utf8Value::try_from_value(Value::from("AAPL"))
+            .unwrap()
+            .data_type(),
+        &DataType::Utf8
+    );
+    assert!(Utf8Value::try_from_value(Value::from(7_i64)).is_err());
+}
+
+#[test]
+fn a_marker_is_a_view_of_the_same_pairing_and_costs_nothing() {
+    use crate::generic::{Int64Value, TimestampValue};
+
+    assert_eq!(
+        std::mem::size_of::<Int64Value>(),
+        std::mem::size_of::<TypedValue>()
+    );
+
+    // Widening and narrowing move the same two halves between markers.
+    let dynamic = TypedValue::from_parts(DataType::Int64, Value::from(7_i64)).unwrap();
+    let narrowed: Int64Value = dynamic.clone().try_into_typed().unwrap();
+    assert_eq!(narrowed.clone().into_any(), dynamic);
+    assert!(
+        dynamic
+            .clone()
+            .try_into_typed::<crate::field::binary::Utf8>()
+            .is_err()
+    );
+    assert_eq!(narrowed.into_value(), Value::I64(7));
+
+    // A parameterized datatype keeps its parameters in the pairing, not the marker.
+    let stamp = TimestampValue::try_from_parts(
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        Value::timestamp(0, TimeUnit::Microsecond, None).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        stamp.data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None)
+    );
+    assert!(
+        TimestampValue::try_from_parts(DataType::Date32, Value::Date(0)).is_err(),
+        "a date is not a timestamp"
+    );
+}
+
+#[test]
+fn a_narrowed_pairing_serializes_as_the_two_halves_and_reads_back_checked() {
+    use crate::generic::Int64Value;
+
+    let typed = Int64Value::new(Value::from(7_i64)).unwrap();
+    let encoded = serde_json::to_vec(&typed).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<TypedValue>(&encoded).unwrap(),
+        typed.clone().into_any()
+    );
+    assert_eq!(
+        serde_json::from_slice::<Int64Value>(&encoded).unwrap(),
+        typed
+    );
+
+    // The marker is a compile-time fact, so a datatype it refuses never loads.
+    let text = br#"{"data_type":{"type":"utf8"},"value":{"type":"string","value":"seven"}}"#;
+    assert!(serde_json::from_slice::<TypedValue>(text).is_ok());
+    assert!(serde_json::from_slice::<Int64Value>(text).is_err());
+}

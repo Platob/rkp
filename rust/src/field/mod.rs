@@ -13,18 +13,38 @@ use crate::datatype::{
     DataType, MapType, RunEndEncodedType, default_value_for_field, preflight_schema_shape,
 };
 use crate::metadata::{
-    ALIAS_KEY, CATALOG_NAME_KEY, FIELD_INIT_KEY, HTTP_ACCEPT_ENCODING_KEY, HTTP_ACCEPT_KEY,
-    HTTP_ACCEPT_LANGUAGE_KEY, HTTP_ACCEPT_RANGES_KEY, HTTP_CACHE_CONTROL_KEY,
+    ALIAS_KEY, CATALOG_NAME_KEY, FIELD_INIT_KEY, FIELD_PARTITION_KEY, HTTP_ACCEPT_ENCODING_KEY,
+    HTTP_ACCEPT_KEY, HTTP_ACCEPT_LANGUAGE_KEY, HTTP_ACCEPT_RANGES_KEY, HTTP_CACHE_CONTROL_KEY,
     HTTP_CONTENT_DISPOSITION_KEY, HTTP_CONTENT_ENCODING_KEY, HTTP_CONTENT_LANGUAGE_KEY,
     HTTP_CONTENT_LENGTH_KEY, HTTP_CONTENT_LOCATION_KEY, HTTP_CONTENT_RANGE_KEY,
     HTTP_CONTENT_TYPE_KEY, HTTP_ETAG_KEY, HTTP_EXPIRES_KEY, HTTP_LAST_MODIFIED_KEY,
     HTTP_LOCATION_KEY, HTTP_RANGE_KEY, HTTP_VARY_KEY, LOCATION_KEY, MetadataIter,
-    PARQUET_FIELD_ID_KEY, PropertyIter, SCHEMA_NAME_KEY, TABLE_NAME_KEY, parse_field_id,
-    parse_reserved_bool, protocol_metadata_prefix, write_json_string as write_quoted,
+    PARQUET_FIELD_ID_KEY, PropertyIter, ProtocolMetadata, ProtocolMetadataMut, SCHEMA_NAME_KEY,
+    TABLE_NAME_KEY, for_each_well_known_protocol, parse_field_id, parse_reserved_bool,
+    property_key, write_json_string as write_quoted,
 };
 use crate::{
     Error, MediaType, Metadata, MimeType, Result, Scheme, Url, Value, stable_hash_display,
 };
+
+/// Emit the borrowed and mutable protocol view accessors of one protocol.
+macro_rules! field_protocol_accessors {
+    ($name:ident, $mutable:ident, $constant:ident, $label:literal) => {
+        #[doc = concat!("Returns the borrowed ", $label, " property view.")]
+        ///
+        /// This is [`Self::protocol`] with the protocol already chosen.
+        pub fn $name(&self) -> ProtocolMetadata<'_> {
+            self.protocol(&Scheme::$constant)
+        }
+
+        #[doc = concat!("Returns the mutable ", $label, " property view.")]
+        ///
+        /// This is [`Self::protocol_mut`] with the protocol already chosen.
+        pub fn $mutable(&mut self) -> ProtocolMetadataMut<'_> {
+            self.protocol_mut(&Scheme::$constant)
+        }
+    };
+}
 
 mod arrow;
 pub mod binary;
@@ -48,7 +68,7 @@ pub use cast::{ArrowCast, ArrowFieldType};
 pub(crate) use diff::push_field_name_path;
 pub use diff::{Differences, OwnedDifferences};
 pub(crate) use diff::{data_types_equal, show_diff};
-pub use typed::{FieldType, TypedField, TypedFieldRef};
+pub use typed::{AnyType, FieldType, TypedField, TypedFieldRef};
 pub(crate) use value::validate_data_type_value_for;
 
 /// A null-typed field.
@@ -297,6 +317,166 @@ impl Field {
         Self::from_parts(
             self.name(),
             DataType::from_fields(kept)?,
+            self.is_nullable(),
+            self.metadata_iter(),
+        )
+    }
+
+    /// Returns whether this field carries the values a path spells out.
+    ///
+    /// A partition field is an ordinary field with the reserved
+    /// `field:partition` marker set. Nothing in a batch says which of its
+    /// columns belong in a directory name, so a schema that means to be stored
+    /// partitioned has to say so, and this is where it says it. Every
+    /// constructor canonicalizes the marker, so an absent one and an explicit
+    /// `false` both read as "not a partition field".
+    ///
+    /// ```
+    /// use yggdryl::DataType;
+    ///
+    /// let year = DataType::Int32.required_field("year").with_partition(true);
+    ///
+    /// assert!(year.is_partition());
+    /// assert!(!DataType::Int64.required_field("price").is_partition());
+    /// ```
+    pub fn is_partition(&self) -> bool {
+        self.get_metadata(FIELD_PARTITION_KEY) == Some("true")
+    }
+
+    /// Returns the struct children that partition the rows.
+    ///
+    /// The iterator borrows the children in declaration order, which is also
+    /// the order their directories nest in a path.
+    ///
+    /// ```
+    /// use yggdryl::DataType;
+    ///
+    /// # fn main() -> yggdryl::Result<()> {
+    /// let schema = DataType::from_fields([
+    ///     DataType::Int32.required_field("year").with_partition(true),
+    ///     DataType::Int64.required_field("price"),
+    /// ])?
+    /// .required_field("row");
+    ///
+    /// assert_eq!(schema.partition_field_names().collect::<Vec<_>>(), ["year"]);
+    /// assert_eq!(schema.partition_field_len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn partition_fields(&self) -> PartitionFields<'_> {
+        PartitionFields(self.fields().iter())
+    }
+
+    /// Returns the names of the struct children that partition the rows.
+    pub fn partition_field_names(&self) -> PartitionFieldNames<'_> {
+        PartitionFieldNames(self.partition_fields())
+    }
+
+    /// Returns how many struct children partition the rows.
+    pub fn partition_field_len(&self) -> usize {
+        self.partition_fields().count()
+    }
+
+    /// Returns whether any struct child partitions the rows.
+    pub fn has_partition_fields(&self) -> bool {
+        self.partition_fields().next().is_some()
+    }
+
+    /// Returns this struct root holding only the columns a path spells out.
+    ///
+    /// This is the tuple a partitioned layout carries in its directory names,
+    /// and the complement of [`Self::without_partition_fields`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this is not a struct, or when the remaining
+    /// children do not form a valid datatype.
+    pub fn only_partition_fields(&self) -> Result<Self> {
+        self.require_struct()?;
+        let kept: Vec<Self> = self.partition_fields().cloned().collect();
+        Self::from_parts(
+            self.name(),
+            DataType::from_fields(kept)?,
+            self.is_nullable(),
+            self.metadata_iter(),
+        )
+    }
+
+    /// Returns this struct root without the columns a path spells out.
+    ///
+    /// This is what a partitioned write stores in a leaf: the declared schema
+    /// minus the columns the directory names already carry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this is not a struct, or when removing the
+    /// partition children would leave a datatype that is not valid.
+    pub fn without_partition_fields(&self) -> Result<Self> {
+        self.require_struct()?;
+        let names: Vec<&str> = self.partition_field_names().collect();
+        if names.is_empty() {
+            // Subtracting nothing is the field itself, and a clone of a field
+            // shares its metadata, children, and populated Arrow projection.
+            return Ok(self.clone());
+        }
+        self.without_fields(&names)
+    }
+
+    /// Returns this struct root with the named children marked as partitions.
+    ///
+    /// A name this root does not carry is an error rather than a silent
+    /// omission: a partition column nobody stores is a layout the writer would
+    /// have produced without ever saying which column went missing.
+    ///
+    /// ```
+    /// use yggdryl::DataType;
+    ///
+    /// # fn main() -> yggdryl::Result<()> {
+    /// let schema = DataType::from_fields([
+    ///     DataType::Int32.required_field("year"),
+    ///     DataType::Int64.required_field("price"),
+    /// ])?
+    /// .required_field("row")
+    /// .with_partition_fields(&["year"])?;
+    ///
+    /// assert_eq!(schema.partition_field_names().collect::<Vec<_>>(), ["year"]);
+    /// assert_eq!(schema.without_partition_fields()?.field_len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this is not a struct or a name is not one of its
+    /// children.
+    pub fn with_partition_fields(&self, names: &[&str]) -> Result<Self> {
+        self.require_struct()?;
+        for name in names {
+            if self.get_field_by_name(name).is_none() {
+                return Err(Error::InvalidRecord {
+                    path: format_smolstr!("$.{name}"),
+                    reason: crate::text::expected_got(
+                        format_args!("a column of {:?} to partition on", self.name()),
+                        format_args!("{name:?}"),
+                    ),
+                });
+            }
+        }
+        let children: Vec<Self> = self
+            .fields()
+            .iter()
+            .map(|child| {
+                let partition = names.contains(&child.name());
+                if partition == child.is_partition() {
+                    child.clone()
+                } else {
+                    child.clone().with_partition(partition)
+                }
+            })
+            .collect();
+        Self::from_parts(
+            self.name(),
+            DataType::from_fields(children)?,
             self.is_nullable(),
             self.metadata_iter(),
         )
@@ -623,6 +803,52 @@ impl Field {
         self.metadata.next_property_entry(scheme, after_name)
     }
 
+    /// Returns a borrowed view of one protocol's properties.
+    ///
+    /// The view remembers the protocol, so a caller spells the bare property
+    /// name and never assembles a `scheme:name` key itself. Nothing is copied:
+    /// it borrows this field's metadata and reads out of the same tree.
+    ///
+    /// ```
+    /// use yggdryl::{DataType, Scheme};
+    ///
+    /// # fn main() -> yggdryl::Result<()> {
+    /// let mut field = DataType::Int64.required_field("price");
+    /// field.set_property(&Scheme::ICEBERG, "doc", "closing price")?;
+    ///
+    /// assert_eq!(field.protocol(&Scheme::ICEBERG).get("doc"), Some("closing price"));
+    /// assert_eq!(field.iceberg().get("doc"), Some("closing price"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn protocol(&self, scheme: &Scheme) -> ProtocolMetadata<'_> {
+        self.metadata.protocol(scheme)
+    }
+
+    /// Returns a mutable view of one protocol's properties.
+    ///
+    /// Every write goes through this field's own cache-aware mutation, so a
+    /// protocol write invalidates a populated Arrow projection exactly as a
+    /// direct metadata write does.
+    ///
+    /// ```
+    /// use yggdryl::{DataType, Scheme};
+    ///
+    /// # fn main() -> yggdryl::Result<()> {
+    /// let mut field = DataType::Int64.required_field("price");
+    ///
+    /// field.protocol_mut(&Scheme::ICEBERG).insert("doc", "closing price")?;
+    ///
+    /// assert_eq!(field.get_metadata("iceberg:doc"), Some("closing price"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn protocol_mut(&mut self, scheme: &Scheme) -> ProtocolMetadataMut<'_> {
+        ProtocolMetadataMut::new(self, scheme.clone())
+    }
+
+    for_each_well_known_protocol!(field_protocol_accessors);
+
     /// Changes the field name and invalidates a populated Arrow cache once.
     pub fn set_name(&mut self, name: impl Into<SmolStr>) {
         let name = name.into();
@@ -885,6 +1111,30 @@ impl Field {
     /// Returns a persistent field with its initialization participation set.
     pub fn with_init(mut self, init: bool) -> Self {
         self.set_init(init);
+        self
+    }
+
+    /// Marks or unmarks this field as one a path spells out.
+    ///
+    /// An ordinary field carries no marker at all, so unmarking removes the
+    /// reserved key rather than storing the default it already means. That
+    /// keeps two schemas that partition the same way exactly equal.
+    pub fn set_partition(&mut self, partition: bool) {
+        if !partition {
+            self.remove_metadata(FIELD_PARTITION_KEY);
+            return;
+        }
+        let (_, changed) = self
+            .metadata
+            .insert_validated(FIELD_PARTITION_KEY.to_owned(), "true".to_owned());
+        if changed {
+            self.invalidate_arrow();
+        }
+    }
+
+    /// Returns a persistent field marked or unmarked as a partition column.
+    pub fn with_partition(mut self, partition: bool) -> Self {
+        self.set_partition(partition);
         self
     }
 
@@ -1385,14 +1635,55 @@ impl Clone for Field {
     }
 }
 
-fn property_key(scheme: &Scheme, name: &str) -> String {
-    let scheme = protocol_metadata_prefix(scheme);
-    let mut key = String::with_capacity(scheme.len() + 1 + name.len());
-    key.push_str(scheme);
-    key.push(':');
-    key.push_str(name);
-    key
+/// A borrowed iterator over the struct children that partition the rows.
+#[derive(Clone)]
+pub struct PartitionFields<'field>(std::slice::Iter<'field, Field>);
+
+impl<'field> Iterator for PartitionFields<'field> {
+    type Item = &'field Field;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.find(|field| field.is_partition())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // Every remaining child may or may not be marked, and the marker is a
+        // metadata read rather than a count kept beside the children.
+        (0, Some(self.0.len()))
+    }
 }
+
+impl DoubleEndedIterator for PartitionFields<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.rfind(|field| field.is_partition())
+    }
+}
+
+impl std::iter::FusedIterator for PartitionFields<'_> {}
+
+/// A borrowed iterator over the names of the partition children.
+#[derive(Clone)]
+pub struct PartitionFieldNames<'field>(PartitionFields<'field>);
+
+impl<'field> Iterator for PartitionFieldNames<'field> {
+    type Item = &'field str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(Field::name)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for PartitionFieldNames<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(Field::name)
+    }
+}
+
+impl std::iter::FusedIterator for PartitionFieldNames<'_> {}
 
 impl fmt::Debug for Field {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

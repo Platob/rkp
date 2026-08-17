@@ -457,7 +457,8 @@ mod avro_container {
 
 mod partition_specs {
     use super::{PartitionSpec, Transform, trade_schema};
-    use crate::Value;
+    use crate::iceberg::assign_field_ids;
+    use crate::{DataType, Value};
 
     #[test]
     fn a_spec_round_trips_through_its_v2_document() {
@@ -492,6 +493,61 @@ mod partition_specs {
         // A null value is spelled `null`, which a path cannot distinguish from
         // the string; that is why the manifest is the authority.
         assert_eq!(spec.partition_path(&[Value::Null]).unwrap(), "venue=null");
+    }
+
+    #[test]
+    fn a_spec_is_read_from_and_written_back_onto_a_field() {
+        let schema = trade_schema();
+        let spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+
+        // The tuple carries what produced it, so the spec reads back off it.
+        let partition = spec.partition_field(&schema).unwrap();
+        assert_eq!(partition.iceberg().get("spec-id"), Some("1"));
+        let venue = partition.get_field_by_name("venue").unwrap();
+        assert!(venue.is_partition());
+        assert_eq!(venue.iceberg().get("transform"), Some("identity"));
+        assert_eq!(venue.iceberg().get("partition-source-id"), Some("3"));
+        assert_eq!(PartitionSpec::from_field(&partition).unwrap(), spec);
+
+        // A schema that marks its own partition columns needs no column list.
+        let marked = spec.mark_partitions(&schema).unwrap();
+        assert_eq!(
+            marked.partition_field_names().collect::<Vec<_>>(),
+            ["venue"]
+        );
+        assert_eq!(PartitionSpec::from_schema(1, &marked).unwrap(), spec);
+        assert_eq!(marked.without_partition_fields().unwrap().field_len(), 2);
+
+        // A schema that marks nothing partitions nothing.
+        assert!(
+            PartitionSpec::from_schema(0, &schema)
+                .unwrap()
+                .is_unpartitioned()
+        );
+    }
+
+    #[test]
+    fn a_partition_directory_is_spelled_the_way_every_other_lake_spells_it() {
+        let schema = DataType::from_fields([
+            DataType::Int64.required_field("id"),
+            DataType::Date32.nullable_field("day"),
+        ])
+        .unwrap()
+        .required_field("row");
+        let mut schema = schema;
+        assign_field_ids(&mut schema, 1).unwrap();
+        let spec = PartitionSpec::identity(1, &schema, &["day"]).unwrap();
+
+        // A date is days on the wire and a calendar day in a path, which is
+        // what `column=value` means everywhere else in the crate.
+        assert_eq!(
+            spec.partition_path(&[Value::date(19_723)]).unwrap(),
+            "day=2024-01-01"
+        );
+        assert_eq!(
+            crate::io::partition::partition_text(&Value::date(19_723)).unwrap(),
+            "2024-01-01"
+        );
     }
 
     #[test]

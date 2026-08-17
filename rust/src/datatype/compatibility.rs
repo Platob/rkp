@@ -23,6 +23,7 @@ enum Target {
     Spark,
     Polars,
     Pandas,
+    Iceberg,
 }
 
 impl Target {
@@ -35,6 +36,8 @@ impl Target {
             Ok(Self::Polars)
         } else if scheme == &Scheme::PANDAS {
             Ok(Self::Pandas)
+        } else if scheme == &Scheme::ICEBERG {
+            Ok(Self::Iceberg)
         } else {
             Err(Error::InvalidDataType {
                 kind: "Compatibility",
@@ -53,6 +56,7 @@ impl Target {
             Self::Spark => "SparkCompatibility",
             Self::Polars => "PolarsCompatibility",
             Self::Pandas => "PandasCompatibility",
+            Self::Iceberg => "IcebergCompatibility",
         }
     }
 
@@ -63,6 +67,7 @@ impl Target {
             Self::Spark => "Spark",
             Self::Polars => "Polars",
             Self::Pandas => "pandas",
+            Self::Iceberg => "Iceberg",
         }
     }
 
@@ -73,7 +78,7 @@ impl Target {
 
     /// Whether the engine has a first-class map type.
     const fn supports_map(self) -> bool {
-        matches!(self, Self::Arrow | Self::Spark)
+        matches!(self, Self::Arrow | Self::Spark | Self::Iceberg)
     }
 
     /// Whether the engine keeps a fixed-length list layout distinct from a list.
@@ -292,6 +297,7 @@ fn normalize_scalar(
         Target::Spark => spark_scalar(data_type, path),
         Target::Polars => polars_scalar(data_type, path),
         Target::Pandas => pandas_scalar(data_type, path),
+        Target::Iceberg => iceberg_scalar(data_type, path),
     }
 }
 
@@ -502,6 +508,79 @@ fn pandas_scalar(data_type: &DataType, path: &Path<'_>) -> Result<(DataType, boo
             ),
         ),
         other => unreachable_container(Target::Pandas, other, path),
+    }
+}
+
+/// The Apache Iceberg table-format subset.
+///
+/// Iceberg's primitive vocabulary is closed: `boolean`, `int`, `long`, `float`,
+/// `double`, `decimal(p<=38, s)`, `date`, `time`, `timestamp`/`timestamptz`,
+/// `timestamp_ns`/`timestamptz_ns`, `string`, `uuid`, `fixed[n]`, `binary`, and
+/// `unknown`. There is no unsigned integer, so a narrow or unsigned width widens
+/// to the signed one that holds it, and there is no elapsed-time or calendar
+/// interval type at all. Time-of-day is microseconds and a timestamp is
+/// microseconds or nanoseconds, so any other resolution is a value cast.
+fn iceberg_scalar(data_type: &DataType, path: &Path<'_>) -> Result<(DataType, bool)> {
+    use DataType as D;
+    match data_type {
+        // `unknown` is Iceberg's always-null primitive.
+        D::Null
+        | D::Boolean
+        | D::Int32
+        | D::Int64
+        | D::Float32
+        | D::Float64
+        | D::Date32
+        | D::Binary
+        | D::Utf8
+        // `fixed[n]`, which is also how `uuid` is stored.
+        | D::FixedSizeBinary(_) => Ok((data_type.clone(), false)),
+        D::Int8 | D::Int16 | D::UInt8 | D::UInt16 => Ok((D::Int32, true)),
+        D::UInt32 => Ok((D::Int64, true)),
+        D::UInt64 => Ok((D::decimal128(20, 0)?, true)),
+        D::Float16 => Ok((D::Float32, true)),
+        D::Date64 => incompatible(
+            Target::Iceberg,
+            path,
+            "date64 milliseconds require a value cast to Iceberg date32 days",
+        ),
+        // Iceberg `time` is microseconds since midnight.
+        D::Time64(TimeUnit::Microsecond) => Ok((data_type.clone(), false)),
+        D::Time32(unit) | D::Time64(unit) => {
+            unit_mismatch(Target::Iceberg, path, "time-of-day", *unit, "us")
+        }
+        // `timestamp`/`timestamptz` are microseconds; the `_ns` pair is nanoseconds.
+        D::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _) => {
+            Ok((data_type.clone(), false))
+        }
+        D::Timestamp(unit, _) => {
+            unit_mismatch(Target::Iceberg, path, "timestamp", *unit, "us or ns")
+        }
+        D::Duration(unit) => incompatible(
+            Target::Iceberg,
+            path,
+            format_smolstr!("Iceberg has no elapsed-time type, got duration({unit})"),
+        ),
+        D::Interval(unit) => incompatible(
+            Target::Iceberg,
+            path,
+            format_smolstr!("Iceberg has no calendar interval type, got interval({unit})"),
+        ),
+        D::LargeBinary | D::BinaryView => Ok((D::Binary, true)),
+        D::LargeUtf8 | D::Utf8View => Ok((D::Utf8, true)),
+        D::Decimal32 { precision, scale }
+        | D::Decimal64 { precision, scale }
+        | D::Decimal128 { precision, scale } => {
+            narrow_decimal(Target::Iceberg, data_type, *precision, *scale, path)
+        }
+        D::Decimal256 { precision, scale } => incompatible(
+            Target::Iceberg,
+            path,
+            format_smolstr!(
+                "decimal256({precision}, {scale}) requires a coefficient value cast and Iceberg precision is limited to 38"
+            ),
+        ),
+        other => unreachable_container(Target::Iceberg, other, path),
     }
 }
 

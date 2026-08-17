@@ -147,6 +147,12 @@ fn compatibility_targets_share_the_canonical_scheme_parser() {
     for target in Scheme::COMPATIBILITY_TARGETS {
         assert!(target.is_compatibility_target(), "{target}");
     }
+
+    // Iceberg is a metadata namespace *and* a normalization target, so it has
+    // to appear in the one central list rather than only inside the module.
+    assert!(Scheme::COMPATIBILITY_TARGETS.contains(&Scheme::ICEBERG));
+    assert!(Scheme::ICEBERG.is_compatibility_target());
+    assert_eq!(Scheme::from_str("Iceberg").unwrap(), Scheme::ICEBERG);
 }
 
 #[test]
@@ -165,6 +171,7 @@ fn a_non_compatibility_scheme_is_rejected_by_normalization_not_by_parsing() {
     assert!(message.contains("spark"), "{message}");
     assert!(message.contains("polars"), "{message}");
     assert!(message.contains("pandas"), "{message}");
+    assert!(message.contains("iceberg"), "{message}");
     assert!(matches!(
         error,
         Error::InvalidDataType {
@@ -305,6 +312,7 @@ fn compatibility_preflight_reports_its_own_operation_kind() {
         (Scheme::SPARK, "SparkCompatibility"),
         (Scheme::POLARS, "PolarsCompatibility"),
         (Scheme::PANDAS, "PandasCompatibility"),
+        (Scheme::ICEBERG, "IcebergCompatibility"),
     ] {
         let error = nested.to_scheme_compat(&scheme).unwrap_err();
         assert!(matches!(
@@ -455,4 +463,198 @@ fn spark_rejects_both_run_end_extension_children_at_exact_paths() {
         assert!(error.contains(expected_path), "{error}");
         assert!(error.contains("extension storage"), "{error}");
     }
+}
+
+#[test]
+fn iceberg_widens_everything_outside_its_closed_primitive_vocabulary() {
+    // Iceberg has no unsigned integer and no narrow integer, so each one widens
+    // to the signed primitive that holds every value it can carry.
+    let widened = vec![
+        (DataType::Int8, DataType::Int32),
+        (DataType::Int16, DataType::Int32),
+        (DataType::UInt8, DataType::Int32),
+        (DataType::UInt16, DataType::Int32),
+        (DataType::UInt32, DataType::Int64),
+        (DataType::UInt64, DataType::decimal128(20, 0).unwrap()),
+        (DataType::Float16, DataType::Float32),
+        (DataType::LargeBinary, DataType::Binary),
+        (DataType::BinaryView, DataType::Binary),
+        (DataType::LargeUtf8, DataType::Utf8),
+        (DataType::Utf8View, DataType::Utf8),
+        (
+            DataType::decimal32(7, 2).unwrap(),
+            DataType::decimal128(7, 2).unwrap(),
+        ),
+        (
+            DataType::decimal64(12, 2).unwrap(),
+            DataType::decimal128(12, 2).unwrap(),
+        ),
+    ];
+    for (source, expected) in widened {
+        assert_eq!(
+            source.to_scheme_compat(&Scheme::ICEBERG).unwrap(),
+            expected,
+            "unexpected Iceberg projection for {source:?}"
+        );
+    }
+
+    // The primitive vocabulary itself passes through untouched: `unknown`,
+    // `boolean`, `int`, `long`, `float`, `double`, `date`, `time`, both
+    // timestamp resolutions, `string`, `binary`, `fixed[n]` - which is also how
+    // a uuid is stored - and a decimal already at the interchange width.
+    for kept in [
+        DataType::Null,
+        DataType::Boolean,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Date32,
+        DataType::Binary,
+        DataType::Utf8,
+        DataType::fixed_size_binary(16).unwrap(),
+        DataType::fixed_size_binary(8).unwrap(),
+        DataType::Time64(TimeUnit::Microsecond),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        DataType::Timestamp(TimeUnit::Microsecond, Some(Timezone::UTC)),
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(Timezone::UTC)),
+        DataType::decimal128(38, 9).unwrap(),
+    ] {
+        assert_eq!(
+            kept.to_scheme_compat(&Scheme::ICEBERG).unwrap(),
+            kept,
+            "{kept:?}"
+        );
+    }
+}
+
+#[test]
+fn iceberg_refusals_carry_a_path_and_name_the_expectation_and_the_actual() {
+    let cases = vec![
+        (
+            DataType::Timestamp(TimeUnit::Second, None),
+            vec!["expected timestamp of us or ns", "got s", "value cast"],
+        ),
+        (
+            DataType::Time32(TimeUnit::Millisecond),
+            vec!["expected time-of-day of us", "got ms"],
+        ),
+        (
+            DataType::Time64(TimeUnit::Nanosecond),
+            vec!["expected time-of-day of us", "got ns"],
+        ),
+        (
+            DataType::Date64,
+            vec!["date64 milliseconds", "Iceberg date32 days"],
+        ),
+        (
+            DataType::Duration(TimeUnit::Microsecond),
+            vec!["no elapsed-time type", "got duration(us)"],
+        ),
+        (
+            DataType::Interval(TimeUnit::MonthDayNano),
+            vec!["no calendar interval type", "got interval(month_day_nano)"],
+        ),
+        (
+            DataType::decimal256(39, 0).unwrap(),
+            vec!["decimal256(39, 0)", "limited to 38"],
+        ),
+        (
+            DataType::Decimal128 {
+                precision: 10,
+                scale: -2,
+            },
+            vec!["expected a non-negative decimal scale, got -2", "Iceberg"],
+        ),
+    ];
+    for (rejected, fragments) in cases {
+        let source =
+            DataType::from_fields([Field::new("created", rejected.clone(), true)]).unwrap();
+        let error = source.to_scheme_compat(&Scheme::ICEBERG).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("$.created"), "{rejected:?}: {message}");
+        for fragment in fragments {
+            assert!(message.contains(fragment), "{rejected:?}: {message}");
+        }
+        assert!(matches!(
+            error,
+            Error::InvalidDataType {
+                kind: "IcebergCompatibility",
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn iceberg_recurses_through_nested_layouts_and_declares_union_and_fixed_size_list() {
+    let source = DataType::from_fields([
+        Field::new("id", DataType::UInt16, false),
+        Field::new(
+            "tags",
+            DataType::large_list(Field::new("item", DataType::Utf8View, true)),
+            false,
+        ),
+        Field::new(
+            "nested",
+            DataType::from_fields([Field::new("half", DataType::Float16, true)]).unwrap(),
+            true,
+        ),
+        // Iceberg has a first-class map, so it recurses rather than refusing.
+        Field::new(
+            "labels",
+            DataType::map_of(DataType::Utf8View, DataType::UInt8, true).unwrap(),
+            true,
+        ),
+    ])
+    .unwrap();
+    let transformed = source.to_scheme_compat(&Scheme::ICEBERG).unwrap();
+    let fields = transformed.as_fields().unwrap();
+
+    assert_eq!(fields[0].data_type(), &DataType::Int32);
+    assert!(!fields[0].is_nullable());
+    let DataType::List(item) = fields[1].data_type() else {
+        panic!("expected a normalized list");
+    };
+    assert_eq!(item.data_type(), &DataType::Utf8);
+    assert!(item.is_nullable());
+    let nested = fields[2].data_type().as_fields().unwrap();
+    assert_eq!(nested[0].name(), "half");
+    assert_eq!(nested[0].data_type(), &DataType::Float32);
+    let DataType::Map(map) = fields[3].data_type() else {
+        panic!("expected a retained map");
+    };
+    assert!(map.keys_sorted());
+    let entries = map.entries().data_type().as_fields().unwrap();
+    assert_eq!(entries[0].data_type(), &DataType::Utf8);
+    assert_eq!(entries[1].data_type(), &DataType::Int32);
+
+    // A fixed-size list has no Iceberg equivalent, so it degrades to a list.
+    let fixed = DataType::fixed_size_list(Field::new("item", DataType::Int32, false), 3).unwrap();
+    assert_eq!(
+        fixed.to_scheme_compat(&Scheme::ICEBERG).unwrap(),
+        DataType::list(Field::new("item", DataType::Int32, false))
+    );
+
+    // A union has none, and says so where it is.
+    let union = DataType::from_fields([Field::new(
+        "choice",
+        DataType::union(
+            [(1, Field::new("value", DataType::Int32, false))],
+            UnionMode::Dense,
+        )
+        .unwrap(),
+        true,
+    )])
+    .unwrap();
+    let message = union
+        .to_scheme_compat(&Scheme::ICEBERG)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("$.choice"), "{message}");
+    assert!(
+        message.contains("Iceberg has no conservative tagged-union schema equivalent"),
+        "{message}"
+    );
 }

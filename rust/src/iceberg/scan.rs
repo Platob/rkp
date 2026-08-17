@@ -103,6 +103,8 @@ pub(super) struct Filter {
     id: i32,
     /// The value exactly as the caller spelled it.
     text: SmolStr,
+    /// The value the text names, read through the column's own datatype.
+    value: Value,
     /// Whether the text names the absence of a value.
     is_null: bool,
     /// The value encoded as a single value, when the type has that encoding.
@@ -154,6 +156,7 @@ impl Filter {
             id,
             is_null: text == NULL_TEXT,
             text: SmolStr::new(text),
+            value,
             field,
             scalar,
         })
@@ -251,7 +254,12 @@ fn file_matches(file: &DataFile, spec: &PartitionSpec, filters: &[Filter]) -> Op
     for (position, filter) in filters.iter().enumerate() {
         if let Some(index) = partition_index(spec, filter) {
             let value = file.partition.get(index).cloned().unwrap_or(Value::Null);
-            if super::value::scalar_text(&value) != filter.text {
+            // The manifest holds the value, so the values are what agree or
+            // disagree. The text is compared too, because a filter spelled the
+            // way the directory spells it is the other way a caller addresses a
+            // partition, and a table written before this renderer settled can
+            // still hold a value whose text is the only thing that matches.
+            if value != filter.value && super::value::scalar_text(&value) != filter.text {
                 return None;
             }
             continue;

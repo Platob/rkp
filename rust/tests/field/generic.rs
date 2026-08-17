@@ -961,3 +961,208 @@ fn a_root_must_be_a_non_null_struct_and_says_why() {
     assert!(message.contains("non-null struct root"), "{message}");
     assert!(message.contains("\"row\""), "{message}");
 }
+
+#[test]
+fn a_protocol_view_reads_and_writes_by_bare_name_over_one_shared_map() {
+    let mut field = DataType::Int64.required_field("price");
+    field.iceberg_mut().insert("doc", "closing price").unwrap();
+    field
+        .iceberg_mut()
+        .update([("schema-id", "3"), ("field-id", "7")])
+        .unwrap();
+    field.postgres_mut().insert("comment", "trades").unwrap();
+
+    // The view spells the key once, so a caller never assembles one.
+    assert_eq!(field.iceberg().key("doc"), "iceberg:doc");
+    assert_eq!(field.iceberg().prefix(), "iceberg");
+    assert_eq!(field.iceberg().scheme(), &Scheme::ICEBERG);
+    assert_eq!(field.iceberg().get("doc"), Some("closing price"));
+    assert_eq!(field.get_metadata("iceberg:doc"), Some("closing price"));
+    assert_eq!(&field.iceberg()["schema-id"], "3");
+    assert!(field.iceberg().contains_key("field-id"));
+    assert!(!field.iceberg().contains_key("comment"));
+    assert_eq!(field.iceberg().len(), 3);
+    assert_eq!(field.postgres().len(), 1);
+    assert!(field.mysql().is_empty());
+
+    // It reads out of the same map every other metadata accessor reads.
+    assert_eq!(
+        field.iceberg().iter().collect::<Vec<_>>(),
+        [
+            ("doc", "closing price"),
+            ("field-id", "7"),
+            ("schema-id", "3")
+        ]
+    );
+    assert_eq!(
+        field.iceberg().next_entry(Some("doc")),
+        Some(("field-id", "7"))
+    );
+    assert_eq!(
+        field.iceberg().to_string(),
+        r#"{"doc":"closing price","field-id":"7","schema-id":"3"}"#
+    );
+    assert_eq!(field.metadata_len(), 4);
+
+    // A protocol-scoped replacement leaves every other protocol alone.
+    field
+        .iceberg_mut()
+        .set([("doc", "close"), ("sort-order-id", "1")])
+        .unwrap();
+    assert_eq!(
+        field.iceberg().iter().collect::<Vec<_>>(),
+        [("doc", "close"), ("sort-order-id", "1")]
+    );
+    assert_eq!(field.postgres().get("comment"), Some("trades"));
+
+    assert_eq!(field.iceberg_mut().remove("doc").as_deref(), Some("close"));
+    field.iceberg_mut().clear();
+    assert!(field.iceberg().is_empty());
+    assert_eq!(field.postgres().len(), 1);
+}
+
+#[test]
+fn a_protocol_view_shares_http_between_the_two_schemes_and_stays_case_insensitive() {
+    let mut field = DataType::Utf8.required_field("body");
+    field
+        .http_mut()
+        .insert("Content-Type", "text/plain")
+        .unwrap();
+
+    assert_eq!(field.http().get("content-type"), Some("text/plain"));
+    assert_eq!(field.http().get("CONTENT-TYPE"), Some("text/plain"));
+    assert_eq!(field.http().key("Content-Type"), "http:Content-Type");
+    assert_eq!(
+        field.protocol(&Scheme::HTTPS).get("Content-Type"),
+        Some("text/plain")
+    );
+    assert_eq!(field.protocol(&Scheme::HTTPS).prefix(), "http");
+    assert_eq!(field.content_type(), Some("text/plain"));
+    assert_eq!(field.get_metadata("http:content-type"), Some("text/plain"));
+
+    // The view is a borrow of the field's own snapshot, not a copy of it.
+    let metadata = field.as_metadata().clone();
+    assert_eq!(metadata.http(), field.http());
+    assert_eq!(
+        metadata
+            .http()
+            .to_metadata()
+            .unwrap()
+            .get("http:content-type"),
+        Some("text/plain")
+    );
+}
+
+#[test]
+fn a_protocol_write_invalidates_the_arrow_cache_exactly_once() {
+    let mut field = DataType::Int64.required_field("price");
+    let cached = field.to_arrow_ref().unwrap();
+    field.iceberg_mut().insert("doc", "close").unwrap();
+    assert!(!Arc::ptr_eq(&cached, &field.to_arrow_ref().unwrap()));
+
+    let cached = field.to_arrow_ref().unwrap();
+    field.iceberg_mut().insert("doc", "close").unwrap();
+    assert!(Arc::ptr_eq(&cached, &field.to_arrow_ref().unwrap()));
+
+    // A rejected value leaves the field, and its cache, untouched.
+    assert!(field.iceberg_mut().insert("", "no name").is_err());
+    assert!(Arc::ptr_eq(&cached, &field.to_arrow_ref().unwrap()));
+    assert_eq!(field.iceberg().len(), 1);
+}
+
+#[test]
+fn a_field_can_act_as_a_partition_column_and_a_root_reports_only_those() {
+    let schema = DataType::from_fields([
+        DataType::Int32.required_field("year"),
+        DataType::Utf8.required_field("venue"),
+        DataType::Int64.required_field("price"),
+    ])
+    .unwrap()
+    .required_field("row")
+    .with_partition_fields(&["year", "venue"])
+    .unwrap();
+
+    assert!(schema.has_partition_fields());
+    assert_eq!(schema.partition_field_len(), 2);
+    assert_eq!(
+        schema.partition_field_names().collect::<Vec<_>>(),
+        ["year", "venue"]
+    );
+    assert_eq!(
+        schema
+            .partition_fields()
+            .rev()
+            .map(Field::name)
+            .collect::<Vec<_>>(),
+        ["venue", "year"]
+    );
+    assert!(schema.get_field_by_name("year").unwrap().is_partition());
+    assert!(!schema.get_field_by_name("price").unwrap().is_partition());
+
+    // The two halves of the layout: what a path spells, and what a leaf stores.
+    let stored = schema.without_partition_fields().unwrap();
+    assert_eq!(stored.field_len(), 1);
+    assert_eq!(stored.get_field(0).unwrap().name(), "price");
+    let partitions = schema.only_partition_fields().unwrap();
+    assert_eq!(
+        partitions
+            .fields()
+            .iter()
+            .map(Field::name)
+            .collect::<Vec<_>>(),
+        ["year", "venue"]
+    );
+
+    // The marker is reserved metadata, so it round-trips like any other.
+    let restored = Field::from_str(&schema.to_string()).unwrap();
+    assert_eq!(restored, schema);
+    assert_eq!(restored.partition_field_len(), 2);
+    assert_eq!(
+        schema
+            .get_field_by_name("year")
+            .unwrap()
+            .get_metadata("field:partition"),
+        Some("true")
+    );
+}
+
+#[test]
+fn unmarking_a_partition_column_removes_the_marker_rather_than_storing_a_default() {
+    let plain = DataType::Int32.required_field("year");
+    let marked = plain.clone().with_partition(true);
+    assert!(marked.is_partition());
+    assert_eq!(marked.clone().with_partition(false), plain);
+    assert!(!plain.is_partition());
+    assert!(plain.without_partition_fields().is_err());
+
+    // A field that never partitions anything answers the accessors anyway.
+    let root = DataType::from_fields([DataType::Int64.required_field("price")])
+        .unwrap()
+        .required_field("row");
+    assert!(!root.has_partition_fields());
+    assert_eq!(root.without_partition_fields().unwrap(), root);
+    assert_eq!(root.only_partition_fields().unwrap().field_len(), 0);
+
+    // A name the root does not carry is refused by name.
+    let message = root
+        .with_partition_fields(&["year"])
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("\"year\""), "{message}");
+    assert!(message.contains("partition on"), "{message}");
+
+    // Only the canonical booleans are accepted for the reserved marker.
+    assert!(
+        Field::from_parts("year", DataType::Int32, false, [("field:partition", "yes")]).is_err()
+    );
+    assert!(
+        !Field::from_parts(
+            "year",
+            DataType::Int32,
+            false,
+            [("field:partition", "false")]
+        )
+        .unwrap()
+        .is_partition()
+    );
+}

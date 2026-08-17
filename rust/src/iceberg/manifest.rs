@@ -362,7 +362,8 @@ pub fn write_manifest<H: IOBase + ?Sized>(
         (
             "schema-id",
             schema
-                .get_metadata(super::schema::SCHEMA_ID_KEY)
+                .iceberg()
+                .get(super::schema::SCHEMA_ID)
                 .unwrap_or("0")
                 .to_owned(),
         ),

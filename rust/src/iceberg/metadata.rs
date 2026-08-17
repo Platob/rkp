@@ -240,9 +240,13 @@ impl TableMetadata {
     ) -> Result<Self> {
         schema.validate_struct_root()?;
         let last_column_id = super::last_field_id(&schema)?;
+        // The schema says how the table is laid out, so the columns the spec
+        // partitions on are marked on it rather than only named beside it.
+        let schema = spec.mark_partitions(&schema)?;
         let last_partition_id = spec.last_field_id();
         let current_schema_id = schema
-            .get_metadata(super::schema::SCHEMA_ID_KEY)
+            .iceberg()
+            .get(super::schema::SCHEMA_ID)
             .and_then(|id| id.parse::<i32>().ok())
             .unwrap_or_default();
         Ok(Self {
@@ -288,7 +292,8 @@ impl TableMetadata {
     pub fn schema_by_id(&self, schema_id: i32) -> Option<&Field> {
         self.schemas.iter().find(|schema| {
             schema
-                .get_metadata(super::schema::SCHEMA_ID_KEY)
+                .iceberg()
+                .get(super::schema::SCHEMA_ID)
                 .and_then(|id| id.parse::<i32>().ok())
                 .unwrap_or_default()
                 == schema_id
@@ -358,13 +363,16 @@ impl TableMetadata {
             .iter()
             .map(|existing| {
                 existing
-                    .get_metadata(super::schema::SCHEMA_ID_KEY)
+                    .iceberg()
+                    .get(super::schema::SCHEMA_ID)
                     .and_then(|id| id.parse::<i32>().ok())
                     .unwrap_or_default()
             })
             .max()
             .map_or(0, |highest| highest + 1);
-        schema.insert_metadata(super::schema::SCHEMA_ID_KEY, next_id.to_string())?;
+        schema
+            .iceberg_mut()
+            .insert(super::schema::SCHEMA_ID, next_id.to_string())?;
         self.last_column_id = self.last_column_id.max(super::last_field_id(&schema)?);
         self.schemas.push(schema);
         Ok(next_id)
@@ -433,6 +441,23 @@ impl TableMetadata {
             });
         }
 
+        // A document records the layout in its spec; a Field records it on the
+        // columns. Marking them here is what makes a table read back with the
+        // same schema it was created with, marks included.
+        let default_spec_id = document
+            .get_key_str("default-spec-id")
+            .and_then(Value::as_i64)
+            .and_then(|id| i32::try_from(id).ok())
+            .unwrap_or_default();
+        if let Some(spec) = partition_specs
+            .iter()
+            .find(|spec| spec.spec_id == default_spec_id)
+        {
+            for schema in &mut schemas {
+                *schema = spec.mark_partitions(schema)?;
+            }
+        }
+
         let mut sort_orders = Vec::new();
         for entry in document
             .get_key_str("sort-orders")
@@ -499,11 +524,7 @@ impl TableMetadata {
                 .and_then(|id| i32::try_from(id).ok())
                 .unwrap_or_default(),
             schemas,
-            default_spec_id: document
-                .get_key_str("default-spec-id")
-                .and_then(Value::as_i64)
-                .and_then(|id| i32::try_from(id).ok())
-                .unwrap_or_default(),
+            default_spec_id,
             last_partition_id: document
                 .get_key_str("last-partition-id")
                 .and_then(Value::as_i64)

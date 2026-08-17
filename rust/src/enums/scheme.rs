@@ -62,7 +62,7 @@ impl Scheme {
     pub const SQL: Self = Self(SchemeValue::Sql);
     /// The AWS Glue metadata namespace.
     pub const GLUE: Self = Self(SchemeValue::Glue);
-    /// The Apache Iceberg metadata namespace.
+    /// The Apache Iceberg metadata namespace and table-format interchange.
     pub const ICEBERG: Self = Self(SchemeValue::Iceberg);
     /// The Financial Information eXchange metadata namespace.
     pub const FIX: Self = Self(SchemeValue::Fix);
@@ -86,9 +86,15 @@ impl Scheme {
     /// Every schema-compatibility target, in normalization-cost order.
     ///
     /// [`Self::ARROW`] is the identity target; the rest are progressively more
-    /// conservative subsets of the pinned Arrow model.
-    pub const COMPATIBILITY_TARGETS: [Self; 4] =
-        [Self::ARROW, Self::SPARK, Self::POLARS, Self::PANDAS];
+    /// conservative subsets of the pinned Arrow model. [`Self::ICEBERG`] is the
+    /// table-format subset, so it is both a metadata namespace and a target.
+    pub const COMPATIBILITY_TARGETS: [Self; 5] = [
+        Self::ARROW,
+        Self::SPARK,
+        Self::POLARS,
+        Self::PANDAS,
+        Self::ICEBERG,
+    ];
 
     /// Parse and validate a URI scheme or metadata protocol namespace.
     #[allow(clippy::should_implement_trait)]
@@ -165,7 +171,11 @@ impl Scheme {
     pub const fn is_compatibility_target(&self) -> bool {
         matches!(
             self.0,
-            SchemeValue::Arrow | SchemeValue::Spark | SchemeValue::Polars | SchemeValue::Pandas
+            SchemeValue::Arrow
+                | SchemeValue::Spark
+                | SchemeValue::Polars
+                | SchemeValue::Pandas
+                | SchemeValue::Iceberg
         )
     }
 

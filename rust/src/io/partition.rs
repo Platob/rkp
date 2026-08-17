@@ -34,11 +34,62 @@ type PartitionGroup = (Vec<(String, String)>, RecordBatch);
 
 /// How a directory name spells a value that is not there.
 ///
-/// A path cannot distinguish the absence of a value from the three letters, so
+/// A path cannot distinguish the absence of a value from the four letters, so
 /// the convention has to pick one spelling and say what it costs: reading such a
 /// partition back yields the text `null` unless a declared schema types the
 /// column as something a cast turns back into a null.
-const NULL_PARTITION: &str = "null";
+pub const NULL_PARTITION: &str = "null";
+
+/// How every partition value in the project is rendered as directory text.
+///
+/// One set of options is the whole convention: the encoding's own display for
+/// the value, and [`NULL_PARTITION`] for the absence of one. Both the
+/// column-at-a-time renderer here and the one-value renderer
+/// [`partition_text`] read it, so a table format writing a directory name and a
+/// folder writing the same one cannot disagree about how a date is spelled.
+fn partition_format() -> FormatOptions<'static> {
+    FormatOptions::new().with_null(NULL_PARTITION)
+}
+
+/// Render one value the way a `column=value` directory spells it.
+///
+/// The value names its own datatype - a date counts days, a timestamp carries
+/// its unit and zone - so the rendering needs nothing beside it. This is the
+/// single-value form of what a partitioned write applies to a whole column, and
+/// it goes through the same formatter and the same options, which is what makes
+/// a table format's directory names identical to a folder's.
+///
+/// ```
+/// use yggdryl::io::partition::partition_text;
+/// use yggdryl::Value;
+///
+/// # fn main() -> yggdryl::Result<()> {
+/// assert_eq!(partition_text(&Value::from("XNAS"))?, "XNAS");
+/// assert_eq!(partition_text(&Value::date(19_723))?, "2024-01-01");
+/// assert_eq!(partition_text(&Value::decimal(150, 2))?, "1.50");
+/// assert_eq!(partition_text(&Value::Null)?, "null");
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// Returns an error when the value names no single datatype, or when it cannot
+/// be materialized as the one-element array the formatter reads.
+pub fn partition_text(value: &crate::Value) -> Result<smol_str::SmolStr> {
+    if value.is_null() {
+        return Ok(smol_str::SmolStr::new_static(NULL_PARTITION));
+    }
+    let typed = crate::TypedValue::from_value(value.clone())?;
+    let (data_type, value) = typed.into_parts();
+    // The field is nullable so a value the datatype cannot hold is refused by
+    // materialization rather than by nullability, which is not the question here.
+    let field = Field::new("partition", data_type, true);
+    let array = crate::arrow::ArrowScalar::from_value(field, value)?.into_array();
+    let formatter =
+        ArrayFormatter::try_new(array.as_ref(), &partition_format()).map_err(Error::Arrow)?;
+    Ok(smol_str::SmolStr::new(formatter.value(0).to_string()))
+}
 
 /// Build a constant column holding `value` for every row of a batch.
 fn constant_column(value: &str, rows: usize, target: Option<&ArrowDataType>) -> Result<ArrayRef> {
@@ -116,11 +167,17 @@ pub fn with_partitions(
         let nullable = field
             .and_then(|field| field.get_field_by_name(column))
             .is_some_and(Field::is_nullable);
-        fields.push(Arc::new(ArrowField::new(
-            column,
-            array.data_type().clone(),
-            nullable,
-        )));
+        // The restored column says it came from the path. That is the one fact
+        // the batch would otherwise lose, and it is what lets a read of a lake
+        // be written back out with the same layout.
+        fields.push(Arc::new(
+            ArrowField::new(column, array.data_type().clone(), nullable).with_metadata(
+                HashMap::from([(
+                    crate::metadata::FIELD_PARTITION_KEY.to_owned(),
+                    "true".to_owned(),
+                )]),
+            ),
+        ));
         columns.push(array);
     }
 
@@ -336,12 +393,57 @@ fn folder_partition_columns(entries: &[Holder], root: Option<&Url>) -> Vec<Strin
     deepest
 }
 
+/// Return the partition columns a write should lay the tree out by.
+///
+/// A tree that already spells a layout out is the authority on it, because its
+/// leaves are already stored that way. A tree that does not - an empty folder,
+/// or one holding a single flat leaf - takes the layout from the declared
+/// schema, so a caller who marked `year` and `venue` as partition fields gets
+/// `year=…/venue=…` directories without first creating one by hand.
+///
+/// A declared layout that contradicts the stored one is refused rather than
+/// merged: writing the two into one tree would leave leaves whose directories
+/// no longer say which columns they are missing.
+///
+/// # Errors
+///
+/// Returns an error naming both layouts when the schema and the tree disagree.
+fn write_partition_columns(
+    entries: &[Holder],
+    root: Option<&Url>,
+    options: &RecordOptions,
+) -> Result<Vec<String>> {
+    let stored = folder_partition_columns(entries, root);
+    let declared: Vec<String> = options
+        .schema()
+        .map(|schema| {
+            schema
+                .partition_field_names()
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if stored.is_empty() || declared.is_empty() || stored == declared {
+        return Ok(if stored.is_empty() { declared } else { stored });
+    }
+    Err(Error::InvalidRecord {
+        path: smol_str::SmolStr::new_static("$"),
+        reason: crate::text::expected_got(
+            format_args!(
+                "the declared partition columns to match the ones this tree stores, [{}]",
+                stored.join(", ")
+            ),
+            format_args!("[{}]", declared.join(", ")),
+        ),
+    })
+}
+
 /// Return the value each row of `batch` spells in a partition directory.
 ///
 /// The rendering is the encoding's own text: an `Int32` `2024` is `2024`, and a
 /// null is [`NULL_PARTITION`], because a path has no other way to say it.
 fn partition_values(batch: &RecordBatch, columns: &[String]) -> Result<Vec<Vec<String>>> {
-    let format = FormatOptions::new().with_null(NULL_PARTITION);
+    let format = partition_format();
     let mut rendered: Vec<Vec<String>> = vec![Vec::with_capacity(columns.len()); batch.num_rows()];
     for column in columns {
         let Ok(index) = batch.schema().index_of(column) else {
@@ -505,7 +607,8 @@ fn derived_field(
         let pairs = pairs_under(part, root);
         // The partition columns are appended untyped, which is what the
         // directory names actually hold; a caller wanting them typed declares a
-        // schema and gets that cast for free.
+        // schema and gets that cast for free. They arrive marked as partition
+        // columns, because the layout is where that fact came from.
         let empty = RecordBatch::new_empty(schema_from_field(&stored)?);
         let widened = with_partitions(&empty, &pairs, None)?;
         return Ok(Some(record_schema_from_arrow(
@@ -595,7 +698,7 @@ pub(crate) fn write_folder(
     // columns, and which leaves already hold rows.
     let entries = folder.ls(true, false)?;
     let root = folder.url().cloned();
-    let columns = folder_partition_columns(&entries, root.as_ref());
+    let columns = write_partition_columns(&entries, root.as_ref(), options)?;
     let encoding = options.mime_type();
     let mut parts: Vec<Holder> = entries
         .into_iter()

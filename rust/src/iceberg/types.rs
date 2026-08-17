@@ -159,7 +159,8 @@ impl PrimitiveType {
                     reason: format_smolstr!(
                         "expected a datatype Iceberg can express (boolean, int, long, float, \
                          double, decimal, date, time, timestamp, timestamptz, timestamp_ns, \
-                         timestamptz_ns, string, uuid, fixed, binary, unknown), got {other}"
+                         timestamptz_ns, string, uuid, fixed, binary, unknown), got {other}; \
+                         to_scheme_compat(&Scheme::ICEBERG) widens the ones that widen losslessly"
                     ),
                 });
             }

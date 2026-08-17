@@ -11,29 +11,31 @@
 //! field that already carries an id keeps it.
 //!
 //! Everything a field cannot hold structurally - the schema identifier, a
-//! column's documentation, the v3 default values - is kept as reserved
-//! `iceberg:*` metadata, so re-emitting a document reproduces it rather than
-//! quietly dropping what the field model has no slot for.
+//! column's documentation, the v3 default values - is kept as Iceberg protocol
+//! properties, so re-emitting a document reproduces it rather than quietly
+//! dropping what the field model has no slot for. Those properties are reached
+//! through [`Field::iceberg`] and [`Field::iceberg_mut`], which remember the
+//! `iceberg:` prefix so this module never spells a metadata key itself.
 
 use smol_str::{SmolStr, format_smolstr};
 
 use super::PrimitiveType;
 use crate::{DataType, Error, Field, Result, Value};
 
-/// The metadata key Iceberg reserves for a schema identifier.
-pub(super) const SCHEMA_ID_KEY: &str = "iceberg:schema-id";
+/// The Iceberg property naming a schema identifier.
+pub(super) const SCHEMA_ID: &str = "schema-id";
 
-/// The metadata key holding a column's Iceberg documentation string.
-const DOC_KEY: &str = "iceberg:doc";
+/// The Iceberg property holding a column's documentation string.
+const DOC: &str = "doc";
 
-/// The metadata key holding a v3 `initial-default`, as encoded JSON.
-const INITIAL_DEFAULT_KEY: &str = "iceberg:initial-default";
+/// The Iceberg property holding a v3 `initial-default`, as encoded JSON.
+const INITIAL_DEFAULT: &str = "initial-default";
 
-/// The metadata key holding a v3 `write-default`, as encoded JSON.
-const WRITE_DEFAULT_KEY: &str = "iceberg:write-default";
+/// The Iceberg property holding a v3 `write-default`, as encoded JSON.
+const WRITE_DEFAULT: &str = "write-default";
 
-/// The metadata key listing the identifier field ids of a schema root.
-const IDENTIFIER_KEY: &str = "iceberg:identifier-field-ids";
+/// The Iceberg property listing the identifier field ids of a schema root.
+const IDENTIFIER: &str = "identifier-field-ids";
 
 /// Read an Iceberg schema object into a non-null struct root field.
 ///
@@ -66,7 +68,7 @@ pub fn schema_from_json(name: &str, schema: &Value) -> Result<Field> {
 
     let mut root = struct_field_from_json(name, schema, false)?;
     if let Some(id) = schema.get_key_str("schema-id").and_then(Value::as_i64) {
-        root.insert_metadata(SCHEMA_ID_KEY, id.to_string())?;
+        root.iceberg_mut().insert(SCHEMA_ID, id.to_string())?;
     }
     if let Some(ids) = schema
         .get_key_str("identifier-field-ids")
@@ -77,7 +79,7 @@ pub fn schema_from_json(name: &str, schema: &Value) -> Result<Field> {
             .filter_map(Value::as_i64)
             .map(|id| id.to_string())
             .collect();
-        root.insert_metadata(IDENTIFIER_KEY, joined.join(","))?;
+        root.iceberg_mut().insert(IDENTIFIER, joined.join(","))?;
     }
     Ok(root)
 }
@@ -92,10 +94,11 @@ pub fn schema_to_json(root: &Field) -> Result<Value> {
     root.validate_struct_root()?;
 
     let mut entries = vec![(Value::from("type"), Value::from("struct"))];
-    if let Some(id) = root.get_metadata(SCHEMA_ID_KEY) {
+    if let Some(id) = root.iceberg().get(SCHEMA_ID) {
         let id = id.parse::<i64>().map_err(|_| {
             invalid(format_smolstr!(
-                "expected an integer {SCHEMA_ID_KEY}, got {id:?}"
+                "expected an integer {:?}, got {id:?}",
+                root.iceberg().key(SCHEMA_ID)
             ))
         })?;
         entries.push((Value::from("schema-id"), Value::from(id)));
@@ -104,12 +107,13 @@ pub fn schema_to_json(root: &Field) -> Result<Value> {
         Value::from("fields"),
         Value::from_sequence(fields_to_json(root)?),
     ));
-    if let Some(ids) = root.get_metadata(IDENTIFIER_KEY) {
+    if let Some(ids) = root.iceberg().get(IDENTIFIER) {
         let mut parsed = Vec::new();
         for id in ids.split(',').filter(|id| !id.is_empty()) {
             parsed.push(Value::from(id.trim().parse::<i64>().map_err(|_| {
                 invalid(format_smolstr!(
-                    "expected comma-separated integers in {IDENTIFIER_KEY}, got {ids:?}"
+                    "expected comma-separated integers in {:?}, got {ids:?}",
+                    root.iceberg().key(IDENTIFIER)
                 ))
             })?));
         }
@@ -244,24 +248,19 @@ fn field_from_json(entry: &Value) -> Result<Field> {
     let mut field = typed_field_from_json(name, type_json, !required)?;
     field.set_id(field_id(id, name)?);
     if let Some(doc) = entry.get_key_str("doc").and_then(Value::as_str) {
-        field.insert_metadata(DOC_KEY, doc)?;
+        field.iceberg_mut().insert(DOC, doc)?;
     }
     // The v3 defaults are values, not schema, so they travel as encoded JSON
     // rather than as a second parallel value model.
-    for (key, metadata_key) in [
-        ("initial-default", INITIAL_DEFAULT_KEY),
-        ("write-default", WRITE_DEFAULT_KEY),
-    ] {
-        if let Some(default) = entry.get_key_str(key) {
+    for property in [INITIAL_DEFAULT, WRITE_DEFAULT] {
+        if let Some(default) = entry.get_key_str(property) {
             let encoded = crate::json::to_vec(default)?;
-            field.insert_metadata(
-                metadata_key,
-                String::from_utf8(encoded).map_err(|error| {
-                    invalid(format_smolstr!(
-                        "expected UTF-8 in an Iceberg {key} on {name:?}, got {error}"
-                    ))
-                })?,
-            )?;
+            let encoded = String::from_utf8(encoded).map_err(|error| {
+                invalid(format_smolstr!(
+                    "expected UTF-8 in an Iceberg {property} on {name:?}, got {error}"
+                ))
+            })?;
+            field.iceberg_mut().insert(property, encoded)?;
         }
     }
     Ok(field)
@@ -346,15 +345,12 @@ fn fields_to_json(root: &Field) -> Result<Vec<Value>> {
             (Value::from("required"), Value::from(!field.is_nullable())),
             (Value::from("type"), type_to_json(field)?),
         ];
-        if let Some(doc) = field.get_metadata(DOC_KEY) {
+        if let Some(doc) = field.iceberg().get(DOC) {
             object.push((Value::from("doc"), Value::from(doc)));
         }
-        for (key, metadata_key) in [
-            ("initial-default", INITIAL_DEFAULT_KEY),
-            ("write-default", WRITE_DEFAULT_KEY),
-        ] {
-            if let Some(encoded) = field.get_metadata(metadata_key) {
-                object.push((Value::from(key), crate::json::from_str(encoded)?));
+        for property in [INITIAL_DEFAULT, WRITE_DEFAULT] {
+            if let Some(encoded) = field.iceberg().get(property) {
+                object.push((Value::from(property), crate::json::from_str(encoded)?));
             }
         }
         entries.push(Value::from_mapping(object)?);

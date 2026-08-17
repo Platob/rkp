@@ -43,5 +43,13 @@ pub use media::Media;
 #[cfg(feature = "arrow")]
 pub use options::{IORecordOptions, RecordOptions};
 pub use text::Text;
-pub use typed::TypedValue;
+pub use typed::{
+    BinaryValue, BinaryViewValue, BooleanValue, Date32Value, Date64Value, Decimal32Value,
+    Decimal64Value, Decimal128Value, Decimal256Value, DictionaryValue, DurationValue,
+    FixedSizeBinaryValue, FixedSizeListValue, Float16Value, Float32Value, Float64Value, Int8Value,
+    Int16Value, Int32Value, Int64Value, IntervalValue, LargeBinaryValue, LargeListValue,
+    LargeListViewValue, LargeUtf8Value, ListValue, ListViewValue, MapValue, NullValue,
+    RunEndEncodedValue, StructValue, Time32Value, Time64Value, TimestampValue, TypedValue,
+    UInt8Value, UInt16Value, UInt32Value, UInt64Value, UnionValue, Utf8Value, Utf8ViewValue,
+};
 pub use value::{Children, Float, Value};

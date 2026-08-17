@@ -5,6 +5,13 @@
 //! rendering, and neither can use the core [`Value`]'s serialization, because
 //! `"XNAS"` must become `XNAS` and not `"XNAS"`.
 //!
+//! The rendering itself is not Iceberg's. A `column=value` directory is the
+//! layout the whole project reads and writes, so the text comes from
+//! [`crate::io::partition::partition_text`] - the same formatter, with the same
+//! null spelling, that a partitioned folder write applies to a column. A table
+//! this module writes is therefore a lake the rest of the crate can walk,
+//! rather than one that happens to look like one.
+//!
 //! The textual rendering is deliberately not the inverse of anything. A
 //! partition path spells a null value `null`, which is indistinguishable from
 //! the string `"null"`, so a reader takes partition values from the manifest and
@@ -20,35 +27,26 @@
 
 use std::cmp::Ordering;
 
-use smol_str::{SmolStr, format_smolstr};
+use smol_str::SmolStr;
 
 use crate::{DataType, Value};
 
 /// The literal Iceberg writes for a null partition value.
-pub(super) const NULL_TEXT: &str = "null";
+pub(super) const NULL_TEXT: &str = crate::io::partition::NULL_PARTITION;
 
-/// Render one scalar value the way Iceberg spells it in text.
+/// Render one scalar value the way a `column=value` directory spells it.
+///
+/// A value that names no datatype - a sequence whose children disagree, a
+/// mapping - has no directory spelling at all, so it falls back to its JSON
+/// form: lossless and readable rather than invented. A partition tuple never
+/// contains one, because a partition value is a scalar.
 pub(super) fn scalar_text(value: &Value) -> SmolStr {
-    match value {
-        Value::Null => SmolStr::new_static(NULL_TEXT),
-        Value::Bool(flag) => SmolStr::new(if *flag { "true" } else { "false" }),
-        Value::I64(number) => format_smolstr!("{number}"),
-        Value::U64(number) => format_smolstr!("{number}"),
-        Value::I128(number) => format_smolstr!("{number}"),
-        Value::U128(number) => format_smolstr!("{number}"),
-        Value::Float(number) => format_smolstr!("{}", number.as_f64()),
-        Value::Decimal(unscaled, scale) => format_smolstr!("{unscaled}e{}", -i32::from(*scale)),
-        Value::String(text) => text.clone(),
-        Value::Date(days) => format_smolstr!("{days}"),
-        Value::Time(count, _) | Value::Duration(count, _) => format_smolstr!("{count}"),
-        Value::Timestamp(count, _, _) => format_smolstr!("{count}"),
-        // Bytes and containers have no partition or summary spelling; the JSON
-        // form is at least lossless and readable rather than invented.
-        other => crate::json::to_vec(other)
+    crate::io::partition::partition_text(value).unwrap_or_else(|_| {
+        crate::json::to_vec(value)
             .ok()
             .and_then(|encoded| String::from_utf8(encoded).ok())
-            .map_or_else(|| SmolStr::new_static(NULL_TEXT), SmolStr::new),
-    }
+            .map_or_else(|| SmolStr::new_static(NULL_TEXT), SmolStr::new)
+    })
 }
 
 /// Return whether a Parquet statistic byte string is also the Iceberg one.
