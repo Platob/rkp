@@ -1372,9 +1372,65 @@ each row of a write to the leaf its values name.
 
 The layout is the authority on which columns are partition columns, because nothing in a batch says
 which of its columns belong in a path. A folder whose leaves already spell out `column=value`
-partitions by exactly those columns; a folder whose leaves do not is one table in one leaf, named
-after the encoding. That is also how a tree comes into being: address one partition directly to
-create it, then address the folder above it and every later write routes itself.
+partitions by exactly those columns; a folder that spells out nothing takes the layout from the
+declared schema, whose [partition-marked fields](field.md#a-field-can-be-a-partition-column) say it;
+and a folder with neither is one table in one leaf, named after the encoding. So a tree comes into
+being two ways: address one partition directly to create it, or declare the columns on the schema
+and let the first write lay the directories out.
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::generic::{Holder, IORecordOptions, RecordOptions};
+    use yggdryl::io::IOBase;
+    use yggdryl::{DataType, MimeType};
+
+    let root = std::env::temp_dir().join("yggdryl-doc-declared-layout");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root)?;
+
+    // Nothing is on disk, so nothing spells a layout. The schema does.
+    let schema = DataType::from_fields([
+        DataType::Int64.required_field("price"),
+        DataType::Int32.required_field("year"),
+    ])?
+    .required_field("row")
+    .with_partition_fields(&["year"])?;
+    assert_eq!(schema.partition_field_names().collect::<Vec<_>>(), ["year"]);
+
+    let arrow_schema = schema.to_arrow_schema()?;
+    let batch = arrow_array::RecordBatch::try_new(
+        std::sync::Arc::clone(&arrow_schema),
+        vec![
+            std::sync::Arc::new(arrow_array::Int64Array::from(vec![10, 20])),
+            std::sync::Arc::new(arrow_array::Int32Array::from(vec![2024, 2024])),
+        ],
+    )?;
+
+    let mut lake = Holder::folder(&root)?;
+    let options = RecordOptions::for_mime_type(&MimeType::ARROW_STREAM)?.with_schema(schema);
+    lake.write_arrow_batch_reader(
+        yggdryl::arrow::batch_reader(arrow_schema, [batch]),
+        &options,
+    )?;
+
+    // The directory came from the declaration, and the leaf stores what the
+    // path does not carry.
+    assert!(root.join("year=2024").is_dir());
+
+    // Reading it back reports the layout without being told it.
+    let derived = lake.read_arrow_field(
+        &RecordOptions::for_mime_type(&MimeType::ARROW_STREAM)?,
+    )?;
+    assert_eq!(derived.partition_field_names().collect::<Vec<_>>(), ["year"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+A declaration that contradicts a stored layout is refused, naming both, because one write cannot mean
+two trees: a folder already partitioned by `year` and a schema that marks `venue` disagree about
+which columns the leaves are missing, and merging them would leave files whose directory names no
+longer say what they left out.
 
 A column the data already carries is left alone rather than rewritten from the directory name, so a
 mismatch between the two stays visible instead of being silently papered over. Without a declared

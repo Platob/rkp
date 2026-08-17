@@ -10,25 +10,33 @@ scan stays lazy on both sides of the boundary.
 from __future__ import annotations
 
 from ._native import (
+    Catalog,
+    Compaction,
     DataFile,
     ManifestFile,
     PartitionField,
     PartitionSpec,
+    SchemaUpdate,
     Snapshot,
     Table,
     assign_field_ids,
+    can_promote,
     schema_from_json,
     schema_to_json,
 )
 
 __all__ = [
+    "Catalog",
+    "Compaction",
     "DataFile",
     "ManifestFile",
     "PartitionField",
     "PartitionSpec",
+    "SchemaUpdate",
     "Snapshot",
     "Table",
     "assign_field_ids",
+    "can_promote",
     "schema_from_json",
     "schema_to_json",
 ]

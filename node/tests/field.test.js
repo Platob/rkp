@@ -3,7 +3,15 @@
 const assert = require('node:assert/strict')
 const test = require('node:test')
 
-const { DataType, Field, MediaType, MimeType, Uri, Url } = require('..')
+const {
+  DataType,
+  Field,
+  MediaType,
+  MimeType,
+  ProtocolMetadata,
+  Uri,
+  Url,
+} = require('..')
 
 test('field values infer native datatypes and round-trip canonically', () => {
   const type = new DataType('varchar')
@@ -220,7 +228,7 @@ test('typed names, locations, and protocol properties share Arrow metadata', () 
   field.setCatalogName('analytics')
   field.setSchemaName('market')
   field.setTableName('bars')
-  field.setId(-2147483648)
+  field.setParquetFieldId(-2147483648)
   field.setLocation(
     Uri.fromString('s3://warehouse/bars/day=2026-08-15/data.parquet'),
   )
@@ -229,7 +237,7 @@ test('typed names, locations, and protocol properties share Arrow metadata', () 
   assert.equal(field.catalogName, 'analytics')
   assert.equal(field.schemaName, 'market')
   assert.equal(field.tableName, 'bars')
-  assert.equal(field.id, -2147483648)
+  assert.equal(field.parquetFieldId, -2147483648)
   assert.equal(field.get('PARQUET:field_id'), '-2147483648')
   assert.ok(
     field.location.equals(
@@ -263,35 +271,35 @@ test('typed names, locations, and protocol properties share Arrow metadata', () 
   assert.equal(field.removeCatalogName(), 'analytics')
   assert.equal(field.removeSchemaName(), 'market')
   assert.equal(field.removeTableName(), 'bars')
-  assert.equal(field.removeId(), -2147483648)
+  assert.equal(field.removeParquetFieldId(), -2147483648)
   assert.ok(
     field
       .removeLocation()
       .equals(Url.fromString('s3://warehouse/bars/day=2026-08-15/data.parquet')),
   )
   assert.equal(field.location, null)
-  assert.equal(field.id, null)
+  assert.equal(field.parquetFieldId, null)
 })
 
 test('field ID uses canonical signed int32 Arrow metadata', () => {
   const field = new Field('id', 'int64', false)
   field.set('PARQUET:field_id', '+00017')
-  assert.equal(field.id, 17)
+  assert.equal(field.parquetFieldId, 17)
   assert.equal(field.get('PARQUET:field_id'), '17')
 
-  field.setId(2147483647)
-  assert.equal(Field.fromJSON(field.toJSON()).id, 2147483647)
-  assert.equal(Field.fromString(field.toString()).id, 2147483647)
+  field.setParquetFieldId(2147483647)
+  assert.equal(Field.fromJSON(field.toJSON()).parquetFieldId, 2147483647)
+  assert.equal(Field.fromString(field.toString()).parquetFieldId, 2147483647)
 
   assert.throws(() => field.set('PARQUET:field_id', '2147483648'))
   assert.throws(() => field.set('PARQUET:field_id', '1.0'))
-  assert.throws(() => field.setId(2147483648))
-  assert.throws(() => field.setId(-2147483649))
-  assert.throws(() => field.setId(1.5))
-  assert.throws(() => field.setId(Number.NaN))
-  assert.throws(() => field.setId(Number.POSITIVE_INFINITY))
-  assert.throws(() => field.setId('17'))
-  assert.equal(field.id, 2147483647)
+  assert.throws(() => field.setParquetFieldId(2147483648))
+  assert.throws(() => field.setParquetFieldId(-2147483649))
+  assert.throws(() => field.setParquetFieldId(1.5))
+  assert.throws(() => field.setParquetFieldId(Number.NaN))
+  assert.throws(() => field.setParquetFieldId(Number.POSITIVE_INFINITY))
+  assert.throws(() => field.setParquetFieldId('17'))
+  assert.equal(field.parquetFieldId, 2147483647)
 })
 
 test('typed metadata rejects invalid updates atomically', () => {
@@ -331,4 +339,231 @@ test('dictionary field options remain native value state', () => {
 
 test('malformed fields never use a permissive fallback', () => {
   assert.throws(() => Field.fromString('name: list<'))
+})
+
+test('a protocol view is a Map over one namespace of bare names', () => {
+  const field = new Field('price', 'decimal(18, 6)', false, { doc: 'shared' })
+  const iceberg = field.iceberg
+
+  assert.ok(iceberg instanceof ProtocolMetadata)
+  assert.throws(() => new ProtocolMetadata(), /no `constructor`/)
+  assert.equal(iceberg.scheme, 'iceberg')
+  assert.equal(iceberg.prefix, 'iceberg')
+  assert.equal(iceberg.key('doc'), 'iceberg:doc')
+  assert.equal(iceberg.size, 0)
+  assert.equal(iceberg.get('doc'), null)
+  assert.equal(iceberg.has('doc'), false)
+
+  iceberg.set('doc', 'closing price')
+  iceberg.update({ 'schema-id': '3', 'field-id': '7' })
+  iceberg.update([{ key: 'sort-order', value: 'asc' }])
+  iceberg.update(new Map([['partition', 'day']]))
+
+  assert.equal(iceberg.size, 5)
+  assert.equal(iceberg.has('doc'), true)
+  assert.deepEqual(iceberg.keys(), [
+    'doc',
+    'field-id',
+    'partition',
+    'schema-id',
+    'sort-order',
+  ])
+  assert.deepEqual(iceberg.values(), ['closing price', '7', 'day', '3', 'asc'])
+  assert.deepEqual(iceberg.entries()[0], { key: 'doc', value: 'closing price' })
+  assert.deepEqual([...iceberg], [
+    ['doc', 'closing price'],
+    ['field-id', '7'],
+    ['partition', 'day'],
+    ['schema-id', '3'],
+    ['sort-order', 'asc'],
+  ])
+  assert.deepEqual(new Map(iceberg).get('field-id'), '7')
+  assert.deepEqual(Object.fromEntries(iceberg), iceberg.toJSON())
+  assert.equal(JSON.stringify(iceberg), iceberg.toString())
+  assert.equal(
+    iceberg.toString(),
+    '{"doc":"closing price","field-id":"7","partition":"day","schema-id":"3","sort-order":"asc"}',
+  )
+
+  assert.equal(iceberg.delete('sort-order'), true)
+  assert.equal(iceberg.delete('sort-order'), false)
+  assert.equal(iceberg.size, 4)
+
+  iceberg.clear()
+  assert.equal(iceberg.size, 0)
+  // Clearing one protocol never reaches a key that belongs to no protocol.
+  assert.equal(field.get('doc'), 'shared')
+  assert.throws(() => iceberg.set('', 'unnamed'))
+  assert.throws(() => iceberg.update([{ key: '', value: 'unnamed' }]))
+  assert.throws(
+    () => iceberg.update('doc'),
+    /field metadata must be an object, Map, or entry array/,
+  )
+  assert.equal(iceberg.size, 0)
+})
+
+test('a protocol view stays live on the field it was taken from', () => {
+  const field = new Field('price', 'decimal(18, 6)', false)
+  const iceberg = field.iceberg
+
+  iceberg.set('doc', 'closing price')
+  assert.equal(field.getProperty('iceberg', 'doc'), 'closing price')
+  assert.equal(field.get('iceberg:doc'), 'closing price')
+  assert.equal(field.has('iceberg:doc'), true)
+  assert.deepEqual(field.propertyIter('iceberg'), [
+    { key: 'doc', value: 'closing price' },
+  ])
+
+  // A write on the field is a read through the view, and the other way round.
+  field.setProperty('iceberg', 'field-id', '7')
+  assert.equal(iceberg.get('field-id'), '7')
+  assert.equal(iceberg.size, 2)
+  field.set('iceberg:doc', 'last trade')
+  assert.equal(iceberg.get('doc'), 'last trade')
+
+  // Two views of one field are two windows onto the same metadata.
+  const same = field.protocol('ICEBERG')
+  same.delete('doc')
+  assert.equal(iceberg.has('doc'), false)
+  assert.equal(field.getProperty('iceberg', 'doc'), null)
+
+  field.clearProperties('iceberg')
+  assert.equal(iceberg.size, 0)
+
+  // A clone is its own field, so a view of the original never writes into it.
+  iceberg.set('doc', 'closing price')
+  const clone = field.clone()
+  iceberg.set('doc', 'last trade')
+  assert.equal(clone.getProperty('iceberg', 'doc'), 'closing price')
+  assert.equal(field.getProperty('iceberg', 'doc'), 'last trade')
+})
+
+test('the HTTP protocol view covers HTTPS and is ASCII case-insensitive', () => {
+  const field = new Field('payload', 'binary', false, {
+    'HTTPS:Content-Type': 'application/json',
+  })
+
+  assert.equal(field.http.get('content-type'), 'application/json')
+  assert.equal(field.http.get('CONTENT-TYPE'), 'application/json')
+  assert.equal(field.http.has('Content-Type'), true)
+
+  // HTTPS shares HTTP's one namespace, so both spell the same prefix.
+  const https = field.protocol('HTTPS')
+  assert.equal(https.scheme, 'https')
+  assert.equal(https.prefix, 'http')
+  assert.equal(https.key('content-type'), 'http:content-type')
+  assert.equal(https.get('Content-Type'), 'application/json')
+
+  https.set('Cache-Control', 'public, max-age=60')
+  assert.equal(field.get('http:cache-control'), 'public, max-age=60')
+  assert.equal(field.cacheControl, 'public, max-age=60')
+  assert.deepEqual(field.http.keys(), ['cache-control', 'content-type'])
+  assert.equal(field.protocol('Http').size, 2)
+  assert.equal(https.delete('CACHE-CONTROL'), true)
+  assert.equal(field.http.size, 1)
+})
+
+test('every well-known protocol has its own live field accessor', () => {
+  const protocols = [
+    'http',
+    'file',
+    'urn',
+    'postgres',
+    'postgresql',
+    'mysql',
+    'arrow',
+    'sql',
+    'glue',
+    'iceberg',
+    'fix',
+    'field',
+    'dtype',
+    's3',
+    'gs',
+    'az',
+    'spark',
+    'polars',
+    'pandas',
+  ]
+  const field = new Field('price', 'decimal(18, 6)', false)
+
+  for (const protocol of protocols) {
+    const view = field[protocol]
+    assert.equal(view.scheme, protocol, protocol)
+    assert.equal(view.prefix, protocol, protocol)
+    assert.equal(view.key('doc'), `${protocol}:doc`, protocol)
+    view.set('doc', protocol)
+  }
+
+  assert.equal(field.size, protocols.length)
+  assert.deepEqual(
+    field.keys(),
+    protocols.map((protocol) => `${protocol}:doc`).sort(),
+  )
+  for (const protocol of protocols) {
+    assert.equal(field.getProperty(protocol, 'doc'), protocol, protocol)
+    assert.equal(field.protocol(protocol).size, 1, protocol)
+  }
+
+  // An unparsable scheme is the core's own message, not a binding invention.
+  assert.throws(
+    () => field.protocol('1invalid'),
+    /invalid scheme expression at byte 0: scheme must start with an ASCII letter/,
+  )
+})
+
+test('partition markers name the columns a path spells out', () => {
+  const year = new Field('year', 'int32', false)
+  assert.equal(year.isPartition, false)
+
+  const marked = year.withPartition(true)
+  assert.ok(marked instanceof Field)
+  assert.equal(marked.isPartition, true)
+  assert.equal(marked.get('field:partition'), 'true')
+  // `withPartition` copies, so the field it was called on is unchanged.
+  assert.equal(year.isPartition, false)
+
+  year.setPartition(true)
+  assert.equal(year.isPartition, true)
+  year.setPartition(false)
+  assert.equal(year.isPartition, false)
+  assert.equal(year.has('field:partition'), false)
+
+  const schema = Field.from(
+    'row: struct<year: int32 not null, price: float64 not null> not null',
+  )
+  assert.equal(schema.hasPartitionFields, false)
+  assert.equal(schema.partitionFieldLen, 0)
+  assert.deepEqual(schema.partitionFieldNames(), [])
+  assert.deepEqual(schema.partitionFields(), [])
+  // Subtracting nothing is the field itself.
+  assert.ok(schema.withoutPartitionFields().equals(schema))
+
+  const partitioned = schema.withPartitionFields(['year'])
+  assert.ok(partitioned instanceof Field)
+  assert.equal(partitioned.hasPartitionFields, true)
+  assert.equal(partitioned.partitionFieldLen, 1)
+  assert.deepEqual(partitioned.partitionFieldNames(), ['year'])
+
+  const [partitionField] = partitioned.partitionFields()
+  assert.ok(partitionField instanceof Field)
+  assert.equal(partitionField.name, 'year')
+  assert.equal(partitionField.isPartition, true)
+
+  const path = partitioned.onlyPartitionFields()
+  assert.ok(path instanceof Field)
+  assert.equal(path.name, 'row')
+  assert.deepEqual([...path.dataType].map((child) => child.name), ['year'])
+
+  const leaf = partitioned.withoutPartitionFields()
+  assert.ok(leaf instanceof Field)
+  assert.deepEqual([...leaf.dataType].map((child) => child.name), ['price'])
+
+  // A partition column nobody stores is a layout error, not a silent omission.
+  assert.throws(
+    () => partitioned.withPartitionFields(['session']),
+    /expected a column of "row" to partition on, got "session"/,
+  )
+  assert.throws(() => year.onlyPartitionFields(), /expected a struct root/)
+  assert.throws(() => year.withPartitionFields(['year']), /expected a struct root/)
 })

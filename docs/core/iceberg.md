@@ -594,8 +594,47 @@ assert!(hashed.require_writable().unwrap_err().to_string().contains("bucket[16]"
 
 Iceberg writes partition directories in exactly the `column=value` shape
 [`Url::hive_partitions`](uri.md) already reads, so a table this module writes is also a lake the rest
-of the crate can walk with [`IOBase::children_where`](io.md). Unlike Hive, an Iceberg data file still
-stores its partition columns, so a scan needs no restoration step in the normal case.
+of the crate can walk with [`IOBase::children_where`](io.md). It is the same shape because it is the
+same renderer: `partition_path` spells a value through
+[`io::partition::partition_text`](io.md#partition-columns-in-the-data), which is what a partitioned
+folder write applies to a whole column, so a date is `day=2024-01-01` in a table and in a lake alike.
+Unlike Hive, an Iceberg data file still stores its partition columns, so a scan needs no restoration
+step in the normal case.
+
+A spec and a schema say the same thing, so neither has to be spelled twice. The partition tuple
+carries what produced each of its columns - the transform, the source column, and the partition
+marker every path-borne column carries - and a schema can carry the marks itself:
+
+```rust
+use yggdryl::iceberg::{PartitionSpec, assign_field_ids};
+use yggdryl::DataType;
+
+let mut schema = DataType::from_fields([
+    DataType::Int64.required_field("id"),
+    DataType::Utf8.nullable_field("venue"),
+])?
+.required_field("row");
+assign_field_ids(&mut schema, 1)?;
+let spec = PartitionSpec::identity(1, &schema, &["venue"])?;
+
+// The tuple describes itself, so the spec reads back off it.
+let partition = spec.partition_field(&schema)?;
+assert_eq!(partition.iceberg().get("spec-id"), Some("1"));
+let venue = partition.get_field_by_name("venue").expect("the partition column");
+assert!(venue.is_partition());
+assert_eq!(venue.iceberg().get("transform"), Some("identity"));
+assert_eq!(PartitionSpec::from_field(&partition)?, spec);
+
+// And a schema that marks its own partition columns needs no column list.
+let marked = spec.mark_partitions(&schema)?;
+assert_eq!(marked.partition_field_names().collect::<Vec<_>>(), ["venue"]);
+assert_eq!(PartitionSpec::from_schema(1, &marked)?, spec);
+```
+
+A table marks its stored schema this way when it is created and again when it is opened, so
+`Table::schema` reports the layout whichever end you came in from - and the mark is core Field
+metadata, not an Iceberg document key, so it survives into Arrow and Parquet without the table
+metadata beside it.
 
 **The manifest is the authority on a partition value, not the path.** A null value is spelled `null`
 in a directory name, and a path cannot say whether that is the string `"null"` or the absence of a
@@ -910,6 +949,147 @@ select a row. `ScanPlan` reports both numbers, so "a filtered read touches only
 the files the metadata says it must" is something a caller can assert on rather
 than believe.
 
+## Time travel and the inspection tables
+
+!!! note "All three"
+    `scan_at` / `scanAt`, `snapshot_by_ref` / `snapshotByRef`, and the three
+    inspection readers cross into both bindings as ordinary record-batch
+    readers.
+
+Nothing a commit writes is mutated in place, so every retained snapshot is still a complete table.
+Reading one is an ordinary scan with the snapshot named:
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let root = std::env::temp_dir().join("yggdryl-doc-time-travel");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    let mut table = Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    let arrow_schema = schema.to_arrow_schema()?;
+    let one = arrow_array::RecordBatch::try_new(
+        std::sync::Arc::clone(&arrow_schema),
+        vec![std::sync::Arc::new(arrow_array::Int64Array::from(vec![1]))],
+    )?;
+    table.append(yggdryl::arrow::batch_reader(std::sync::Arc::clone(&arrow_schema), [one]))?;
+    let past = table.current_snapshot().expect("one commit").snapshot_id;
+
+    let nine = arrow_array::RecordBatch::try_new(
+        std::sync::Arc::clone(&arrow_schema),
+        vec![std::sync::Arc::new(arrow_array::Int64Array::from(vec![9]))],
+    )?;
+    table.overwrite(yggdryl::arrow::batch_reader(arrow_schema, [nine]))?;
+
+    // The present shows the overwrite; the retained snapshot shows what was.
+    assert_eq!(table.scan(None)?.count(), 1);
+    let history = table.scan_at(past, &[], None)?.next().expect("one batch")?;
+    assert_eq!(history.num_rows(), 1);
+
+    // Planning history prunes exactly as planning the present does.
+    assert_eq!(table.plan_at(past, &[])?.tasks.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import shutil
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids
+
+    columns = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+    root = pathlib.Path(tempfile.mkdtemp(prefix="yggdryl-doc-")) / "trades"
+
+    table = Table.create(IOBase(root), assign_field_ids(columns))
+    table.append(pa.record_batch({"id": [1]}, schema=columns))
+    past = table.current_snapshot.snapshot_id
+    table.overwrite(pa.record_batch({"id": [9]}, schema=columns))
+
+    # The present shows the overwrite; the retained snapshot shows what was.
+    assert table.scan().read_all().column("id").to_pylist() == [9]
+    assert table.scan_at(past).read_all().column("id").to_pylist() == [1]
+
+    # A branch or tag resolves by name, and every commit moves `main`.
+    assert table.snapshot_by_ref("main").snapshot_id == table.current_snapshot.snapshot_id
+
+    # The inspection readers render the table's own record as record batches.
+    assert table.inspect_history().read_all().num_rows == 2
+    assert table.inspect_snapshots().read_all().column("operation").to_pylist() == [
+        "append",
+        "overwrite",
+    ]
+    assert table.inspect_files().read_all().num_rows == 1
+
+    shutil.rmtree(root.parent)
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const schema = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int64')], { nullable: false }),
+    )
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-doc-')), 'trades')
+
+    const table = iceberg.Table.create(root, schema)
+    table.append(new arrow.Table({ id: arrow.vectorFromArray([1n], new arrow.Int64()) }))
+    const past = table.currentSnapshot.snapshotId
+    table.overwrite(new arrow.Table({ id: arrow.vectorFromArray([9n], new arrow.Int64()) }))
+
+    // The present shows the overwrite; the retained snapshot shows what was.
+    assert.deepEqual(table.scan().toTable().getChild('id').toArray(), BigInt64Array.from([9n]))
+    assert.deepEqual(table.scanAt(past).toTable().getChild('id').toArray(), BigInt64Array.from([1n]))
+
+    // A branch or tag resolves by name, and every commit moves `main`.
+    assert.equal(table.snapshotByRef('main').snapshotId, table.currentSnapshot.snapshotId)
+
+    // The inspection readers render the table's own record as record batches.
+    assert.equal(table.inspectHistory().toTable().numRows, 2)
+    assert.equal(table.inspectSnapshots().toTable().getChild('operation').get(1), 'overwrite')
+    assert.equal(table.inspectFiles().toTable().numRows, 1)
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
+
+A snapshot is read as the schema that was current when it was written, so a column added later does
+not appear and a column dropped later still does. A branch or tag resolves with `snapshot_by_ref`,
+and a metadata-only change - a property, a new ref, an evolved schema - commits through
+`commit_changes`, which writes one new metadata document and leaves the table untouched when the
+change or the write fails.
+
+The table also renders its own record as record batches, under the column names PyIceberg's
+inspection tables use: `inspect_history` (when each snapshot became current, and whether it is on
+the current ancestry chain), `inspect_snapshots` (operation, manifest list, and the summary map per
+retained snapshot), and `inspect_files` (path, format, spec, rendered `column=value` partition
+chain, row count, and size per live data file). They are ordinary readers, so the same collect that
+drains a scan drains them.
+
 ## The three record methods over a table
 
 === "Rust"
@@ -1118,6 +1298,717 @@ let rows: usize = partition
 assert_eq!(rows, 1);
 ```
 
+## A warehouse of tables
+
+!!! note "All three"
+    The catalog crosses whole: Python has it as `yggdryl.iceberg.Catalog` and
+    JavaScript as `iceberg.Catalog`, over the same warehouse folder and the
+    same dotted names.
+
+A caller who has rows and a dotted name should need nothing else. `Catalog` is that surface: one
+warehouse folder, namespaces as nested folders, and a table per name - `HadoopCatalog`'s layout,
+reached through [`IOBase`](io.md) and nothing else.
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use yggdryl::iceberg::Catalog;
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let warehouse = std::env::temp_dir().join("yggdryl-doc-warehouse");
+    let _ = std::fs::remove_dir_all(&warehouse);
+    let catalog = Catalog::new(Folder::new(&warehouse)?);
+
+    // Rows and a name are enough: the first append creates the table with the
+    // schema the rows carry, and the second appends to it.
+    let schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Utf8.nullable_field("venue"),
+    ])?
+    .required_field("row")
+    .with_partition_fields(&["venue"])?;
+    let arrow_schema = schema.to_arrow_schema()?;
+    let rows = |ids: &[i64], venues: &[&str]| {
+        RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(venues.to_vec())),
+            ],
+        )
+    };
+    let first = rows(&[1, 2], &["XNAS", "XNYS"])?;
+    let table = catalog.append("nyc.trades", yggdryl::arrow::batch_reader(first.schema(), [first]))?;
+    let rows_read: usize = table.scan(None)?.map(|batch| batch.map(|b| b.num_rows())).sum::<Result<usize, _>>()?;
+    assert_eq!(rows_read, 2);
+
+    let second = rows(&[3], &["XNAS"])?;
+    catalog.append("nyc.trades", yggdryl::arrow::batch_reader(second.schema(), [second]))?;
+
+    // The partition marks the schema carried became the table's spec.
+    let reopened = catalog.table("nyc.trades")?;
+    assert_eq!(reopened.metadata().default_spec()?.fields[0].name, "venue");
+    assert!(catalog.has_table("nyc.trades")?);
+    assert_eq!(catalog.list_namespaces(None)?, ["nyc"]);
+    assert_eq!(catalog.list_tables("nyc")?, ["nyc.trades"]);
+
+    let _ = std::fs::remove_dir_all(&warehouse);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import shutil
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import DataType, Field
+    from yggdryl.iceberg import Catalog
+
+    warehouse = pathlib.Path(tempfile.mkdtemp(prefix="yggdryl-doc-")) / "warehouse"
+    catalog = Catalog(warehouse)
+
+    # Rows and a name are enough: the first append creates the table with the
+    # schema the rows carry, and the second appends to it.
+    marked = Field(
+        "row",
+        DataType.from_fields([
+            Field("id", "int64", nullable=False),
+            Field("venue", "string"),
+        ]),
+        nullable=False,
+    ).with_partition_fields(["venue"])
+    columns = pa.schema([child.to_arrow() for child in marked.data_type])
+
+    table = catalog.append(
+        "nyc.trades", pa.table({"id": [1, 2], "venue": ["XNAS", "XNYS"]}, schema=columns)
+    )
+    assert table.scan().read_all().num_rows == 2
+
+    catalog.append("nyc.trades", pa.table({"id": [3], "venue": ["XNAS"]}, schema=columns))
+
+    # The partition marks the schema carried became the table's spec.
+    reopened = catalog.table("nyc.trades")
+    assert [field.name for field in reopened.spec.fields] == ["venue"]
+    assert reopened.scan().read_all().num_rows == 3
+    assert catalog.has_table("nyc.trades")
+    assert catalog.list_namespaces() == ["nyc"]
+    assert catalog.list_tables("nyc") == ["nyc.trades"]
+
+    shutil.rmtree(warehouse.parent)
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const warehouse = fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-doc-'))
+    const catalog = new iceberg.Catalog(warehouse)
+
+    // The explicit spelling: the schema is numbered here, and its partition
+    // marks become the identity spec.
+    const marked = fields
+      .struct('row', [Field.from('id: int64'), Field.from('venue: utf8')], { nullable: false })
+      .withPartitionFields(['venue'])
+    catalog.createTable('nyc.trades', marked)
+
+    const rows = (ids, venues) =>
+      new arrow.Table({
+        id: arrow.vectorFromArray(ids, new arrow.Int64()),
+        venue: arrow.vectorFromArray(venues, new arrow.Utf8()),
+      })
+    const table = catalog.append('nyc.trades', rows([1n, 2n], ['XNAS', 'XNYS']))
+    assert.equal(table.scan().toTable().numRows, 2)
+    assert.equal(catalog.append('nyc.trades', rows([3n], ['XNAS'])).scan().toTable().numRows, 3)
+
+    // The dotted name is the folder nyc/trades, and the marks became the spec.
+    assert.ok(catalog.hasTable('nyc.trades'))
+    assert.deepEqual(catalog.table('nyc.trades').spec.fields.map((field) => field.name), ['venue'])
+    assert.deepEqual(catalog.listNamespaces(), ['nyc'])
+    assert.deepEqual(catalog.listTables('nyc'), ['nyc.trades'])
+
+    fs.rmSync(warehouse, { recursive: true, force: true })
+    ```
+
+`create_table` is the explicit spelling - it numbers an unnumbered schema, derives the identity spec
+from the schema's own [partition marks](field.md#a-field-can-be-a-partition-column), and refuses a
+name that already has a table. `append` and `overwrite` are create-or-write. Every convenience is a
+thin wrapper over the explicit one; nothing is decided twice.
+
+What is deliberately not here: `drop_table` and `rename_table`, because the storage contract has no
+delete or move primitive, and a catalog must not emulate either by leaving a half-erased table
+behind; and no catalog *service* client, because the module holds no network code. A REST catalog
+is future work behind an HTTP storage backend.
+
+## Data files aim at a size
+
+!!! note "All three"
+    The bindings read the target as `target_file_size` / `targetFileSize` and
+    rewrite with `compact()`, which reports the same three numbers in each
+    language's casing.
+
+One key names the target: the table property `write.target-file-size-bytes`, falling back to the
+schema root's `iceberg:write.target-file-size-bytes` protocol property, then Iceberg's 512 MiB
+default. A partition's stream rolls to a new data file at the batch boundary that reaches the
+target - sized by Arrow in-memory bytes, so Parquet's compression lands files under the target
+rather than at it - and a table that has accumulated small files rewrites them:
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use yggdryl::iceberg::{Catalog, FormatVersion};
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let warehouse = std::env::temp_dir().join("yggdryl-doc-compaction");
+    let _ = std::fs::remove_dir_all(&warehouse);
+    let catalog = Catalog::new(Folder::new(&warehouse)?);
+
+    let schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    let arrow_schema = schema.to_arrow_schema()?;
+    let one = |id: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![id]))],
+        )
+    };
+
+    // Five appends, five snapshots, five small files.
+    let mut table = catalog.create_table("tiny.rows", schema)?;
+    for id in 0..5 {
+        let batch = one(id)?;
+        table.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+    }
+    assert_eq!(table.inspect_files()?.next().expect("one batch")?.num_rows(), 5);
+
+    // Compaction rewrites the small groups as one replace commit and reports it.
+    let compaction = table.compact()?;
+    assert_eq!(compaction.files_before, 5);
+    assert_eq!(compaction.files_after, 1);
+    assert_eq!(table.scan(None)?.map(|batch| batch.map(|b| b.num_rows())).sum::<Result<usize, _>>()?, 5);
+
+    // Nothing to do is a no-op that commits nothing.
+    assert_eq!(table.compact()?, yggdryl::iceberg::Compaction::default());
+
+    let _ = std::fs::remove_dir_all(&warehouse);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import shutil
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl.iceberg import Catalog
+
+    warehouse = pathlib.Path(tempfile.mkdtemp(prefix="yggdryl-doc-")) / "warehouse"
+    catalog = Catalog(warehouse)
+
+    # The default target is Iceberg's own 512 MiB.
+    columns = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+    table = catalog.create_table("tiny.rows", columns)
+    assert table.target_file_size == 512 * 1024 * 1024
+
+    # Five appends, five snapshots, five small files.
+    for value in range(5):
+        table.append(pa.record_batch({"id": [value]}, schema=columns))
+    assert table.inspect_files().read_all().num_rows == 5
+
+    # Compaction rewrites the small groups as one replace commit and reports it.
+    compaction = table.compact()
+    assert compaction.files_before == 5
+    assert compaction.files_after == 1
+    assert compaction.bytes_rewritten > 0
+    assert table.scan().read_all().num_rows == 5
+
+    # Nothing to do is a no-op that commits nothing.
+    done = table.compact()
+    assert (done.files_before, done.files_after, done.bytes_rewritten) == (0, 0, 0)
+
+    shutil.rmtree(warehouse.parent)
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, iceberg } = require('@yggdryl/node')
+
+    const warehouse = fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-doc-'))
+    const catalog = new iceberg.Catalog(warehouse)
+
+    // The default target is Iceberg's own 512 MiB.
+    const table = catalog.createTable('tiny.rows', [Field.from('id: int64')])
+    assert.equal(table.targetFileSize, 512 * 1024 * 1024)
+
+    // Five appends, five snapshots, five small files.
+    for (const value of [0n, 1n, 2n, 3n, 4n]) {
+      table.append(new arrow.Table({ id: arrow.vectorFromArray([value], new arrow.Int64()) }))
+    }
+    assert.equal(table.inspectFiles().toTable().numRows, 5)
+
+    // Compaction rewrites the small groups as one replace commit and reports it.
+    const compaction = table.compact()
+    assert.equal(compaction.filesBefore, 5)
+    assert.equal(compaction.filesAfter, 1)
+    assert.ok(compaction.bytesRewritten > 0)
+    assert.equal(table.scan().toTable().numRows, 5)
+
+    // Nothing to do is a no-op that commits nothing.
+    assert.deepEqual(table.compact(), { filesBefore: 0, filesAfter: 0, bytesRewritten: 0 })
+
+    fs.rmSync(warehouse, { recursive: true, force: true })
+    ```
+
+Compaction groups live files by partition, touches only groups holding at least two files with one
+under the target, and carries every other file into the new snapshot exactly as a merge carries the
+files it never read. The snapshot before the compaction still time-travels: rewriting the present
+never rewrites history.
+
+## One options value, three layers
+
+!!! note "Rust first"
+    `IcebergOptions` and the surfaces of this section and the next two are
+    Rust-first for now; the bindings gain them in a follow-up rather than
+    growing an untested spelling here.
+
+Every knob a table honors lives on one value, `IcebergOptions`, and every field of it resolves
+the same way: an explicit option set on the handle, then the table property of the same name
+(falling back to the schema root's `iceberg:`-prefixed protocol property), then the documented
+default. The keys are Iceberg's own spellings - `commit.retry.num-retries`,
+`commit.retry.min-wait-ms`, `commit.retry.max-wait-ms`, `write.target-file-size-bytes`,
+`read.parallelism`, `read.parallel.min-files`, `read.parallel.min-file-size-bytes` - so a property
+another engine wrote configures this reader too:
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{
+        FormatVersion, IcebergOptions, PartitionSpec, Table, assign_field_ids,
+    };
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let root = std::env::temp_dir().join("yggdryl-doc-options");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    let mut table = Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema,
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    // Nothing set: every field answers its documented default.
+    assert_eq!(table.options()?.commit_retries(), 4);
+    assert_eq!(table.options()?.target_file_size_bytes(), 512 * 1024 * 1024);
+
+    // The property layer is the table's own metadata, one commit away.
+    table.commit_changes(|metadata| {
+        metadata.set_property(IcebergOptions::COMMIT_RETRIES_KEY, "9")?;
+        Ok(())
+    })?;
+    assert_eq!(table.options()?.commit_retries(), 9);
+
+    // An explicit override shadows the property on this handle alone;
+    // nothing is written, and an unset field still resolves the other layers.
+    table.set_options(IcebergOptions::new().with_commit_retries(2));
+    assert_eq!(table.options()?.commit_retries(), 2);
+    assert_eq!(table.options()?.commit_min_backoff_ms(), 100);
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+A property that is present but does not parse is a typed error naming the key and the value, never
+a silent default - and because an explicit option never reads the property it shadows, a broken
+stored value can be shadowed first and repaired after, through the same handle. The resolvers are
+also scoped to what each operation consults: a commit resolves only the three `commit.retry.*`
+keys, so an unparseable `read.*` property cannot stop the metadata-only commit that fixes it.
+
+## Concurrent writers and commit retries
+
+Two writers holding the same table race the moment both commit, and what this module can promise
+depends on what [`IOBase`](io.md) offers: positional reads and writes, no compare-and-swap. So the
+one commit gate every write goes through re-checks the current version before writing, counts each
+newer version it finds as being *beaten* once, and retries with jittered exponential backoff up to
+`commit.retry.num-retries` times. What a retry does depends on the operation. An `append` and every
+metadata-only `commit_changes` **rebase**: they reload the winner's document and re-apply their
+intent on it - the data files and the manifest of added entries are written once and reused, only
+the manifest list and the document are rebuilt - so both writers' rows survive in one line of
+history:
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let root = std::env::temp_dir().join("yggdryl-doc-concurrency");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    // Two handles opened at the same version, each unaware of the other.
+    let mut left = Table::open(Folder::new(&root)?)?;
+    let mut right = Table::open(Folder::new(&root)?)?;
+
+    let arrow_schema = schema.to_arrow_schema()?;
+    let one = |id: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![id]))],
+        )
+    };
+
+    let batch = one(1)?;
+    left.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+
+    // The right handle is now stale; its commit observes the winner,
+    // rebases onto it, and lands as the next version.
+    let batch = one(2)?;
+    right.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+
+    // Both rows survive, on one line of history, and the rebased handle
+    // is current: no re-open needed to see the winner's row.
+    let rows: usize = right
+        .scan(None)?
+        .map(|batch| batch.map(|b| b.num_rows()))
+        .sum::<Result<usize, _>>()?;
+    assert_eq!(rows, 2);
+    assert_eq!(right.inspect_history()?.next().expect("one batch")?.num_rows(), 2);
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+`overwrite`, `merge`, and `compact` never rebase: they planned against files the winner may have
+replaced, and their input rows are already consumed, so re-applying could resurrect deleted data.
+Beaten, they only wait, look again, and after exhausting the retries restore the in-memory state
+and return a `CommitConflict` naming what happened - `expected to commit version 4, got beaten 5
+times; last saw version 8` - so the caller re-plans against the table as it now is.
+
+Honesty about the window: the check-then-write pair is not atomic. On plain storage a writer
+landing between the check and the write goes undetected - retries shrink the window, they cannot
+close it. Storage that serializes writers (an object store's atomic PUT, a catalog's swap) closes
+it; `yggdryl::local`'s memory mapping does not, and two processes truncating one mapped file at
+the same instant is the documented SIGBUS hazard of that backend. A failed commit leaves no
+visible change: at worst it leaves orphan data files no snapshot names.
+
+## Branches and tags
+
+Named references are part of the metadata document: a **tag** is a name that never moves, a
+**branch** is a name meant to. Creating one is a metadata-only commit, reading one is an ordinary
+scan, and every ref keeps the snapshot it names retained past any expiry:
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let root = std::env::temp_dir().join("yggdryl-doc-branching");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    let mut table = Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    let arrow_schema = schema.to_arrow_schema()?;
+    let one = |id: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![id]))],
+        )
+    };
+
+    let batch = one(1)?;
+    table.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+    let audited = table.current_snapshot().expect("one commit").snapshot_id;
+
+    // The tag pins the audited state; the table keeps moving.
+    table.create_tag("audit-2026", audited)?;
+    let batch = one(2)?;
+    table.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+    table.create_branch("review", audited)?;
+
+    // Every ref reads as the complete table it names.
+    assert_eq!(table.scan_ref("audit-2026", &[], None)?.count(), 1);
+    assert_eq!(table.scan_ref("review", &[], None)?.count(), 1);
+    assert_eq!(table.scan(None)?.count(), 2);
+
+    // A branch fast-forwards only along its own ancestry: the target must
+    // reach the branch's head by parent ids, so no history can be lost.
+    let head = table.current_snapshot().expect("two commits").snapshot_id;
+    table.fast_forward("review", head)?;
+    assert_eq!(table.snapshot_by_ref("review")?.snapshot_id, head);
+
+    // Removing a ref removes the name; the snapshots stay retained.
+    let removed = table.remove_ref("review")?;
+    assert_eq!(removed.snapshot_id, head);
+
+    // Expiry honors every ref's retention: the tagged snapshot survives
+    // a cutoff that would otherwise expire everything old.
+    assert!(table.expire_snapshots(i64::MAX)?.is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+Each ref carries its own retention - `min-snapshots-to-keep` and `max-snapshot-age-ms` for a
+branch's history, `max-ref-age-ms` for the ref itself - and `expire_snapshots` applies them before
+its own age cutoff; `main` itself never expires. A branch or tag commits through the same retrying
+gate as everything else, so two writers tagging at once behave like two writers appending at once.
+Writing *to* a branch other than `main` remains future work: a commit's parent is always the
+current snapshot, so today a branch is read with `scan_ref` and moved with `fast_forward`.
+
+## Reading many files at once
+
+A scan over many files can decode them in parallel, and the decision is deliberately conservative:
+the fan-out starts only when `read.parallelism` is at least 2 **and** at least
+`read.parallel.min-files` planned files (default 16) carry a recorded size of at least
+`read.parallel.min-file-size-bytes` (default 4 MiB). Small reads never pay for threads they cannot
+use, and storage is never hammered with more than `read.parallelism` files in flight - the default
+is the host's own parallelism, clamped to 1..=8. The order is the plan's order either way:
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use yggdryl::iceberg::{
+        FormatVersion, IcebergOptions, PartitionSpec, Table, assign_field_ids,
+    };
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let root = std::env::temp_dir().join("yggdryl-doc-parallel-read");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    let mut table = Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    let arrow_schema = schema.to_arrow_schema()?;
+    for id in 0..3 {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![id]))],
+        )?;
+        table.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+    }
+
+    // Three tiny files sit below both thresholds, so this table reads
+    // sequentially by default; forcing the thresholds down demonstrates
+    // that the fan-out changes nothing the caller can observe.
+    let sequential: Vec<RecordBatch> = table.scan(None)?.collect::<Result<_, _>>()?;
+    table.set_options(
+        IcebergOptions::new()
+            .try_with_read_parallelism(2)?
+            .with_read_parallel_min_files(1)
+            .with_read_parallel_min_file_size_bytes(0),
+    );
+    let fanned: Vec<RecordBatch> = table.scan(None)?.collect::<Result<_, _>>()?;
+    assert_eq!(sequential, fanned);
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+Each worker decodes one file end to end - the cast, the partition restore, and the residual
+filters run on the worker, not the consumer - and a reorder buffer releases batches strictly in
+plan order, admitting the next file only as the cursor file drains. Pruning still happens first:
+a filtered scan fans out over the files the statistics could not exclude, not over the table. On
+the benchmark table - 32 files of 100k rows each - four workers read a full collect about twice
+as fast as one; the numbers live in `rust/benchmarks/iceberg.rs` under `read/`.
+
+## The Spark quickstart, locally
+
+!!! note "All three"
+    The same walk now runs from Python and JavaScript: the catalog, the writes,
+    the schema evolution, and the look back each have their three-language form
+    in the sections above, so the quickstart itself is shown once, in Rust.
+
+The scenario the [Spark quickstart](https://iceberg.apache.org/spark-quickstart/) walks - create
+`nyc.taxis`, insert, read, update, delete, evolve, look back - runs against this module with no
+Spark, no JVM, and no catalog service. A local folder is the whole warehouse.
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use yggdryl::generic::Holder;
+use yggdryl::iceberg::Table;
+use yggdryl::local::Folder;
+use yggdryl::DataType;
+
+let root = std::env::temp_dir().join("yggdryl-doc-nyc-taxis");
+let _ = std::fs::remove_dir_all(&root);
+let catalog = yggdryl::iceberg::Catalog::new(Folder::new(&root)?);
+
+// CREATE TABLE nyc.taxis (...) PARTITIONED BY (vendor_id)
+// The partition mark on the schema is the whole PARTITIONED BY clause.
+let schema = DataType::from_fields([
+    DataType::Int64.required_field("vendor_id"),
+    DataType::Int64.required_field("trip_id"),
+    DataType::Float32.nullable_field("trip_distance"),
+    DataType::Float64.nullable_field("fare_amount"),
+    DataType::Utf8.nullable_field("store_and_fwd_flag"),
+])?
+.required_field("row")
+.with_partition_fields(&["vendor_id"])?;
+let mut table = catalog.create_table("nyc.taxis", schema.clone())?;
+let schema = table.schema()?.clone();
+
+// INSERT INTO nyc.taxis VALUES (...)
+let arrow_schema = schema.to_arrow_schema()?;
+let taxis = |vendors: &[i64], trips: &[i64], distances: &[f32], fares: &[f64], flags: &[&str]| {
+    RecordBatch::try_new(
+        Arc::clone(&arrow_schema),
+        vec![
+            Arc::new(Int64Array::from(vendors.to_vec())),
+            Arc::new(Int64Array::from(trips.to_vec())),
+            Arc::new(Float32Array::from(distances.to_vec())),
+            Arc::new(Float64Array::from(fares.to_vec())),
+            Arc::new(StringArray::from(flags.to_vec())),
+        ],
+    )
+};
+let rows = taxis(
+    &[1, 2, 2, 1],
+    &[1_000_371, 1_000_372, 1_000_373, 1_000_374],
+    &[1.8, 2.5, 0.9, 8.4],
+    &[15.32, 22.15, 9.01, 42.13],
+    &["N", "N", "N", "Y"],
+)?;
+table.append(yggdryl::arrow::batch_reader(rows.schema(), [rows]))?;
+
+// SELECT * FROM nyc.taxis
+let fares = |table: &Table<Holder>| -> Result<Vec<(i64, f64)>, Box<dyn std::error::Error>> {
+    let mut rows = Vec::new();
+    for batch in table.scan(None)? {
+        let batch = batch?;
+        let trips = batch.column_by_name("trip_id").expect("the trip column");
+        let fares = batch.column_by_name("fare_amount").expect("the fare column");
+        let trips = trips.as_any().downcast_ref::<Int64Array>().expect("int64");
+        let fares = fares.as_any().downcast_ref::<Float64Array>().expect("float64");
+        for row in 0..batch.num_rows() {
+            rows.push((trips.value(row), fares.value(row)));
+        }
+    }
+    rows.sort_by_key(|(trip, _)| *trip);
+    Ok(rows)
+};
+assert_eq!(fares(&table)?.len(), 4);
+assert_eq!(fares(&table)?[0], (1_000_371, 15.32));
+let before_changes = table.current_snapshot().expect("the insert").snapshot_id;
+
+// UPDATE nyc.taxis SET fare_amount = 16.32 WHERE trip_id = 1000371
+// An update is a merge: the incoming row matches on the key and replaces.
+let update = taxis(&[1], &[1_000_371], &[1.8], &[16.32], &["N"])?;
+table.merge(
+    yggdryl::arrow::batch_reader(update.schema(), [update]),
+    &["trip_id".to_owned()],
+    true,
+)?;
+assert_eq!(fares(&table)?[0], (1_000_371, 16.32));
+assert_eq!(fares(&table)?.len(), 4);
+
+// DELETE FROM nyc.taxis WHERE vendor_id = 1
+// A delete is a filtered overwrite with nothing incoming: the selected
+// partition is replaced by no rows, and every other file is carried over.
+table.overwrite_where(
+    &[("vendor_id", "1")],
+    yggdryl::arrow::batch_reader(Arc::clone(&arrow_schema), []),
+)?;
+assert_eq!(
+    fares(&table)?,
+    [(1_000_372, 22.15), (1_000_373, 9.01)],
+);
+
+// ALTER TABLE nyc.taxis ADD COLUMN fare_per_distance float
+let mut update = yggdryl::iceberg::SchemaUpdate::for_metadata(table.metadata())?;
+update.add_column("", DataType::Float32.nullable_field("fare_per_distance"));
+let evolved = update.apply()?;
+table.commit_changes(|metadata| {
+    // The new column got the next unused id; a retired id is never reused.
+    let schema_id = metadata.add_schema(evolved.clone())?;
+    metadata.set_current_schema(schema_id)
+})?;
+let widened = table.scan(None)?.next().expect("one batch")?;
+assert_eq!(widened.schema().fields().len(), 6);
+assert_eq!(widened.column_by_name("fare_per_distance").expect("the new column").null_count(), 2);
+
+// Time travel: the table before the update and the delete is still there.
+assert_eq!(table.scan_at(before_changes, &[], None)?.map(|batch| batch.map(|b| b.num_rows())).sum::<Result<usize, _>>()?, 4);
+
+// SELECT * FROM nyc.taxis.history / .snapshots / .files
+let history = table.inspect_history()?.next().expect("one batch")?;
+assert_eq!(history.num_rows(), 3);
+let files = table.inspect_files()?.next().expect("one batch")?;
+assert_eq!(files.num_rows(), 1);
+
+let _ = std::fs::remove_dir_all(&root);
+```
+
+Every data-moving step above is one commit, so the history table ends with three rows - the insert,
+the merge, the filtered overwrite - and the metadata-only schema change never appears there, because
+it moved no data. The delete really is an overwrite: `vendor_id` is a partition column, so the plan selects one
+partition's file, replaces it with nothing, and carries the other file into the new snapshot
+untouched. And the time-travel read at the end sees the four original fares, because nothing a
+commit writes is ever mutated in place.
+
 ## Schema evolution and field ids
 
 === "Rust"
@@ -1264,17 +2155,17 @@ by id survives a rename, and a new column can never reuse a retired id.
 
     // Depth first from `start`; the return value is the first id it did not use.
     assert_eq!(assign_field_ids(&mut schema, 1)?, 4);
-    assert_eq!(schema.fields()[0].id()?, Some(1));
-    assert_eq!(schema.fields()[1].id()?, Some(2));
-    assert_eq!(schema.fields()[1].fields()[0].id()?, Some(3));
+    assert_eq!(schema.fields()[0].parquet_field_id()?, Some(1));
+    assert_eq!(schema.fields()[1].parquet_field_id()?, Some(2));
+    assert_eq!(schema.fields()[1].fields()[0].parquet_field_id()?, Some(3));
     assert_eq!(last_field_id(&schema)?, 3, "what a table records as last-column-id");
 
     // The root is not a column, so it is not numbered.
-    assert_eq!(schema.id()?, None);
+    assert_eq!(schema.parquet_field_id()?, None);
 
     // A field that already carries an id keeps it, so a second pass changes nothing.
     assert_eq!(assign_field_ids(&mut schema, 100)?, 100);
-    assert_eq!(schema.fields()[0].id()?, Some(1));
+    assert_eq!(schema.fields()[0].parquet_field_id()?, Some(1));
     ```
 
 === "Python"
@@ -1295,14 +2186,14 @@ by id survives a rename, and a new column can never reuse a retired id.
     # Depth first from `start`; the numbered schema is what comes back, so the
     # schema handed in is left as it was.
     schema = assign_field_ids(columns, 1)
-    assert [child.id for child in schema.data_type] == [1, 2]
-    assert schema.data_type[1].data_type[0].id == 3
+    assert [child.parquet_field_id for child in schema.data_type] == [1, 2]
+    assert schema.data_type[1].data_type[0].parquet_field_id == 3
 
     # The root is not a column, so it is not numbered.
-    assert schema.id is None
+    assert schema.parquet_field_id is None
 
     # A field that already carries an id keeps it, so a second pass changes nothing.
-    assert [child.id for child in assign_field_ids(schema, 100).data_type] == [1, 2]
+    assert [child.parquet_field_id for child in assign_field_ids(schema, 100).data_type] == [1, 2]
     ```
 
 === "JavaScript"
@@ -1317,16 +2208,16 @@ by id survives a rename, and a new column can never reuse a retired id.
     // Depth first from `start`; the numbered schema is what comes back, so the
     // schema handed in is left as it was.
     const schema = iceberg.assignFieldIds(plain)
-    assert.equal(plain.dataType.at(0).id, null)
-    assert.equal(schema.dataType.at(0).id, 1)
-    assert.equal(schema.dataType.at(1).id, 2)
-    assert.equal(schema.dataType.at(1).dataType.at(0).id, 3)
+    assert.equal(plain.dataType.at(0).parquetFieldId, null)
+    assert.equal(schema.dataType.at(0).parquetFieldId, 1)
+    assert.equal(schema.dataType.at(1).parquetFieldId, 2)
+    assert.equal(schema.dataType.at(1).dataType.at(0).parquetFieldId, 3)
 
     // The root is not a column, so it is not numbered.
-    assert.equal(schema.id, null)
+    assert.equal(schema.parquetFieldId, null)
 
     // A field that already carries an id keeps it, so a second pass changes nothing.
-    assert.equal(iceberg.assignFieldIds(schema, 100).dataType.at(0).id, 1)
+    assert.equal(iceberg.assignFieldIds(schema, 100).dataType.at(0).parquetFieldId, 1)
     ```
 
 Numbering is explicit, never implicit: a field tree built in Rust has no ids until `assign_field_ids`
@@ -1383,6 +2274,153 @@ Writing a schema whose columns were never numbered fails, and says so:
     fs.rmSync(path.dirname(root), { recursive: true, force: true })
     ```
 
+## Evolving a schema
+
+!!! note "All three"
+    Python records the chain on `update_schema()` as a context manager,
+    JavaScript on a builder ending in `commit()`, and `can_promote` /
+    `canPromote` answers the promotion list everywhere.
+
+A column change is a new schema, and `SchemaUpdate` is how one is built from the current one:
+record the operations, apply, and commit the result. Only the promotions Iceberg allows are
+accepted, so a change that would reinterpret stored values is refused naming both sides.
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{can_promote, FormatVersion, PartitionSpec, SchemaUpdate, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let root = std::env::temp_dir().join("yggdryl-doc-evolution");
+    let _ = std::fs::remove_dir_all(&root);
+    let mut schema = DataType::from_fields([
+        DataType::Int32.required_field("id"),
+        DataType::Utf8.nullable_field("symbol"),
+    ])?
+    .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    let mut table = Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema,
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    // Legal promotions pass; anything else is refused naming both sides.
+    assert!(can_promote(&DataType::Int32, &DataType::Int64).is_ok());
+    assert!(can_promote(&DataType::decimal(10, 2)?, &DataType::decimal(18, 2)?).is_ok());
+    let message = can_promote(&DataType::Int64, &DataType::Int32).unwrap_err().to_string();
+    assert!(message.contains("int64") && message.contains("int32"));
+
+    // Widen id, rename symbol, add venue - one evolved schema, one commit.
+    let mut update = SchemaUpdate::for_metadata(table.metadata())?;
+    update.update_type("id", DataType::Int64);
+    update.rename_column("symbol", "ticker");
+    update.add_column("", DataType::Utf8.nullable_field("venue"));
+    let evolved = update.apply()?;
+
+    table.commit_changes(|metadata| {
+        let schema_id = metadata.add_schema(evolved.clone())?;
+        metadata.set_current_schema(schema_id)
+    })?;
+
+    let current = table.schema()?;
+    assert_eq!(current.get_field_by_name("id").expect("the column").data_type(), &DataType::Int64);
+    // A renamed column keeps its identifier: the name is a label, the id is the column.
+    assert_eq!(current.get_field_by_name("ticker").expect("the column").parquet_field_id()?, Some(2));
+    assert_eq!(current.get_field_by_name("venue").expect("the column").parquet_field_id()?, Some(3));
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import shutil
+    import tempfile
+
+    import pyarrow as pa
+    import pytest
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids, can_promote
+
+    # Legal promotions pass; anything else is refused naming both sides.
+    assert can_promote("int32", "int64") is None
+    assert can_promote("decimal128(10, 2)", "decimal128(18, 2)") is None
+    with pytest.raises(ValueError, match="int64 to int32"):
+        can_promote("int64", "int32")
+
+    columns = pa.schema([
+        pa.field("id", pa.int32(), nullable=False),
+        pa.field("symbol", pa.string()),
+    ])
+    root = pathlib.Path(tempfile.mkdtemp(prefix="yggdryl-doc-")) / "trades"
+    table = Table.create(IOBase(root), assign_field_ids(columns))
+
+    # Widen id, rename symbol, add venue - one evolved schema, one commit.
+    with table.update_schema() as update:
+        update.update_type("id", "int64").rename_column("symbol", "ticker")
+        update.add_column("", "venue: string")
+
+    children = list(table.schema.data_type)
+    assert [child.name for child in children] == ["id", "ticker", "venue"]
+    assert str(children[0].data_type) == "int64"
+    # A renamed column keeps its identifier: the name is a label, the id is the column.
+    assert [child.parquet_field_id for child in children] == [1, 2, 3]
+
+    shutil.rmtree(root.parent)
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    // Legal promotions pass; anything else is refused naming both sides.
+    iceberg.canPromote('int32', 'int64')
+    iceberg.canPromote('decimal128(10, 2)', 'decimal128(18, 2)')
+    assert.throws(() => iceberg.canPromote('int64', 'int32'), /int64 to int32/)
+
+    const declared = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int32'), Field.from('symbol: utf8')], {
+        nullable: false,
+      }),
+    )
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-doc-')), 'trades')
+    const table = iceberg.Table.create(root, declared)
+
+    // Widen id, rename symbol, add venue - one evolved schema, one commit.
+    const schemaId = table
+      .updateSchema()
+      .updateType('id', 'int64')
+      .renameColumn('symbol', 'ticker')
+      .addColumn('', 'venue: utf8')
+      .commit()
+    assert.equal(schemaId, 1)
+
+    const evolved = table.schema
+    assert.deepEqual(Array.from(evolved.dataType, (child) => child.name), ['id', 'ticker', 'venue'])
+    assert.equal(String(evolved.dataType.at(0).dataType), 'int64')
+    // A renamed column keeps its identifier: the name is a label, the id is the column.
+    assert.deepEqual(Array.from(evolved.dataType, (child) => child.parquetFieldId), [1, 2, 3])
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
+
+`TableMetadata` carries the rest of the update vocabulary - `set_property`/`remove_property`,
+`set_location`, `assign_uuid`, `upgrade_format_version`, `set_snapshot_ref`/`remove_snapshot_ref`,
+`remove_snapshots`, `add_spec`/`set_default_spec`, `add_sort_order`/`set_default_sort_order` - and
+every one of them commits through the same `commit_changes`, which validates the whole document
+before a byte of it is written. Dropping a column never frees its identifier: `last-column-id` only
+grows, so a reader of an old file can never mistake a retired column for a new one.
+
 ## Schemas as documents
 
 !!! note "All three"
@@ -1412,7 +2450,7 @@ Writing a schema whose columns were never numbered fails, and says so:
     // `required` inverts into nullability, and `id` becomes PARQUET:field_id.
     assert!(!schema.fields()[0].is_nullable());
     assert!(schema.fields()[1].is_nullable());
-    assert_eq!(schema.fields()[0].id()?, Some(1));
+    assert_eq!(schema.fields()[0].parquet_field_id()?, Some(1));
     assert_eq!(schema.fields()[0].get_metadata("PARQUET:field_id"), Some("1"));
 
     // The same document comes back out.
@@ -1441,7 +2479,7 @@ Writing a schema whose columns were never numbered fails, and says so:
     # `required` inverts into nullability, and `id` becomes PARQUET:field_id.
     assert not schema.data_type[0].nullable
     assert schema.data_type[1].nullable
-    assert schema.data_type[0].id == 1
+    assert schema.data_type[0].parquet_field_id == 1
     assert schema.data_type[0]["PARQUET:field_id"] == "1"
 
     # The same document comes back out.
@@ -1471,7 +2509,7 @@ Writing a schema whose columns were never numbered fails, and says so:
     // `required` inverts into nullability, and `id` becomes PARQUET:field_id.
     assert.equal(schema.dataType.at(0).nullable, false)
     assert.equal(schema.dataType.at(1).nullable, true)
-    assert.equal(schema.dataType.at(0).id, 1)
+    assert.equal(schema.dataType.at(0).parquetFieldId, 1)
     assert.equal(schema.dataType.at(0).get('PARQUET:field_id'), '1')
 
     // The same document comes back out.
@@ -1588,8 +2626,23 @@ assert_eq!(
 ```
 
 `int8`, `uint32`, `interval`, `union`, `decimal256`, and any `time` or `timestamp` unit other than
-microsecond and nanosecond have no Iceberg spelling. Widen them yourself before writing, so the
-column type in the table is one you chose.
+microsecond and nanosecond have no Iceberg spelling, and this conversion refuses them rather than
+widening them behind your back - the column type in the table has to be one you chose.
+
+Choosing it is one call: `iceberg` is a
+[schema-compatibility target](datatype.md#compatibility-rewriting) like `spark` and `polars`, so the
+widenings that are lossless are named in one place and applied by the one recursive walker.
+
+```rust
+use yggdryl::iceberg::PrimitiveType;
+use yggdryl::{DataType, Scheme};
+
+// The narrow integers widen; the refusals stay refusals.
+let widened = DataType::Int8.to_scheme_compat(&Scheme::ICEBERG)?;
+assert_eq!(widened, DataType::Int32);
+assert_eq!(PrimitiveType::from_data_type(&widened)?.to_string(), "int");
+assert!(DataType::Interval(yggdryl::TimeUnit::YearMonth).to_scheme_compat(&Scheme::ICEBERG).is_err());
+```
 
 ## Nested types
 
@@ -1623,7 +2676,7 @@ let schema = schema_from_json("row", &document)?;
 let legs = &schema.fields()[0];
 let DataType::List(element) = legs.data_type() else { panic!("expected a list") };
 assert_eq!(element.name(), "element");
-assert_eq!(element.id()?, Some(2));
+assert_eq!(element.parquet_field_id()?, Some(2));
 assert!(!element.is_nullable());
 assert_eq!(element.fields()[0].name(), "price");
 
@@ -1634,7 +2687,7 @@ assert_eq!(map.entries().name(), "entries");
 assert!(!map.entries().is_nullable());
 assert!(!map.entries().fields()[0].is_nullable());
 assert!(map.entries().fields()[1].is_nullable());
-assert_eq!(map.entries().fields()[0].id()?, Some(5));
+assert_eq!(map.entries().fields()[0].parquet_field_id()?, Some(5));
 
 assert_eq!(schema_to_json(&schema)?, document);
 ```
@@ -1675,8 +2728,8 @@ media.write_batch_reader(arrow::batch_reader(
 
 // The ids Iceberg assigned are the ids in the file.
 let written = media.read_field()?;
-assert_eq!(written.fields()[0].id()?, Some(7));
-assert_eq!(written.fields()[1].id()?, Some(8));
+assert_eq!(written.fields()[0].parquet_field_id()?, Some(7));
+assert_eq!(written.fields()[1].parquet_field_id()?, Some(8));
 assert!(!written.fields()[0].is_nullable());
 ```
 
@@ -1704,6 +2757,14 @@ the [`IOBase`](io.md) handle the caller supplies.
 
 No deletes. This module writes and reads data files; position and equality delete files are read as
 manifest content that a scan skips, not produced.
+
+No writes to a branch other than `main`: a commit's parent is always the current snapshot, so a
+branch is read with `scan_ref` and moved with `fast_forward` until commits learn to parent a
+branch's head.
+
+No compare-and-swap. The commit gate re-checks the current version and retries when beaten, but
+`IOBase` cannot make check-then-write atomic, so the guarantee is honest best-effort on plain
+storage and exact only where the storage itself serializes writers.
 
 Two partition transforms can place a row: `identity` and `void`. A write against a spec using
 `bucket`, `truncate`, or a calendar transform is refused by name rather than silently writing rows

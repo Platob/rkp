@@ -685,8 +685,8 @@ handle untouched.
     use yggdryl::{DataType, MimeType};
 
     let field = DataType::from_fields([
-        DataType::Int64.required_field("id").with_id(1),
-        DataType::Utf8.nullable_field("symbol").with_id(2),
+        DataType::Int64.required_field("id").with_parquet_field_id(1),
+        DataType::Utf8.nullable_field("symbol").with_parquet_field_id(2),
     ])?
     .required_field("row");
 
@@ -711,8 +711,8 @@ handle untouched.
 
     // And the recovered Field answers by id rather than by position.
     let recovered = media.read_field()?;
-    assert_eq!(recovered.fields()[0].id()?, Some(1));
-    assert_eq!(recovered.fields()[1].id()?, Some(2));
+    assert_eq!(recovered.fields()[0].parquet_field_id()?, Some(1));
+    assert_eq!(recovered.fields()[1].parquet_field_id()?, Some(2));
     ```
 
 === "Python"
@@ -737,7 +737,7 @@ handle untouched.
     # The ids went into the file, so the recovered Field answers by id rather
     # than by position.
     recovered = handle.read_arrow_field()
-    assert [child.id for child in recovered.data_type] == [1, 2]
+    assert [child.parquet_field_id for child in recovered.data_type] == [1, 2]
     ```
 
 === "JavaScript"
@@ -775,13 +775,13 @@ handle untouched.
     // The ids went into the file, so the recovered Field answers by id rather
     // than by position.
     const recovered = handle.readArrowField()
-    assert.deepEqual([...recovered.dataType].map((child) => child.id), [1, 2])
+    assert.deepEqual([...recovered.dataType].map((child) => child.parquetFieldId), [1, 2])
     assert.equal(recovered.dataType.at(0).get('PARQUET:field_id'), '1')
 
     fs.rmSync(root, { recursive: true, force: true })
     ```
 
-[`Field::with_id`](field.md) stores an identifier under the `PARQUET:field_id` metadata key, which is
+[`Field::with_parquet_field_id`](field.md) stores an identifier under the `PARQUET:field_id` metadata key, which is
 exactly the key the Parquet writer reads when it assigns ids in the file's own schema. Projecting the
 root to Arrow before building the write's reader is what carries them across, and reading reverses
 it. That round trip is

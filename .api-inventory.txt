@@ -113,6 +113,30 @@
   pub fn get_field(&self, index: usize) -> Option<&Field>
   pub fn get_field_by_name(&self, name: &str) -> Option<&Field>
 
+### yggdryl::io::partition  [rust\src\io\partition.rs]
+  pub const NULL_PARTITION: &str = "null";
+  pub fn partition_text(value: &Value) -> Result<SmolStr>
+  pub fn with_partitions( batch: &RecordBatch, partitions: &[(String, String)], field: Option<&Field>, ) -> Result<RecordBatch>
+  pub fn without_partitions( batch: &RecordBatch, partitions: &[(String, String)], ) -> Result<RecordBatch>
+  pub fn partitioned_reader( inner: crate::arrow::BatchReader, partitions: Vec<(String, String)>, field: Option<Field>, ) -> Result<crate::arrow::BatchReader>
+  pub fn narrowed_reader( inner: crate::arrow::BatchReader, partitions: Vec<(String, String)>, schema: Arc<Schema>, ) -> crate::arrow::BatchReader
+
+### yggdryl::generic::typed  [rust\src\generic\typed.rs]
+  pub struct TypedValue<K: FieldType = AnyType>
+  pub fn try_from_parts(data_type: DataType, value: Value) -> Result<Self>
+  pub fn try_from_value(value: Value) -> Result<Self>
+  pub fn from_parts(data_type: DataType, value: Value) -> Result<Self>
+  pub fn from_value(value: Value) -> Result<Self>
+  pub const fn data_type(&self) -> &DataType
+  pub const fn value(&self) -> &Value
+  pub const fn is_null(&self) -> bool
+  pub fn into_parts(self) -> (DataType, Value)
+  pub fn into_value(self) -> Value
+  pub fn into_any(self) -> TypedValue
+  pub fn try_into_typed<J: FieldType>(self) -> Result<TypedValue<J>>
+  pub fn new(value: Value) -> Result<Self>
+  pub type NullValue = TypedValue<scalar::Null>;  // one alias per datatype, through RunEndEncodedValue
+
 ### yggdryl::datatype::parser  [rust\src\datatype\parser.rs]
   pub const PARSE_RECURSION_LIMIT: usize = 64;
   pub fn from_str(input: &str) -> Result<Self>
@@ -368,7 +392,7 @@
   pub const SPARK: Self = Self(SchemeValue::Spark);
   pub const POLARS: Self = Self(SchemeValue::Polars);
   pub const PANDAS: Self = Self(SchemeValue::Pandas);
-  pub const COMPATIBILITY_TARGETS: [Self; 4] = [Self::ARROW, Self::SPARK, Self::POLARS, Self::PANDAS];
+  pub const COMPATIBILITY_TARGETS: [Self; 5] = [Self::ARROW, Self::SPARK, Self::POLARS, Self::PANDAS, Self::ICEBERG];
   pub fn from_str(value: &str) -> Result<Self>
   pub fn as_str(&self) -> &str
   pub const fn is_known(&self) -> bool
@@ -497,7 +521,24 @@
   pub fn catalog_name(&self) -> Option<&str>
   pub fn schema_name(&self) -> Option<&str>
   pub fn table_name(&self) -> Option<&str>
-  pub fn id(&self) -> Result<Option<i32>>
+  pub fn parquet_field_id(&self) -> Result<Option<i32>>
+  pub fn field_by_parquet_field_id(&self, id: i32) -> Option<&Self>
+  pub fn max_parquet_field_id(&self) -> Result<Option<i32>>
+  pub fn assign_parquet_field_ids(&mut self, start: i32) -> Result<i32>
+  pub fn is_partition(&self) -> bool
+  pub fn set_partition(&mut self, partition: bool)
+  pub fn with_partition(mut self, partition: bool) -> Self
+  pub fn partition_fields(&self) -> PartitionFields<'_>
+  pub fn partition_field_names(&self) -> PartitionFieldNames<'_>
+  pub fn partition_field_len(&self) -> usize
+  pub fn has_partition_fields(&self) -> bool
+  pub fn only_partition_fields(&self) -> Result<Self>
+  pub fn without_partition_fields(&self) -> Result<Self>
+  pub fn with_partition_fields(&self, names: &[&str]) -> Result<Self>
+  pub fn protocol(&self, scheme: &Scheme) -> ProtocolMetadata<'_>
+  pub fn protocol_mut(&mut self, scheme: &Scheme) -> ProtocolMetadataMut<'_>
+  pub fn iceberg(&self) -> ProtocolMetadata<'_>
+  pub fn iceberg_mut(&mut self) -> ProtocolMetadataMut<'_>
   pub fn is_init(&self) -> Result<bool>
   pub fn location(&self) -> Result<Option<Url>>
   pub fn accept(&self) -> Option<&str>
@@ -552,11 +593,11 @@
   pub fn set_table_name(&mut self, value: impl Into<String>) -> Result<()>
   pub fn try_with_table_name(mut self, value: impl Into<String>) -> Result<Self>
   pub fn remove_table_name(&mut self) -> Option<String>
-  pub fn set_id(&mut self, id: i32)
-  pub fn with_id(mut self, id: i32) -> Self
+  pub fn set_parquet_field_id(&mut self, id: i32)
+  pub fn with_parquet_field_id(mut self, id: i32) -> Self
   pub fn set_init(&mut self, init: bool)
   pub fn with_init(mut self, init: bool) -> Self
-  pub fn remove_id(&mut self) -> Result<Option<i32>>
+  pub fn remove_parquet_field_id(&mut self) -> Result<Option<i32>>
   pub fn set_location(&mut self, location: Url)
   pub fn with_location(mut self, location: Url) -> Self
   pub fn remove_location(&mut self) -> Result<Option<Url>>
@@ -762,6 +803,9 @@
   pub struct PartitionSpec
   pub const fn unpartitioned() -> Self
   pub fn identity(spec_id: i32, schema: &Field, columns: &[&str]) -> Result<Self>
+  pub fn from_schema(spec_id: i32, schema: &Field) -> Result<Self>
+  pub fn from_field(partition: &Field) -> Result<Self>
+  pub fn mark_partitions(&self, schema: &Field) -> Result<Field>
   pub fn is_unpartitioned(&self) -> bool
   pub fn last_field_id(&self) -> i32
   pub fn source_names(&self, schema: &Field) -> Result<Vec<SmolStr>>
@@ -771,6 +815,62 @@
   pub fn from_json(document: &Value) -> Result<Self>
   pub fn to_json(&self) -> Result<Value>
   pub fn to_v1_json(&self) -> Result<Value>
+
+### yggdryl::iceberg::table (additions)
+  pub fn manifests_at(&self, snapshot: &Snapshot) -> Result<Vec<ManifestFile>>
+  pub fn snapshot_by_ref(&self, name: &str) -> Result<&Snapshot>
+  pub fn plan_at(&self, snapshot_id: i64, filters: &[(&str, &str)]) -> Result<ScanPlan>
+  pub fn scan_at(&self, snapshot_id: i64, filters: &[(&str, &str)], field: Option<&Field>) -> Result<BatchReader>
+  pub fn commit_changes(&mut self, change: impl FnMut(&mut TableMetadata) -> Result<()>) -> Result<()>
+  pub fn inspect_history(&self) -> Result<BatchReader>
+  pub fn inspect_snapshots(&self) -> Result<BatchReader>
+  pub fn inspect_files(&self) -> Result<BatchReader>
+
+### yggdryl::iceberg::evolve  [rust\src\iceberg\evolve.rs]
+  pub fn can_promote(from: &DataType, to: &DataType) -> Result<()>
+  pub struct SchemaUpdate
+  pub fn for_metadata(metadata: &TableMetadata) -> Result<Self>
+  pub fn add_column(&mut self, parent: &str, field: Field)
+  pub fn drop_column(&mut self, path: &str)
+  pub fn rename_column(&mut self, path: &str, name: &str)
+  pub fn update_doc(&mut self, path: &str, doc: &str)
+  pub fn make_nullable(&mut self, path: &str)
+  pub fn update_type(&mut self, path: &str, data_type: DataType)
+  pub fn apply(self) -> Result<Field>
+
+### yggdryl::iceberg::metadata (additions)
+  pub fn set_property(&mut self, key: impl Into<SmolStr>, value: impl Into<SmolStr>) -> Result<Option<SmolStr>>
+  pub fn remove_property(&mut self, key: &str) -> Option<SmolStr>
+  pub fn set_location(&mut self, location: impl Into<SmolStr>)
+  pub fn assign_uuid(&mut self, uuid: impl Into<SmolStr>) -> Result<()>
+  pub fn upgrade_format_version(&mut self, version: FormatVersion) -> Result<()>
+  pub fn set_current_schema(&mut self, schema_id: i32) -> Result<()>
+  pub fn add_spec(&mut self, spec: PartitionSpec) -> Result<i32>
+  pub fn set_default_spec(&mut self, spec_id: i32) -> Result<()>
+  pub fn add_sort_order(&mut self, order: SortOrder) -> Result<i32>
+  pub fn set_default_sort_order(&mut self, order_id: i32) -> Result<()>
+  pub fn set_snapshot_ref(&mut self, name: impl Into<SmolStr>, reference: SnapshotRef) -> Result<()>
+  pub fn remove_snapshot_ref(&mut self, name: &str) -> Option<SnapshotRef>
+  pub fn remove_snapshots(&mut self, ids: &[i64]) -> Result<()>
+  pub fn validate(&self) -> Result<()>
+
+### yggdryl::iceberg::catalog  [rust\src\iceberg\catalog.rs]
+  pub struct Catalog<H: IOBase>
+  pub const fn new(warehouse: H) -> Self
+  pub const fn warehouse(&self) -> &H
+  pub fn create_table(&self, name: &str, schema: Field) -> Result<Table<Holder>>
+  pub fn table(&self, name: &str) -> Result<Table<Holder>>
+  pub fn has_table(&self, name: &str) -> Result<bool>
+  pub fn open_or_create_table(&self, name: &str, schema: Field) -> Result<Table<Holder>>
+  pub fn append(&self, name: &str, batches: BatchReader) -> Result<Table<Holder>>
+  pub fn overwrite(&self, name: &str, batches: BatchReader) -> Result<Table<Holder>>
+  pub fn list_namespaces(&self, parent: Option<&str>) -> Result<Vec<String>>
+  pub fn list_tables(&self, namespace: &str) -> Result<Vec<String>>
+
+### yggdryl::iceberg::table (size and compaction)
+  pub fn target_file_size(&self) -> Result<u64>
+  pub fn compact(&mut self) -> Result<Compaction>
+  pub struct Compaction { pub files_before: usize, pub files_after: usize, pub bytes_rewritten: i64 }
 
 ### yggdryl::iceberg::schema  [rust\src\iceberg\schema.rs]
   pub fn schema_from_json(name: &str, schema: &Value) -> Result<Field>
@@ -808,6 +908,73 @@
   pub fn append(&mut self, batches: BatchReader) -> Result<()>
   pub fn overwrite(&mut self, batches: BatchReader) -> Result<()>
   pub fn evolve_schema(&mut self, schema: Field) -> Result<i32>
+
+### yggdryl::iceberg::snapshot (refs and retention)
+  pub fn tag(snapshot_id: i64) -> Self
+  pub fn is_branch(&self) -> bool
+  pub fn is_tag(&self) -> bool
+  pub fn with_min_snapshots_to_keep(mut self, count: i32) -> Result<Self>
+  pub fn with_max_snapshot_age_ms(mut self, age_ms: i64) -> Result<Self>
+  pub fn with_max_ref_age_ms(mut self, age_ms: i64) -> Result<Self>
+
+### yggdryl::iceberg::metadata (refs and retention)
+  pub fn ref_by_name(&self, name: &str) -> Option<&SnapshotRef>
+  pub fn create_branch(&mut self, name: impl Into<SmolStr>, snapshot_id: i64) -> Result<()>
+  pub fn create_tag(&mut self, name: impl Into<SmolStr>, snapshot_id: i64) -> Result<()>
+  pub fn rename_ref(&mut self, from: &str, to: impl Into<SmolStr>) -> Result<()>
+  pub fn fast_forward_branch(&mut self, name: &str, to_snapshot_id: i64) -> Result<()>
+  pub fn expire_snapshots_older_than(&mut self, older_than_ms: i64) -> Result<Vec<i64>>
+
+### yggdryl::iceberg::options  [rust\src\iceberg\options.rs]
+  pub struct IcebergOptions
+  pub const COMMIT_RETRIES_KEY: &'static str = "commit.retry.num-retries";
+  pub const COMMIT_MIN_BACKOFF_MS_KEY: &'static str = "commit.retry.min-wait-ms";
+  pub const COMMIT_MAX_BACKOFF_MS_KEY: &'static str = "commit.retry.max-wait-ms";
+  pub const TARGET_FILE_SIZE_KEY: &'static str = "write.target-file-size-bytes";
+  pub const READ_PARALLELISM_KEY: &'static str = "read.parallelism";
+  pub const READ_PARALLEL_MIN_FILES_KEY: &'static str = "read.parallel.min-files";
+  pub const READ_PARALLEL_MIN_FILE_SIZE_KEY: &'static str = "read.parallel.min-file-size-bytes";
+  pub const DEFAULT_COMMIT_RETRIES: u32 = 4;
+  pub const DEFAULT_COMMIT_MIN_BACKOFF_MS: u64 = 100;
+  pub const DEFAULT_COMMIT_MAX_BACKOFF_MS: u64 = 60_000;
+  pub const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+  pub const DEFAULT_READ_PARALLEL_MIN_FILES: usize = 16;
+  pub const DEFAULT_READ_PARALLEL_MIN_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
+  pub fn new() -> Self
+  pub fn default_read_parallelism() -> usize
+  pub fn commit_retries(&self) -> u32
+  pub fn commit_min_backoff_ms(&self) -> u64
+  pub fn commit_max_backoff_ms(&self) -> u64
+  pub fn target_file_size_bytes(&self) -> u64
+  pub fn read_parallelism(&self) -> usize
+  pub fn read_parallel_min_files(&self) -> usize
+  pub fn read_parallel_min_file_size_bytes(&self) -> u64
+  pub fn set_commit_retries(&mut self, retries: u32)
+  pub fn with_commit_retries(mut self, retries: u32) -> Self
+  pub fn set_commit_min_backoff_ms(&mut self, wait_ms: u64)
+  pub fn with_commit_min_backoff_ms(mut self, wait_ms: u64) -> Self
+  pub fn set_commit_max_backoff_ms(&mut self, wait_ms: u64)
+  pub fn with_commit_max_backoff_ms(mut self, wait_ms: u64) -> Self
+  pub fn set_target_file_size_bytes(&mut self, bytes: u64) -> Result<()>
+  pub fn try_with_target_file_size_bytes(mut self, bytes: u64) -> Result<Self>
+  pub fn set_read_parallelism(&mut self, threads: usize) -> Result<()>
+  pub fn try_with_read_parallelism(mut self, threads: usize) -> Result<Self>
+  pub fn set_read_parallel_min_files(&mut self, files: usize)
+  pub fn with_read_parallel_min_files(mut self, files: usize) -> Self
+  pub fn set_read_parallel_min_file_size_bytes(&mut self, bytes: u64)
+  pub fn with_read_parallel_min_file_size_bytes(mut self, bytes: u64) -> Self
+  pub fn for_metadata(metadata: &TableMetadata) -> Result<Self>
+
+### yggdryl::iceberg::table (options, refs, concurrency)
+  pub fn set_options(&mut self, options: IcebergOptions)
+  pub fn options(&self) -> Result<IcebergOptions>
+  pub fn create_branch(&mut self, name: &str, snapshot_id: i64) -> Result<()>
+  pub fn create_tag(&mut self, name: &str, snapshot_id: i64) -> Result<()>
+  pub fn remove_ref(&mut self, name: &str) -> Result<SnapshotRef>
+  pub fn fast_forward(&mut self, name: &str, snapshot_id: i64) -> Result<()>
+  pub fn expire_snapshots(&mut self, older_than_ms: i64) -> Result<Vec<i64>>
+  pub fn scan_ref(&self, name: &str, filters: &[(&str, &str)], field: Option<&Field>) -> Result<BatchReader>
+  pub struct CommitConflict { pub expected_version: u32, pub beaten: u32, pub last_seen_version: u32 }
 
 ### yggdryl::iceberg::types  [rust\src\iceberg\types.rs]
   pub enum PrimitiveType
@@ -946,6 +1113,54 @@
   pub fn has_property(&self, scheme: &Scheme, name: &str) -> bool
   pub fn property_iter<'metadata, 'scheme>( &'metadata self, scheme: &'scheme Scheme, ) -> PropertyIter<'metadata, 'scheme>
   pub fn next_property_entry<'metadata>( &'metadata self, scheme: &Scheme, after_name: Option<&str>, ) -> Option<(&'metadata str, &'metadata str)>
+  pub fn protocol(&self, scheme: &Scheme) -> ProtocolMetadata<'_>
+  pub fn http(&self) -> ProtocolMetadata<'_>
+  pub fn file(&self) -> ProtocolMetadata<'_>
+  pub fn urn(&self) -> ProtocolMetadata<'_>
+  pub fn postgres(&self) -> ProtocolMetadata<'_>
+  pub fn postgresql(&self) -> ProtocolMetadata<'_>
+  pub fn mysql(&self) -> ProtocolMetadata<'_>
+  pub fn arrow(&self) -> ProtocolMetadata<'_>
+  pub fn sql(&self) -> ProtocolMetadata<'_>
+  pub fn glue(&self) -> ProtocolMetadata<'_>
+  pub fn iceberg(&self) -> ProtocolMetadata<'_>
+  pub fn fix(&self) -> ProtocolMetadata<'_>
+  pub fn field(&self) -> ProtocolMetadata<'_>
+  pub fn dtype(&self) -> ProtocolMetadata<'_>
+  pub fn s3(&self) -> ProtocolMetadata<'_>
+  pub fn gs(&self) -> ProtocolMetadata<'_>
+  pub fn az(&self) -> ProtocolMetadata<'_>
+  pub fn spark(&self) -> ProtocolMetadata<'_>
+  pub fn polars(&self) -> ProtocolMetadata<'_>
+  pub fn pandas(&self) -> ProtocolMetadata<'_>
+  pub struct ProtocolMetadata<'metadata>
+  pub const fn scheme(&self) -> &Scheme
+  pub fn prefix(&self) -> &str
+  pub fn key(&self, name: &str) -> String
+  pub fn get(&self, name: &str) -> Option<&'metadata str>
+  pub fn contains_key(&self, name: &str) -> bool
+  pub fn len(&self) -> usize
+  pub fn is_empty(&self) -> bool
+  pub fn iter(&self) -> PropertyIter<'metadata, '_>
+  pub fn next_entry(&self, after_name: Option<&str>) -> Option<(&'metadata str, &'metadata str)>
+  pub const fn as_metadata(&self) -> &'metadata Metadata
+  pub fn to_metadata(&self) -> Result<Metadata>
+  pub struct ProtocolMetadataMut<'field>
+  pub const fn scheme(&self) -> &Scheme
+  pub fn prefix(&self) -> &str
+  pub fn key(&self, name: &str) -> String
+  pub fn as_protocol(&self) -> ProtocolMetadata<'_>
+  pub fn get(&self, name: &str) -> Option<&str>
+  pub fn contains_key(&self, name: &str) -> bool
+  pub fn len(&self) -> usize
+  pub fn is_empty(&self) -> bool
+  pub fn iter(&self) -> PropertyIter<'_, '_>
+  pub fn next_entry(&self, after_name: Option<&str>) -> Option<(&str, &str)>
+  pub fn insert(&mut self, name: &str, value: impl Into<String>) -> Result<Option<String>>
+  pub fn update<I, N, V>(&mut self, entries: I) -> Result<()> where I: IntoIterator<Item = (N, V)>, N: AsRef<str>, V: Into<String>,
+  pub fn set<I, N, V>(&mut self, entries: I) -> Result<()> where I: IntoIterator<Item = (N, V)>, N: AsRef<str>, V: Into<String>,
+  pub fn remove(&mut self, name: &str) -> Option<String>
+  pub fn clear(&mut self)
   pub fn accept(&self) -> Option<&str>
   pub fn accept_encoding(&self) -> Option<&str>
   pub fn accept_language(&self) -> Option<&str>

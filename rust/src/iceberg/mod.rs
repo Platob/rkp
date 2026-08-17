@@ -64,7 +64,7 @@
 //!
 //! let schema = schema_from_json("row", &document)?;
 //! assert_eq!(schema.field_len(), 2);
-//! assert_eq!(schema.fields()[0].id()?, Some(1));
+//! assert_eq!(schema.fields()[0].parquet_field_id()?, Some(1));
 //! assert!(!schema.fields()[0].is_nullable());
 //!
 //! // And writes back to the same document.
@@ -90,8 +90,12 @@
 //! file belongs to.
 
 mod avro;
+mod catalog;
+mod evolve;
+mod inspect;
 mod manifest;
 mod metadata;
+mod options;
 mod partition;
 mod scan;
 mod schema;
@@ -101,16 +105,19 @@ mod table;
 mod types;
 mod value;
 
+pub use catalog::Catalog;
+pub use evolve::{SchemaUpdate, can_promote};
 pub use manifest::{
     DataFile, EntryStatus, FieldSummary, FileFormat, ManifestContent, ManifestEntry, ManifestFile,
     read_manifest, read_manifest_list, read_manifest_spec, write_manifest, write_manifest_list,
 };
 pub use metadata::{FormatVersion, SortField, SortOrder, TableMetadata};
+pub use options::IcebergOptions;
 pub use partition::{FIRST_PARTITION_ID, PartitionField, PartitionSpec, Transform};
 pub use scan::{ScanPlan, ScanTask};
 pub use schema::{assign_field_ids, last_field_id, schema_from_json, schema_to_json};
 pub use snapshot::{MAIN_BRANCH, Snapshot, SnapshotRef};
-pub use table::Table;
+pub use table::{CommitConflict, Compaction, Table};
 pub use types::PrimitiveType;
 
 use crate::Result;

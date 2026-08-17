@@ -5,12 +5,14 @@ export {
   IOBase,
   MediaType,
   MimeType,
+  ProtocolMetadata,
   RecordOptions,
   Timezone,
   Uri,
   Url,
   Urn,
   Value,
+  type Compaction,
   type FieldBound,
   type FieldCount,
   type ManifestFileView,
@@ -30,6 +32,7 @@ import type {
   MetadataEntry,
   MimeType,
   PartitionEntry,
+  ProtocolMetadata,
   RecordOptions,
   Timezone,
   Uri,
@@ -39,7 +42,7 @@ import type {
 } from './index'
 // The Iceberg values are reached through the `iceberg` namespace, so they are
 // imported here as values to type it and re-exported as types only.
-import { DataFile, PartitionSpec, Table } from './index'
+import { Catalog, DataFile, PartitionSpec, Table } from './index'
 import type {
   RecordBatch as ArrowRecordBatch,
   Table as ArrowTable,
@@ -47,7 +50,7 @@ import type {
 import type { Buffer } from 'node:buffer'
 import type { URL as NodeURL } from 'node:url'
 
-export type { DataFile, PartitionSpec, Table }
+export type { Catalog, DataFile, PartitionSpec, Table }
 
 /** A native MIME wrapper or canonical MIME/extension string. */
 export type MimeTypeInput = MimeType | string
@@ -201,7 +204,12 @@ interface DataTypeKindById {
 export type DataTypeKindOf<K extends DataTypeId> = DataTypeKindById[K]
 
 /** Core compatibility targets supported by DataType and Field projection. */
-export type CompatibilityScheme = 'arrow' | 'spark'
+export type CompatibilityScheme =
+  | 'arrow'
+  | 'spark'
+  | 'polars'
+  | 'pandas'
+  | 'iceberg'
 
 declare const yggdrylHintValue: unique symbol
 
@@ -867,6 +875,9 @@ declare module './index' {
   namespace Field {
     function fromArrow(value: Field | string | ArrowStringCompatible): Field
   }
+  interface ProtocolMetadata extends Iterable<readonly [string, string]> {
+    update(values: FieldMetadataInput): void
+  }
   namespace MimeType {
     const OCTET_STREAM: MimeType
     const JSON: MimeType
@@ -965,6 +976,18 @@ declare module './index' {
     | ReadonlyMap<string, string>
     | Iterable<readonly [string, string]>
     | readonly PartitionEntry[]
+  /** A table schema: a root `Field`, an expression, or the child `Field`s. */
+  type TableSchemaInput = Field | string | readonly Field[]
+  /** A native root `Field`, or the field expression naming one. */
+  type FieldInput = Field | string
+  /** A native `DataType`, or the type expression naming one. */
+  type DataTypeInput = DataType | string
+  /** The `bigint` a snapshot reports, or a number no larger than 2^53. */
+  type SnapshotIdInput = bigint | number
+  /** Scan filters: the same `(column, value)` pairs `childrenWhere` takes. */
+  type ScanFilters = PartitionFilters
+  /** Property updates as an object, a `Map`, or an entry sequence. */
+  type PropertyUpdates = FieldMetadataInput
 
   /** Iterating a handle lists its immediate children. */
   interface IOBase extends Iterable<IOBase> {
@@ -1028,6 +1051,15 @@ declare module './index' {
     scan(field?: SchemaInput | null): BatchReader
     /** Add a schema, make it current, and write a new metadata document. */
     evolveSchema(schema: SchemaInput): number
+    /** Record a chain of column operations, committed as one new schema. */
+    updateSchema(): SchemaUpdateBuilder
+  }
+
+  interface Catalog {
+    /** Append rows to the named table, creating it on first write. */
+    append(name: string, data: BatchSource): Table
+    /** Replace the named table's rows, creating it on first write. */
+    overwrite(name: string, data: BatchSource): Table
   }
 
   namespace Timezone {
@@ -1062,9 +1094,41 @@ export type RecordOptionsInput = RecordOptions | MediaTypeInput
 export type PartitionInput = PartitionSpec | readonly string[]
 /** A native root `Field`, or the field expression naming one. */
 export type SchemaInput = Field | string
+/** A table schema: a root `Field`, an expression, or the child `Field`s. */
+export type TableSchemaInput = Field | string | readonly Field[]
+
+/**
+ * A chainable recording of column operations against a table's schema.
+ *
+ * `Table.updateSchema()` hands one out; each call records without touching
+ * anything, and `commit()` replays the chain onto the schema the table has
+ * then, adds the evolved schema, makes it current, and writes one new
+ * metadata document, returning the new schema's identifier.
+ */
+export interface SchemaUpdate {
+  /** Record a new column under `parent` - `''` names the root itself. */
+  addColumn(parent: string, field: SchemaInput): SchemaUpdate
+  /** Record the removal of the column at `path`, retiring its identifier. */
+  dropColumn(path: string): SchemaUpdate
+  /** Record a rename of the column at `path`; its identifier is kept. */
+  renameColumn(path: string, name: string): SchemaUpdate
+  /** Record a new `iceberg:doc` documentation string on the column at `path`. */
+  updateDoc(path: string, doc: string): SchemaUpdate
+  /** Record that the column at `path` becomes optional. */
+  makeNullable(path: string): SchemaUpdate
+  /** Record a type promotion on the column at `path`. */
+  updateType(path: string, dataType: DataTypeInput): SchemaUpdate
+  /** Replay the chain, make the evolved schema current, and commit once. */
+  commit(): number
+}
+// The augmentation block below resolves bare `SchemaUpdate` against the
+// generated module, so the chainable interface travels under an alias.
+type SchemaUpdateBuilder = SchemaUpdate
 
 /** `yggdryl::iceberg`: the table format, over the record encodings. */
 export interface Iceberg {
+  /** A warehouse folder of namespaces of Iceberg tables. */
+  readonly Catalog: typeof Catalog
   /** An Iceberg table reached entirely through one container handle. */
   readonly Table: typeof Table
   /** How a table turns column values into the directories it writes. */
@@ -1073,6 +1137,8 @@ export interface Iceberg {
   readonly DataFile: typeof DataFile
   /** Number every column of a schema, so a table can carry it. */
   assignFieldIds(schema: Field, start?: number): Field
+  /** Throw the core message when a type change is not a legal promotion. */
+  canPromote(fromType: DataTypeInput, toType: DataTypeInput): void
   /** Read an Iceberg schema document as a root `Field`. */
   schemaFromJson(name: string, document: Value | unknown): Field
   /** Write a root `Field` as an Iceberg schema document. */

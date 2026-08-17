@@ -22,12 +22,35 @@ pub(crate) mod sealed {
 /// Marker implementations validate the variant only. Parameters such as a
 /// decimal precision, timestamp unit, or list child remain in the wrapped
 /// [`Field`], so the typed view never duplicates schema state.
+///
+/// [`AnyType`] is the one marker that names no variant: it accepts every
+/// datatype, which is what a value or field that has not been narrowed yet
+/// carries.
 pub trait FieldType: sealed::Sealed + Copy + Default + fmt::Debug + Send + Sync + 'static {
     /// The canonical, parameter-independent datatype name.
     const NAME: &'static str;
 
     /// Returns whether `data_type` has this marker's variant.
     fn matches(data_type: &DataType) -> bool;
+}
+
+/// The marker every datatype satisfies.
+///
+/// A marker usually narrows a value to one variant. This one narrows nothing,
+/// so it is what an unnarrowed pairing such as [`crate::TypedValue`] carries by
+/// default: the datatype is still checked against the value, and the marker
+/// simply has no opinion about which datatype that was.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AnyType;
+
+impl sealed::Sealed for AnyType {}
+
+impl FieldType for AnyType {
+    const NAME: &'static str = "any";
+
+    fn matches(_data_type: &DataType) -> bool {
+        true
+    }
 }
 
 /// An owned field whose datatype variant is checked at construction.

@@ -17,15 +17,18 @@ use pyo3::types::{PyDict, PyTuple, PyType};
 
 use yggdryl::generic::Holder;
 use yggdryl::iceberg::{
-    DataFile, FormatVersion, ManifestContent, ManifestFile, PartitionField, PartitionSpec,
-    Snapshot, Table, assign_field_ids, schema_from_json, schema_to_json,
+    Catalog, Compaction, DataFile, FormatVersion, ManifestContent, ManifestFile, PartitionField,
+    PartitionSpec, SchemaUpdate, Snapshot, Table, assign_field_ids, can_promote, schema_from_json,
+    schema_to_json,
 };
 use yggdryl::io::IOBase as _;
-use yggdryl::{Field as CoreField, Value};
+use yggdryl::{DataType as CoreDataType, Field as CoreField, Value};
 
-use crate::field::PyField;
+use crate::datatype::core_data_type_from_value;
+use crate::field::{PyField, core_field_from_value};
 use crate::io::PyIOBase;
 use crate::record::{batch_reader_from_value, batch_reader_to_pyarrow, core_root_field_from_value};
+use crate::uri::core_url_from_value;
 use crate::value_error;
 
 /// The root name given to a schema that arrives as a bare Arrow schema.
@@ -85,6 +88,25 @@ pub(crate) fn iceberg_schema_to_json(
     crate::value::as_py(py, &document)
 }
 
+/// Check one type change against the promotions Iceberg allows.
+///
+/// Both sides accept anything a datatype crosses the boundary as: the native
+/// wrapper, a datatype expression, or a `PyArrow` type. A legal promotion
+/// returns `None`, because the question is "may I", not "how".
+///
+/// # Errors
+///
+/// Raises `ValueError` naming both types for every other change.
+#[pyfunction(name = "can_promote")]
+pub(crate) fn iceberg_can_promote(
+    from_type: &Bound<'_, PyAny>,
+    to_type: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let from_type = core_data_type_from_value(from_type)?;
+    let to_type = core_data_type_from_value(to_type)?;
+    can_promote(&from_type, &to_type).map_err(value_error)
+}
+
 /// Read a core format version out of the number or name Python spells it with.
 fn format_version_from_value(value: &Bound<'_, PyAny>) -> PyResult<FormatVersion> {
     if let Ok(number) = value.extract::<i64>() {
@@ -134,6 +156,200 @@ fn bounds_by_id<'py>(py: Python<'py>, bounds: &[(i32, Vec<u8>)]) -> PyResult<Bou
         mapping.set_item(id, pyo3::types::PyBytes::new(py, value))?;
     }
     Ok(mapping)
+}
+
+/// Read a schema root out of what Python describes a table's columns with.
+///
+/// Everything [`PyTable::create`] accepts passes through the same boundary
+/// helper unchanged; a plain iterable of Fields is assembled into a struct
+/// root besides, because a caller building columns one by one holds exactly
+/// that.
+fn catalog_schema_from_value(value: &Bound<'_, PyAny>) -> PyResult<CoreField> {
+    if value.extract::<PyRef<'_, PyField>>().is_ok()
+        || value.extract::<&str>().is_ok()
+        || value.hasattr("__arrow_c_schema__")?
+    {
+        return core_root_field_from_value(value, SCHEMA_ROOT_NAME);
+    }
+    if let Ok(items) = value.try_iter() {
+        let mut fields = Vec::new();
+        for item in items {
+            fields.push(core_field_from_value(&item?)?);
+        }
+        let data_type = CoreDataType::from_fields(fields).map_err(value_error)?;
+        return Ok(data_type.required_field(SCHEMA_ROOT_NAME));
+    }
+    core_root_field_from_value(value, SCHEMA_ROOT_NAME)
+}
+
+/// Read `(key, value)` string pairs out of a mapping or an iterable of pairs.
+///
+/// These are the two shapes `IOBase.children_where` already accepts for the
+/// same vocabulary, so a filter and a property update are spelled alike.
+fn string_pairs_from_value(value: &Bound<'_, PyAny>) -> PyResult<Vec<(String, String)>> {
+    let items = if value.hasattr("items")? {
+        value.call_method0("items")?
+    } else {
+        value.clone()
+    };
+    let mut pairs = Vec::new();
+    for item in items.try_iter()? {
+        pairs.push(item?.extract::<(String, String)>()?);
+    }
+    Ok(pairs)
+}
+
+/// Read the `(column, value)` filter pairs a scan takes; `None` means none.
+fn filter_pairs_from_value(value: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(String, String)>> {
+    match value {
+        Some(value) => string_pairs_from_value(value),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Read a warehouse folder out of what Python names one with.
+///
+/// A handle is taken as the folder it addresses - the same inference
+/// [`PyTable::create`]'s `root` runs through - and a string, path-like, or URL
+/// describes one. Per the laziness contract, naming a folder that does not
+/// exist yet touches nothing and is not an error.
+fn folder_holder_from_value(value: &Bound<'_, PyAny>) -> PyResult<Holder> {
+    if let Ok(handle) = value.extract::<PyRef<'_, PyIOBase>>() {
+        return handle.folder_holder();
+    }
+    let url = core_url_from_value(value)?;
+    Holder::folder(url.to_path().map_err(value_error)?).map_err(value_error)
+}
+
+/// A warehouse folder of namespaces of Iceberg tables.
+///
+/// The catalog is a description of where tables live, not proof that any do:
+/// constructing one touches nothing, and every operation resolves its dotted
+/// name - `"nyc.taxis"` is the folder `nyc/taxis` - against the warehouse
+/// handle at the moment it runs.
+#[pyclass(name = "Catalog", module = "yggdryl._native", skip_from_py_object)]
+pub(crate) struct PyCatalog {
+    inner: Catalog<Holder>,
+}
+
+#[pymethods]
+impl PyCatalog {
+    /// Describe a catalog over a warehouse folder, touching nothing.
+    ///
+    /// `warehouse` accepts an [`IOBase`][crate::io::PyIOBase] handle or
+    /// anything that names a folder location: a string, a path-like, a
+    /// [`Url`][crate::uri::PyUrl].
+    #[new]
+    fn new(warehouse: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            inner: Catalog::new(folder_holder_from_value(warehouse)?),
+        })
+    }
+
+    /// The warehouse folder the catalog resolves names against.
+    #[getter]
+    fn warehouse(&self) -> PyResult<PyIOBase> {
+        Ok(PyIOBase::from_core(
+            Holder::folder(
+                self.inner
+                    .warehouse()
+                    .url()
+                    .ok_or_else(|| PyValueError::new_err("this catalog has no location"))?
+                    .to_path()
+                    .map_err(value_error)?,
+            )
+            .map_err(value_error)?,
+        ))
+    }
+
+    /// Create the named table, writing its first metadata document.
+    ///
+    /// Unnumbered schema fields are numbered, and the partition spec is derived
+    /// from the columns the schema itself marks - a schema that marks none
+    /// produces an unpartitioned table.
+    fn create_table(&self, name: &str, schema: &Bound<'_, PyAny>) -> PyResult<PyTable> {
+        let schema = catalog_schema_from_value(schema)?;
+        self.inner
+            .create_table(name, schema)
+            .map(PyTable::from_core)
+            .map_err(value_error)
+    }
+
+    /// Open the named table.
+    fn table(&self, name: &str) -> PyResult<PyTable> {
+        self.inner
+            .table(name)
+            .map(PyTable::from_core)
+            .map_err(value_error)
+    }
+
+    /// Return whether the named table exists.
+    fn has_table(&self, name: &str) -> PyResult<bool> {
+        self.inner.has_table(name).map_err(value_error)
+    }
+
+    /// Open the named table if it exists, creating it otherwise.
+    ///
+    /// An existing table is opened as it is - `schema` describes only the
+    /// table this call would create.
+    fn open_or_create_table(&self, name: &str, schema: &Bound<'_, PyAny>) -> PyResult<PyTable> {
+        let schema = catalog_schema_from_value(schema)?;
+        self.inner
+            .open_or_create_table(name, schema)
+            .map(PyTable::from_core)
+            .map_err(value_error)
+    }
+
+    /// Append `data` to the named table, creating it on first write.
+    ///
+    /// A table that is not there yet takes its schema from the rows: partition
+    /// marks riding the Arrow fields' metadata become the spec, so a marked
+    /// schema lays its files out partitioned from the very first append.
+    /// Returns the table so the caller can keep going.
+    fn append(&self, name: &str, data: &Bound<'_, PyAny>) -> PyResult<PyTable> {
+        let data = batch_reader_from_value(data)?;
+        self.inner
+            .append(name, data)
+            .map(PyTable::from_core)
+            .map_err(value_error)
+    }
+
+    /// Replace the named table's rows with `data`, creating it on first write.
+    ///
+    /// An existing table keeps its previous snapshot readable, which is what
+    /// makes the overwrite reversible. Returns the table so the caller can
+    /// keep going.
+    fn overwrite(&self, name: &str, data: &Bound<'_, PyAny>) -> PyResult<PyTable> {
+        let data = batch_reader_from_value(data)?;
+        self.inner
+            .overwrite(name, data)
+            .map(PyTable::from_core)
+            .map_err(value_error)
+    }
+
+    /// List the namespaces one level below `parent`, as dotted names.
+    ///
+    /// `None` lists the warehouse's own child folders. A parent that does not
+    /// exist lists nothing rather than failing.
+    #[pyo3(signature = (parent = None))]
+    fn list_namespaces(&self, parent: Option<&str>) -> PyResult<Vec<String>> {
+        self.inner.list_namespaces(parent).map_err(value_error)
+    }
+
+    /// List the tables in a namespace, as sorted dotted names.
+    fn list_tables(&self, namespace: &str) -> PyResult<Vec<String>> {
+        self.inner.list_tables(namespace).map_err(value_error)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Catalog({:?})",
+            self.inner
+                .warehouse()
+                .url()
+                .map_or_else(|| "<memory>".to_owned(), ToString::to_string),
+        )
+    }
 }
 
 /// An Iceberg table reached entirely through one container handle.
@@ -395,12 +611,456 @@ impl PyTable {
         self.inner.evolve_schema(schema).map_err(value_error)
     }
 
+    /// Read one retained snapshot's rows: time travel as an ordinary scan.
+    ///
+    /// The rows are read as the schema that was current when the snapshot was
+    /// written. `filters` is a mapping or a sequence of `(column, value)`
+    /// pairs - the vocabulary `IOBase.children_where` uses - answered by the
+    /// plan for a partition column and row by row for every other; `schema`
+    /// keeps the columns it names, exactly as `scan` does.
+    #[pyo3(signature = (snapshot_id, filters = None, schema = None))]
+    fn scan_at<'py>(
+        &self,
+        py: Python<'py>,
+        snapshot_id: i64,
+        filters: Option<&Bound<'_, PyAny>>,
+        schema: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pairs = filter_pairs_from_value(filters)?;
+        let borrowed: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_str()))
+            .collect();
+        let field = schema
+            .map(|schema| core_root_field_from_value(schema, SCHEMA_ROOT_NAME))
+            .transpose()?;
+        let reader = self
+            .inner
+            .scan_at(snapshot_id, &borrowed, field.as_ref())
+            .map_err(value_error)?;
+        batch_reader_to_pyarrow(py, reader)
+    }
+
+    /// Return the retained snapshot a branch or tag names.
+    ///
+    /// The `main` branch follows the current snapshot, so a table that has
+    /// been written to always answers for it.
+    fn snapshot_by_ref(&self, name: &str) -> PyResult<PySnapshot> {
+        self.inner
+            .snapshot_by_ref(name)
+            .cloned()
+            .map(PySnapshot::from_core)
+            .map_err(value_error)
+    }
+
+    /// The size a data file aims for, in bytes.
+    ///
+    /// The table property `write.target-file-size-bytes` decides, falling back
+    /// to the schema root's `iceberg:` protocol property of the same name and
+    /// then to Iceberg's own 512 MiB default.
+    #[getter]
+    fn target_file_size(&self) -> PyResult<u64> {
+        self.inner.target_file_size().map_err(value_error)
+    }
+
+    /// Merge the current snapshot's undersized data files, partition by
+    /// partition, as one `replace` snapshot.
+    ///
+    /// A table with nothing to compact is left exactly as it is: no snapshot
+    /// is committed and the returned [`PyCompaction`] is all zeros.
+    fn compact(&mut self) -> PyResult<PyCompaction> {
+        self.inner
+            .compact()
+            .map(PyCompaction::from_core)
+            .map_err(value_error)
+    }
+
+    /// Render when each snapshot became current, oldest first.
+    ///
+    /// The columns are `made_current_at`, `snapshot_id`, `parent_id`, and
+    /// `is_current_ancestor`, the names `PyIceberg`'s `history` table uses.
+    fn inspect_history<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let reader = self.inner.inspect_history().map_err(value_error)?;
+        batch_reader_to_pyarrow(py, reader)
+    }
+
+    /// Render every retained snapshot with its operation and summary.
+    ///
+    /// The columns are `committed_at`, `snapshot_id`, `parent_id`,
+    /// `operation`, `manifest_list`, and the free-form `summary` map.
+    fn inspect_snapshots<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let reader = self.inner.inspect_snapshots().map_err(value_error)?;
+        batch_reader_to_pyarrow(py, reader)
+    }
+
+    /// Render the live data files of the current snapshot.
+    ///
+    /// The columns are `file_path`, `file_format`, `spec_id`, the rendered
+    /// `partition` chain, `record_count`, and `file_size_in_bytes`.
+    fn inspect_files<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let reader = self.inner.inspect_files().map_err(value_error)?;
+        batch_reader_to_pyarrow(py, reader)
+    }
+
+    /// Set and remove free-form table properties as one metadata commit.
+    ///
+    /// `updates` is a mapping or a sequence of `(key, value)` pairs and
+    /// `removes` an iterable of keys; the updates land first, so a key named
+    /// by both ends up removed. A call given neither commits nothing at all.
+    #[pyo3(signature = (updates = None, removes = None))]
+    fn update_properties(
+        &mut self,
+        updates: Option<&Bound<'_, PyAny>>,
+        removes: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let updates = match updates {
+            Some(value) => string_pairs_from_value(value)?,
+            None => Vec::new(),
+        };
+        let removes = match removes {
+            Some(value) => crate::media::strings_from_iterable(value, "removes")?,
+            None => Vec::new(),
+        };
+        if updates.is_empty() && removes.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .commit_changes(|metadata| {
+                for (key, value) in &updates {
+                    metadata.set_property(key.as_str(), value.as_str())?;
+                }
+                for key in &removes {
+                    metadata.remove_property(key);
+                }
+                Ok(())
+            })
+            .map_err(value_error)
+    }
+
+    /// Start recording a column-level schema evolution against this table.
+    ///
+    /// The recording methods touch nothing; [`PySchemaUpdate::commit`] plays
+    /// them back through the core evolution rules and writes one new metadata
+    /// document. `with table.update_schema() as update:` commits on a clean
+    /// exit and discards on an exception.
+    fn update_schema(slf: &Bound<'_, Self>) -> PySchemaUpdate {
+        PySchemaUpdate {
+            table: slf.clone().unbind(),
+            ops: Vec::new(),
+            consumed: false,
+        }
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Table({:?}, format_version={}, version={})",
             self.inner.metadata().location.as_str(),
             self.inner.metadata().format_version.number(),
             self.inner.version(),
+        )
+    }
+}
+
+/// One recorded column operation, held until its update commits.
+///
+/// This mirrors the core's own recording: inference happens when the caller
+/// speaks - a field or datatype argument is read at the boundary - and the
+/// operation itself runs in Rust when the update is played back.
+enum RecordedOp {
+    /// Append a column to the root (`""`) or to a nested struct.
+    AddColumn {
+        /// The dotted path of the struct the column lands under.
+        parent: String,
+        /// The column itself; stale identifiers are stripped on apply.
+        field: CoreField,
+    },
+    /// Remove a column, retiring its identifier forever.
+    DropColumn {
+        /// The dotted path of the column.
+        path: String,
+    },
+    /// Rename a column, keeping its identifier.
+    RenameColumn {
+        /// The dotted path of the column.
+        path: String,
+        /// The new name.
+        name: String,
+    },
+    /// Set a column's `iceberg:doc` documentation string.
+    UpdateDoc {
+        /// The dotted path of the column.
+        path: String,
+        /// The documentation string.
+        doc: String,
+    },
+    /// Relax a required column to optional.
+    MakeNullable {
+        /// The dotted path of the column.
+        path: String,
+    },
+    /// Promote a column's type, gated by the legal Iceberg promotions.
+    UpdateType {
+        /// The dotted path of the column.
+        path: String,
+        /// The promoted type.
+        data_type: CoreDataType,
+    },
+}
+
+/// A recorded set of column operations against one table's current schema.
+///
+/// Built by `Table.update_schema`. Each recording method returns the update
+/// itself so calls chain, and `commit` plays the operations back onto the
+/// table's metadata - added columns numbered above `last-column-id`, renames
+/// keeping their identifier, promotions gated by `can_promote` - as one new
+/// metadata document. Used as a context manager, a clean exit commits and an
+/// exception discards.
+#[pyclass(name = "SchemaUpdate", module = "yggdryl._native", skip_from_py_object)]
+pub(crate) struct PySchemaUpdate {
+    /// The table the update was started from and commits back to.
+    table: Py<PyTable>,
+    /// The recorded operations, in call order.
+    ops: Vec<RecordedOp>,
+    /// Whether the update has already committed or been discarded.
+    consumed: bool,
+}
+
+impl PySchemaUpdate {
+    /// Refuse an update that has already committed or been discarded.
+    fn check_open(&self) -> PyResult<()> {
+        if self.consumed {
+            return Err(PyValueError::new_err(
+                "expected an open schema update, got one already committed or discarded",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl PySchemaUpdate {
+    /// Record a new column under `parent` - `""` for the root, a dotted path
+    /// for a nested struct.
+    ///
+    /// `field` accepts anything a Field crosses the boundary as: the native
+    /// wrapper, a field expression, a `PyArrow` field. On commit the column is
+    /// numbered fresh above the table's `last-column-id`, so a retired
+    /// identifier is never reused.
+    fn add_column<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        parent: &str,
+        field: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.check_open()?;
+        let field = core_field_from_value(field)?;
+        slf.ops.push(RecordedOp::AddColumn {
+            parent: parent.to_owned(),
+            field,
+        });
+        Ok(slf)
+    }
+
+    /// Record the removal of the column at `path`, retiring its identifier.
+    fn drop_column<'py>(mut slf: PyRefMut<'py, Self>, path: &str) -> PyResult<PyRefMut<'py, Self>> {
+        slf.check_open()?;
+        slf.ops.push(RecordedOp::DropColumn {
+            path: path.to_owned(),
+        });
+        Ok(slf)
+    }
+
+    /// Record a rename of the column at `path`; its identifier is kept, which
+    /// is what keeps the rows written under the old name readable.
+    fn rename_column<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        path: &str,
+        name: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.check_open()?;
+        slf.ops.push(RecordedOp::RenameColumn {
+            path: path.to_owned(),
+            name: name.to_owned(),
+        });
+        Ok(slf)
+    }
+
+    /// Record a new `iceberg:doc` documentation string on the column at
+    /// `path`.
+    fn update_doc<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        path: &str,
+        doc: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.check_open()?;
+        slf.ops.push(RecordedOp::UpdateDoc {
+            path: path.to_owned(),
+            doc: doc.to_owned(),
+        });
+        Ok(slf)
+    }
+
+    /// Record that the column at `path` becomes optional.
+    ///
+    /// Required to optional is the only direction nullability can evolve, so
+    /// there is no reverse method.
+    fn make_nullable<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        path: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.check_open()?;
+        slf.ops.push(RecordedOp::MakeNullable {
+            path: path.to_owned(),
+        });
+        Ok(slf)
+    }
+
+    /// Record a type promotion on the column at `path`, checked against the
+    /// legal Iceberg promotions when the update commits.
+    ///
+    /// `data_type` accepts anything a datatype crosses the boundary as: the
+    /// native wrapper, a datatype expression, a `PyArrow` type.
+    fn update_type<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        path: &str,
+        data_type: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.check_open()?;
+        let data_type = core_data_type_from_value(data_type)?;
+        slf.ops.push(RecordedOp::UpdateType {
+            path: path.to_owned(),
+            data_type,
+        });
+        Ok(slf)
+    }
+
+    /// Play the recorded operations back and write one new metadata document.
+    ///
+    /// The evolved schema is added to the table's metadata and made current in
+    /// the same commit a property change uses, so the table describes the new
+    /// shape when this returns and describes the old one on any failure. An
+    /// update that recorded nothing commits nothing at all.
+    fn commit(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.check_open()?;
+        self.consumed = true;
+        let ops = std::mem::take(&mut self.ops);
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut table = self.table.bind(py).borrow_mut();
+        table
+            .inner
+            .commit_changes(move |metadata| {
+                // Replayed by reference: a beaten commit rebases and runs this
+                // closure again on the winner's metadata, so the recording
+                // must survive every attempt.
+                let mut update = SchemaUpdate::for_metadata(metadata)?;
+                for op in &ops {
+                    match op {
+                        RecordedOp::AddColumn { parent, field } => {
+                            update.add_column(parent, field.clone());
+                        }
+                        RecordedOp::DropColumn { path } => update.drop_column(path),
+                        RecordedOp::RenameColumn { path, name } => {
+                            update.rename_column(path, name.clone());
+                        }
+                        RecordedOp::UpdateDoc { path, doc } => {
+                            update.update_doc(path, doc.clone());
+                        }
+                        RecordedOp::MakeNullable { path } => update.make_nullable(path),
+                        RecordedOp::UpdateType { path, data_type } => {
+                            update.update_type(path, data_type.clone());
+                        }
+                    }
+                }
+                let evolved = update.apply()?;
+                let schema_id = metadata.add_schema(evolved)?;
+                metadata.set_current_schema(schema_id)
+            })
+            .map_err(value_error)
+    }
+
+    /// Enter the update's scope; the recording happens inside it.
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Leave the scope: a clean exit commits, an exception discards.
+    ///
+    /// The exception is never swallowed, and a discarded update commits
+    /// nothing, so the table still describes exactly what is stored.
+    #[pyo3(signature = (exception_type = None, exception = None, traceback = None))]
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        exception_type: Option<&Bound<'_, PyAny>>,
+        exception: Option<&Bound<'_, PyAny>>,
+        traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let _ = (exception, traceback);
+        if exception_type.is_some() {
+            self.ops.clear();
+            self.consumed = true;
+            return Ok(false);
+        }
+        if !self.consumed {
+            self.commit(py)?;
+        }
+        Ok(false)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SchemaUpdate(ops={}, committed={})",
+            self.ops.len(),
+            if self.consumed { "True" } else { "False" },
+        )
+    }
+}
+
+/// What one `Table.compact` call did, in numbers a caller can assert on.
+///
+/// A compaction with nothing to do reports zeros, because it commits nothing.
+#[pyclass(
+    name = "Compaction",
+    module = "yggdryl._native",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub(crate) struct PyCompaction {
+    inner: Compaction,
+}
+
+impl PyCompaction {
+    fn from_core(inner: Compaction) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl PyCompaction {
+    /// How many live data files were read and replaced.
+    #[getter]
+    fn files_before(&self) -> usize {
+        self.inner.files_before
+    }
+
+    /// How many data files the rewrite produced in their place.
+    #[getter]
+    fn files_after(&self) -> usize {
+        self.inner.files_after
+    }
+
+    /// The recorded size of the replaced files, in bytes.
+    #[getter]
+    fn bytes_rewritten(&self) -> i64 {
+        self.inner.bytes_rewritten
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Compaction(files_before={}, files_after={}, bytes_rewritten={})",
+            self.inner.files_before, self.inner.files_after, self.inner.bytes_rewritten,
         )
     }
 }

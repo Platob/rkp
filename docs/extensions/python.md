@@ -219,8 +219,56 @@ del field["venue"]
 assert "venue" not in field
 ```
 
-Typed identifiers and protocol properties (`id`, `alias`, `content_type`, `etag`, and the rest) are
-attributes rather than map keys, because they are validated.
+Typed identifiers and typed HTTP values (`parquet_field_id`, `alias`, `content_type`, `etag`, and
+the rest) are attributes rather than map keys, because they are validated.
+
+One protocol's properties are a mapping of their own, and it is a live view of the same field rather
+than a copy of part of it.
+
+```python
+from yggdryl import Field
+
+field = Field("price", "int64", nullable=False)
+field.iceberg["doc"] = "closing price"
+field.postgres.update({"type": "numeric"})
+
+assert field.iceberg["doc"] == "closing price"
+assert dict(field.postgres.items()) == {"type": "numeric"}
+assert len(field.iceberg) == 1
+assert "doc" not in field.postgres
+
+# The bare name is all the view needs; the full key is what the field stores.
+assert field.iceberg.key("doc") == "iceberg:doc"
+assert field["iceberg:doc"] == "closing price"
+assert len(field) == 2
+
+del field.iceberg["doc"]
+assert not field.iceberg
+```
+
+Every well-known protocol is an attribute - `iceberg`, `postgres`, `http`, `arrow`, `spark`, `s3`,
+and the rest - and `field.protocol(name)` takes one that is only known at runtime. There is no
+`https` attribute, because HTTPS shares the canonical `http:` namespace.
+
+A schema also says which of its columns a path spells out, which is what a partitioned write and an
+Iceberg spec both read.
+
+```python
+from yggdryl import DataType, Field
+
+schema = Field(
+    "row",
+    DataType.from_fields([
+        Field("year", "int32", nullable=False),
+        Field("price", "int64", nullable=False),
+    ]),
+    nullable=False,
+).with_partition_fields(["year"])
+
+assert schema.partition_field_names == ["year"]
+assert schema.data_type["year"].is_partition
+assert len(schema.without_partition_fields().data_type) == 1
+```
 
 ## Records
 
@@ -455,37 +503,59 @@ and `write_arrow` already accepts both. A `polars.LazyFrame` is accepted and col
 polars offers no way to hand its rows over a batch at a time - that is polars' boundary, not this
 one's.
 
-An Iceberg table is the same handle one level up.
+## An Iceberg table end to end
+
+An Iceberg table is the same handle one level up, and a warehouse of them is one more:
+`yggdryl.iceberg` carries the catalog, the table, the schema-evolution builder, and compaction,
+each documented on the [iceberg](../core/iceberg.md) core page. PyArrow is the rows boundary in
+both directions - a commit takes anything that exports an Arrow C stream, and every read, whether
+a scan, a time travel, or an inspection table, returns a `pyarrow.RecordBatchReader`.
+`update_schema()` is a context manager, so a recorded chain commits once on a clean exit and not
+at all on an exception.
 
 ```python
 import pathlib
+import shutil
 import tempfile
 
 import pyarrow as pa
 
-from yggdryl import IOBase
-from yggdryl.iceberg import Table, assign_field_ids
+from yggdryl.iceberg import Catalog
 
+warehouse = pathlib.Path(tempfile.mkdtemp(prefix="yggdryl-doc-")) / "warehouse"
+catalog = Catalog(warehouse)
+
+# Rows and a dotted name are enough: the first append creates the table.
 columns = pa.schema([
     pa.field("id", pa.int64(), nullable=False),
     pa.field("venue", pa.string()),
 ])
-
-# Iceberg resolves a column by identifier, so a schema is numbered first.
-table = Table.create(
-    IOBase(pathlib.Path(tempfile.mkdtemp()) / "trades"),
-    assign_field_ids(columns),
-    ["venue"],
+table = catalog.append(
+    "nyc.trades", pa.table({"id": [1, 2], "venue": ["XNAS", "XNYS"]}, schema=columns)
 )
-table.append(pa.record_batch({"id": [1, 2], "venue": ["XNAS", None]}, schema=columns))
+past = table.current_snapshot.snapshot_id
+table.append(pa.table({"id": [3], "venue": [None]}, schema=columns))
+assert catalog.list_tables("nyc") == ["nyc.trades"]
+assert table.scan().read_all().num_rows == 3
 
-assert table.scan().read_all().num_rows == 2
-# The manifest is the authority on a partition value, not the directory name.
-assert sorted(str(file.partition[0]) for file, _ in table.data_files()) == [
-    "None",
-    "XNAS",
-]
+# A column change is recorded on the update and committed once, on exit.
+with table.update_schema() as update:
+    update.add_column("", "price: float64")
+assert table.scan().read_all().column("price").to_pylist() == [None, None, None]
+
+# Undersized files rewrite as one replace commit that reports itself.
+compaction = table.compact()
+assert (compaction.files_before, compaction.files_after) == (2, 1)
+assert table.scan().read_all().num_rows == 3
+
+# And nothing rewrote history: the first snapshot reads as it was written.
+assert table.scan_at(past).read_all().column("id").to_pylist() == [1, 2]
+
+shutil.rmtree(warehouse.parent)
 ```
+
+The folder is the table and the walk is the same everywhere: the [iceberg](../core/iceberg.md)
+page shows each of these steps beside its Rust and JavaScript form.
 
 <!-- notebooks: generated by scripts/build_docs_notebooks.py -->
 

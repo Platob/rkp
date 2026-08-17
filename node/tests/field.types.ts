@@ -1,4 +1,11 @@
-import { Field, MediaType, MimeType, Url, type MetadataEntry } from '..'
+import {
+  Field,
+  MediaType,
+  MimeType,
+  ProtocolMetadata,
+  Url,
+  type MetadataEntry,
+} from '..'
 
 const metadata: MetadataEntry[] = [{ key: 'source', value: 'book' }]
 const field = new Field('id', 'bigint', false, metadata)
@@ -18,7 +25,7 @@ field.setAlias('identifier')
 field.setCatalogName('analytics')
 field.setSchemaName('public')
 field.setTableName('events')
-field.setId(17)
+field.setParquetFieldId(17)
 field.setLocation('s3://warehouse/events/data.parquet')
 field.setAccept('application/json')
 field.setAcceptEncoding('gzip')
@@ -44,7 +51,7 @@ const alias: string | null = field.alias
 const catalogName: string | null = field.catalogName
 const schemaName: string | null = field.schemaName
 const tableName: string | null = field.tableName
-const id: number | null = field.id
+const id: number | null = field.parquetFieldId
 const location: Url | null = field.location
 const accept: string | null = field.accept
 const contentLength: bigint | null = field.contentLength
@@ -57,6 +64,61 @@ const property: string | null = field.getProperty('postgres', 'type')
 const hasProperty: boolean = field.hasProperty('postgres', 'type')
 const properties: MetadataEntry[] = field.propertyIter('postgres')
 field.clearProperties('postgres')
+
+const iceberg: ProtocolMetadata = field.iceberg
+const namedProtocols: ProtocolMetadata[] = [
+  field.http,
+  field.file,
+  field.urn,
+  field.postgres,
+  field.postgresql,
+  field.mysql,
+  field.arrow,
+  field.sql,
+  field.glue,
+  field.iceberg,
+  field.fix,
+  field.field,
+  field.dtype,
+  field.s3,
+  field.gs,
+  field.az,
+  field.spark,
+  field.polars,
+  field.pandas,
+]
+const protocol: ProtocolMetadata = field.protocol('HTTPS')
+const protocolScheme: string = protocol.scheme
+const protocolPrefix: string = protocol.prefix
+const protocolKey: string = protocol.key('content-type')
+const protocolSize: number = iceberg.size
+const protocolValue: string | null = iceberg.get('doc')
+const protocolHas: boolean = iceberg.has('doc')
+iceberg.set('doc', 'closing price')
+iceberg.update({ 'schema-id': '3' })
+iceberg.update(metadata)
+iceberg.update(new Map([['field-id', '7']]))
+const protocolNames: string[] = iceberg.keys()
+const protocolValues: string[] = iceberg.values()
+const protocolEntries: MetadataEntry[] = iceberg.entries()
+const protocolPairs: Array<readonly [string, string]> = [...iceberg]
+const protocolText: string = iceberg.toString()
+const protocolJson: unknown = iceberg.toJSON()
+const protocolDeleted: boolean = iceberg.delete('doc')
+iceberg.clear()
+
+const partitionRoot: Field = Field.from(
+  'row: struct<year: int32 not null, price: float64 not null> not null',
+).withPartitionFields(['year'])
+const isPartition: boolean = partitionRoot.isPartition
+const hasPartitionFields: boolean = partitionRoot.hasPartitionFields
+const partitionFieldLen: number = partitionRoot.partitionFieldLen
+const partitionFields: Field[] = partitionRoot.partitionFields()
+const partitionFieldNames: string[] = partitionRoot.partitionFieldNames()
+const onlyPartitionFields: Field = partitionRoot.onlyPartitionFields()
+const withoutPartitionFields: Field = partitionRoot.withoutPartitionFields()
+const withPartition: Field = partitionRoot.withPartition(false)
+partitionRoot.setPartition(false)
 
 void fieldHash
 void fieldJson
@@ -80,3 +142,26 @@ void previousProperty
 void property
 void hasProperty
 void properties
+void namedProtocols
+void protocol
+void protocolScheme
+void protocolPrefix
+void protocolKey
+void protocolSize
+void protocolValue
+void protocolHas
+void protocolNames
+void protocolValues
+void protocolEntries
+void protocolPairs
+void protocolText
+void protocolJson
+void protocolDeleted
+void isPartition
+void hasPartitionFields
+void partitionFieldLen
+void partitionFields
+void partitionFieldNames
+void onlyPartitionFields
+void withoutPartitionFields
+void withPartition

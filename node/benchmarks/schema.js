@@ -1,7 +1,7 @@
 'use strict'
 
 const { performance } = require('node:perf_hooks')
-const { DataType, MediaType, MimeType, fields } = require('..')
+const { DataType, Field, MediaType, MimeType, fields } = require('..')
 
 const iterations = Number.parseInt(process.env.YGGDRYL_BENCH_ITERATIONS ?? '100000', 10)
 if (!Number.isSafeInteger(iterations) || iterations <= 0) {
@@ -31,6 +31,22 @@ const wideRight = DataType.fromFields(
     fields.int32(`right_${index.toString().padStart(4, '0')}`),
   ),
 )
+// The protocol view crosses the boundary once and then answers by bare name,
+// so both halves are measured: taking the view, and reading or writing through
+// one already held next to the two-argument property call it replaces.
+const property = fields.decimal128('price', 18, 6, {
+  metadata: {
+    'iceberg:doc': 'closing price',
+    'iceberg:field-id': '7',
+    'iceberg:schema-id': '3',
+    'postgres:type': 'numeric(18,6)',
+  },
+})
+const iceberg = property.iceberg
+const partitioned = Field.from(
+  'row: struct<year: int32 not null, price: float64 not null> not null',
+).withPartitionFields(['year'])
+
 const knownMime = 'application/json'
 const customMime = 'application/vnd.benchmark+json'
 const compoundMedia = 'text/csv;encodings=application/gzip,application/zstd'
@@ -48,6 +64,17 @@ benchmark('schema/from_json', () => DataType.fromJSON(structuralJson))
 benchmark('schema/metadata_ignored_equals', () => struct.equals(struct, false))
 benchmark('schema/diff_first_wide_struct_1024', () =>
   wideLeft.showDiffs(wideRight, false).next(),
+)
+benchmark('schema/protocol_view', () => property.iceberg)
+benchmark('schema/protocol_view_get', () => iceberg.get('doc'))
+benchmark('schema/protocol_property_get', () =>
+  property.getProperty('iceberg', 'doc'),
+)
+benchmark('schema/protocol_view_set', () => iceberg.set('doc', 'closing price'))
+benchmark('schema/protocol_view_entries', () => iceberg.entries())
+benchmark('schema/partition_field_names', () => partitioned.partitionFieldNames())
+benchmark('schema/without_partition_fields', () =>
+  partitioned.withoutPartitionFields(),
 )
 benchmark('schema/mime_known_parse', () => MimeType.fromString(knownMime))
 benchmark('schema/mime_custom_parse', () => MimeType.fromString(customMime))

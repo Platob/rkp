@@ -14,8 +14,12 @@ use crate::{DataType, Field, Url};
 /// A root carrying explicit Iceberg-style field identifiers.
 fn root() -> Field {
     DataType::from_fields([
-        DataType::Int64.required_field("id").with_id(1),
-        DataType::Utf8.nullable_field("symbol").with_id(2),
+        DataType::Int64
+            .required_field("id")
+            .with_parquet_field_id(1),
+        DataType::Utf8
+            .nullable_field("symbol")
+            .with_parquet_field_id(2),
     ])
     .unwrap()
     .required_field("row")
@@ -97,8 +101,8 @@ fn field_identifiers_survive_the_round_trip() {
 
     let recovered = media.read_field().unwrap();
     let fields = recovered.data_type().as_fields().unwrap();
-    assert_eq!(fields[0].id().unwrap(), Some(1));
-    assert_eq!(fields[1].id().unwrap(), Some(2));
+    assert_eq!(fields[0].parquet_field_id().unwrap(), Some(1));
+    assert_eq!(fields[1].parquet_field_id().unwrap(), Some(2));
 }
 
 #[test]

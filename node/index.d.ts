@@ -21,6 +21,74 @@ export declare class BatchReader {
 export type JsBatchReader = BatchReader
 
 /**
+ * A warehouse folder of namespaces of Iceberg tables.
+ *
+ * The catalog is storage and nothing else: a dotted name like `"nyc.taxis"`
+ * names the folder `nyc/taxis` under the warehouse handle, and constructing
+ * one touches nothing at all. There is no service in between, so two catalogs
+ * over the same folder see the same tables.
+ */
+export declare class Catalog {
+  /**
+   * Describe a catalog over a warehouse folder, touching nothing.
+   *
+   * `warehouse` accepts whatever names a location - a path or URL string, a
+   * native `Url`, or a handle - the same inputs `Table.create`'s root takes.
+   */
+  constructor(warehouse: LocationInput)
+  /**
+   * Create the named table, writing its first metadata document.
+   *
+   * `schema` is a root `Field`, a field expression, or an array of child
+   * `Field`s assembled under a root named `row`. Unnumbered columns are
+   * numbered, and the partition spec is derived from the columns the schema
+   * itself marks - a schema that marks none produces an unpartitioned
+   * table.
+   */
+  createTable(name: string, schema: TableSchemaInput): Table
+  /** Open the named table. */
+  table(name: string): Table
+  /** Return whether the named table exists. */
+  hasTable(name: string): boolean
+  /**
+   * Open the named table if it exists, creating it otherwise.
+   *
+   * An existing table is opened as it is - `schema` describes only the
+   * table this call would create.
+   */
+  openOrCreateTable(name: string, schema: TableSchemaInput): Table
+  /**
+   * Append `data` to the named table, creating it on first write.
+   *
+   * A table that is not there yet takes its schema from the reader, so a
+   * caller who only has rows and a name needs nothing else. Returns the
+   * table so the caller can keep going.
+   */
+  append(name: string, data: BatchReader): Table
+  /**
+   * Replace the named table's rows with `data`, creating it on first write.
+   *
+   * An existing table keeps its previous snapshot readable; only the
+   * current pointer moves. Returns the table so the caller can keep going.
+   */
+  overwrite(name: string, data: BatchReader): Table
+  /**
+   * List the namespaces one level below `parent`, as sorted dotted names.
+   *
+   * Omitting `parent` lists the warehouse's own child folders. A parent
+   * that does not exist lists nothing rather than failing.
+   */
+  listNamespaces(parent?: string | undefined | null): Array<string>
+  /**
+   * List the tables in a namespace, as sorted dotted names.
+   *
+   * A namespace that does not exist lists nothing rather than failing.
+   */
+  listTables(namespace: string): Array<string>
+}
+export type JsCatalog = Catalog
+
+/**
  * One live data file of the current snapshot, with the spec that placed it.
  *
  * This is a class rather than a plain object because a partition value crosses
@@ -152,7 +220,7 @@ export declare class Field {
   /** Shared table name stored in Arrow-compatible metadata. */
   get tableName(): string | null
   /** Arrow/Parquet signed 32-bit field identifier stored in metadata. */
-  get id(): number | null
+  get parquetFieldId(): number | null
   /** Typed location URL stored canonically in Arrow-compatible metadata. */
   get location(): JsUrl | null
   /** Raw HTTP Accept field value. */
@@ -222,9 +290,9 @@ export declare class Field {
   /** Remove and return the shared table name. */
   removeTableName(): string | null
   /** Set the canonical Arrow/Parquet signed 32-bit field identifier. */
-  setId(id: number): void
+  setParquetFieldId(id: number): void
   /** Remove and return the Arrow/Parquet signed 32-bit field identifier. */
-  removeId(): number | null
+  removeParquetFieldId(): number | null
   /** Set a typed location from any native identifier wrapper or URL string. */
   setLocation(value: JsUrl | JsUri | JsUrn | string): void
   /** Remove and return the typed location URL. */
@@ -321,6 +389,71 @@ export declare class Field {
   propertyIter(scheme: string): Array<MetadataEntry>
   /** Remove every property for one protocol without affecting shared keys. */
   clearProperties(scheme: string): void
+  /**
+   * Return a live view of one protocol's properties on this field.
+   *
+   * The scheme accepts every spelling `getProperty` does, and the view keeps
+   * reading and writing this same field.
+   */
+  protocol(scheme: string): JsProtocolMetadata
+  /** The live HTTP and HTTPS representation property view. */
+  get http(): JsProtocolMetadata
+  /** The live file protocol property view. */
+  get file(): JsProtocolMetadata
+  /** The live uniform resource name property view. */
+  get urn(): JsProtocolMetadata
+  /** The live short-spelling `PostgreSQL` property view. */
+  get postgres(): JsProtocolMetadata
+  /** The live long-spelling `PostgreSQL` property view. */
+  get postgresql(): JsProtocolMetadata
+  /** The live `MySQL` property view. */
+  get mysql(): JsProtocolMetadata
+  /** The live Arrow property view. */
+  get arrow(): JsProtocolMetadata
+  /** The live generic SQL property view. */
+  get sql(): JsProtocolMetadata
+  /** The live AWS Glue property view. */
+  get glue(): JsProtocolMetadata
+  /** The live Apache Iceberg property view. */
+  get iceberg(): JsProtocolMetadata
+  /** The live Financial Information eXchange property view. */
+  get fix(): JsProtocolMetadata
+  /** The live Yggdryl field property view. */
+  get field(): JsProtocolMetadata
+  /** The live Yggdryl datatype property view. */
+  get dtype(): JsProtocolMetadata
+  /** The live Amazon S3 property view. */
+  get s3(): JsProtocolMetadata
+  /** The live Google Cloud Storage property view. */
+  get gs(): JsProtocolMetadata
+  /** The live Azure Blob Storage property view. */
+  get az(): JsProtocolMetadata
+  /** The live Apache Spark property view. */
+  get spark(): JsProtocolMetadata
+  /** The live Polars property view. */
+  get polars(): JsProtocolMetadata
+  /** The live pandas property view. */
+  get pandas(): JsProtocolMetadata
+  /** Whether this field carries the values a path spells out. */
+  get isPartition(): boolean
+  /** Mark or unmark this field as one a path spells out. */
+  setPartition(partition: boolean): void
+  /** Return a copy of this field with the partition marker set. */
+  withPartition(partition: boolean): Field
+  /** The struct children that partition the rows, in declaration order. */
+  partitionFields(): Array<Field>
+  /** The names of the struct children that partition the rows. */
+  partitionFieldNames(): Array<string>
+  /** Number of struct children that partition the rows. */
+  get partitionFieldLen(): number
+  /** Whether any struct child partitions the rows. */
+  get hasPartitionFields(): boolean
+  /** Return this struct root holding only the columns a path spells out. */
+  onlyPartitionFields(): Field
+  /** Return this struct root without the columns a path spells out. */
+  withoutPartitionFields(): Field
+  /** Return this struct root with the named children marked as partitions. */
+  withPartitionFields(names: Array<string>): Field
   /** Read one metadata value without materializing the metadata collection. */
   get(key: string): string | null
   /** Insert or replace one metadata value through the native Field API. */
@@ -694,6 +827,48 @@ export declare class PartitionSpec {
 }
 export type JsPartitionSpec = PartitionSpec
 
+/**
+ * One protocol's properties on a field, read and written by bare name.
+ *
+ * The view is live: it holds the `Field` it was taken from and answers every
+ * call through it, so a write through the view is visible on the field and a
+ * write on the field is visible through the view. Nothing is snapshotted, and
+ * the `scheme:` prefix is applied once, by the view.
+ */
+export declare class ProtocolMetadata {
+  /** The protocol this view remembers, in its canonical lowercase spelling. */
+  get scheme(): string
+  /** The canonical key prefix this view applies. */
+  get prefix(): string
+  /** The full metadata key one bare property name is stored under. */
+  key(name: string): string
+  /** Number of properties this protocol holds. */
+  get size(): number
+  /** Read one property value by its bare name. */
+  get(name: string): string | null
+  /** Test whether one property exists. */
+  has(name: string): boolean
+  /** Insert or replace one property through the live field. */
+  set(name: string, value: string): void
+  /** Remove one property and report whether it existed. */
+  delete(name: string): boolean
+  /** Bare property names in deterministic lexical order. */
+  keys(): Array<string>
+  /** Property values in deterministic lexical-name order. */
+  values(): Array<string>
+  /** Bare name/value entries in deterministic lexical order. */
+  entries(): Array<MetadataEntry>
+  /** Overlay several properties atomically, keeping the ones not named. */
+  update(values: Array<MetadataEntry> | Record<string, string>): void
+  /** Remove every property of this protocol, leaving shared keys alone. */
+  clear(): void
+  /** Render this protocol's bare names as the native JSON object text. */
+  toString(): string
+  /** Serialize this protocol's bare names as a JSON object. */
+  toJSON(): any
+}
+export type JsProtocolMetadata = ProtocolMetadata
+
 /** The settings one record read or write takes. */
 export declare class RecordOptions {
   /** Derive the options for the encoding a media type names. */
@@ -772,6 +947,36 @@ export declare class RecordOptions {
 }
 export type JsRecordOptions = RecordOptions
 
+/**
+ * A recording of column operations against a table's current schema.
+ *
+ * The loader hands one out from `table.updateSchema()` and wraps each method
+ * to return the builder, so a chain reads as one sentence. Nothing is checked
+ * while recording: `commit()` replays the recording onto a fresh core
+ * `SchemaUpdate`, which is what makes the operations apply to the schema the
+ * table has *then* and report the first failure with its core message.
+ */
+export declare class SchemaUpdate {
+  /** Start an empty recording. */
+  constructor()
+  /**
+   * Record a new column under `parent` - `""` for the root, a dotted path
+   * for a nested struct.
+   */
+  addColumn(parent: string, field: FieldInput): void
+  /** Record the removal of the column at `path`, retiring its identifier. */
+  dropColumn(path: string): void
+  /** Record a rename of the column at `path`; its identifier is kept. */
+  renameColumn(path: string, name: string): void
+  /** Record a new `iceberg:doc` documentation string on the column at `path`. */
+  updateDoc(path: string, doc: string): void
+  /** Record that the column at `path` becomes optional. */
+  makeNullable(path: string): void
+  /** Record a type promotion on the column at `path`. */
+  updateType(path: string, dataType: DataTypeInput): void
+}
+export type JsSchemaUpdate = SchemaUpdate
+
 /** An Iceberg table reached entirely through one container handle. */
 export declare class Table {
   /**
@@ -839,6 +1044,68 @@ export declare class Table {
   overwrite(batches: BatchReader): void
   /** Add a schema, make it current, and write a new metadata document. */
   evolveSchema(schema: Field): number
+  /**
+   * Read one retained snapshot's rows: time travel as an ordinary scan.
+   *
+   * `snapshotId` is the identifier a snapshot reports, as a `bigint` or as
+   * a number no larger than 2^53. `filters` is the same `(column, value)`
+   * pair vocabulary `childrenWhere` uses, and `schema` keeps the columns it
+   * names, exactly as on [`scan`](Self::scan). The rows are read as the
+   * schema the snapshot was written under.
+   */
+  scanAt(snapshotId: SnapshotIdInput, filters?: ScanFilters | undefined | null, schema?: FieldInput | undefined | null): BatchReader
+  /**
+   * Return the retained snapshot a branch or tag names.
+   *
+   * A name the table does not have is refused naming the refs it does.
+   */
+  snapshotByRef(name: string): SnapshotView
+  /**
+   * The size a data file aims for, in bytes.
+   *
+   * The table property `write.target-file-size-bytes` decides, falling back
+   * to the schema root's protocol property of the same name, then to
+   * Iceberg's own 512 MiB default. A present-but-unparseable value throws
+   * naming the key and the value rather than silently using the default.
+   */
+  get targetFileSize(): number
+  /**
+   * Merge the current snapshot's undersized data files, per partition.
+   *
+   * The commit is one `replace` snapshot, so the pre-compaction snapshot
+   * stays readable through [`scanAt`](Self::scan_at). A table with nothing
+   * to compact commits nothing and reports zeros.
+   */
+  compact(): Compaction
+  /**
+   * Render when each snapshot became current, oldest first.
+   *
+   * The columns are `made_current_at`, `snapshot_id`, `parent_id`, and
+   * `is_current_ancestor`, the names `PyIceberg`'s `history` table uses.
+   */
+  inspectHistory(): BatchReader
+  /**
+   * Render every retained snapshot with its operation and summary.
+   *
+   * The columns are `committed_at`, `snapshot_id`, `parent_id`,
+   * `operation`, `manifest_list`, and the free-form `summary` map.
+   */
+  inspectSnapshots(): BatchReader
+  /**
+   * Render the live data files of the current snapshot.
+   *
+   * The columns are `file_path`, `file_format`, `spec_id`, the rendered
+   * `partition` chain, `record_count`, and `file_size_in_bytes`.
+   */
+  inspectFiles(): BatchReader
+  /**
+   * Set and remove table properties as one metadata-only commit.
+   *
+   * `updates` is a mapping of properties to set and `removes` lists the
+   * keys to drop, in that order. Passing neither commits nothing at all: a
+   * commit that changes no property would still cost a metadata document.
+   */
+  updateProperties(updates?: PropertyUpdates | undefined | null, removes?: Array<string> | undefined | null): void
   /** Return where the table lives, so a table prints as its location. */
   toString(): string
 }
@@ -1259,6 +1526,21 @@ export declare function codecInferFormat(path: string): string
 
 /** Parse a format alias and return its stable native spelling. */
 export declare function codecNormalizeFormat(format: string): string
+
+/**
+ * What one `compact` call rewrote.
+ *
+ * The sizes cross as numbers because a data file already reports
+ * `fileSizeInBytes` as one, and the two must agree.
+ */
+export interface Compaction {
+  /** How many live data files were read and replaced. */
+  filesBefore: number
+  /** How many data files the rewrite produced in their place. */
+  filesAfter: number
+  /** The recorded size of the replaced files, in bytes. */
+  bytesRewritten: number
+}
 
 /** One per-column bound a manifest records, as its encoded bytes. */
 export interface FieldBound {

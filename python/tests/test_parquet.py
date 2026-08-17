@@ -190,7 +190,7 @@ class TestWhatAnotherReaderSees:
             handle.write_arrow_batch_reader([rows])
 
         stored = file.read_arrow_field().data_type[0]
-        assert stored.id == 17
+        assert stored.parquet_field_id == 17
         assert pq.ParquetFile(tmp_path / "trades.parquet").schema_arrow.field(
             "id"
         ).metadata == {b"PARQUET:field_id": b"17"}

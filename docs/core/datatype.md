@@ -669,13 +669,17 @@ A bare `DataType` has no nullability, so its default is the non-null one. Ask a
     )
     ```
 
-Four targets are accepted - `arrow`, `spark`, `polars`, `pandas` - and anything else is refused by
-name. Arrow validates and clones. The other three walk the type recursively and apply only
+Five targets are accepted - `arrow`, `spark`, `polars`, `pandas`, `iceberg` - and anything else is
+refused by name. Arrow validates and clones. The other four walk the type recursively and apply only
 layout-only rewrites: widths that the engine cannot address, offset variants it does not implement,
 and container shapes it lacks. Spark has no unsigned integers, so `uint8` widens to `int16` and
 `uint64` becomes `decimal128(20, 0)`; Polars has both natively and keeps them, and keeps a
 fixed-size list where Spark degrades to a list. Polars and pandas have no first-class map and say
-so, naming key/value structs as the alternative.
+so, naming key/value structs as the alternative. [Iceberg](iceberg.md) is a closed primitive
+vocabulary rather than an engine, so every narrow or unsigned integer widens to the signed one that
+holds it - `uint8`, `uint16`, `int8`, and `int16` all become `int32` - it keeps `fixed[n]` and both
+its microsecond and nanosecond timestamps, and it has no elapsed-time or calendar-interval type at
+all.
 
 Anything that would change what a value means is an error rather than a rewrite. A nanosecond
 timestamp is not silently truncated to Spark's microseconds, a negative decimal scale is not

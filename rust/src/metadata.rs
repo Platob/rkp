@@ -36,11 +36,67 @@ pub(crate) const HTTP_RANGE_KEY: &str = "http:range";
 pub(crate) const HTTP_VARY_KEY: &str = "http:vary";
 pub(crate) const LOCATION_KEY: &str = "location";
 pub(crate) const FIELD_INIT_KEY: &str = "field:init";
+pub(crate) const FIELD_PARTITION_KEY: &str = "field:partition";
 pub(crate) const PARQUET_FIELD_ID_KEY: &str = "PARQUET:field_id";
 pub(crate) const SCHEMA_NAME_KEY: &str = "schema_name";
 pub(crate) const TABLE_NAME_KEY: &str = "table_name";
 
 type MetadataMap = BTreeMap<String, String>;
+
+/// Apply `$emit` to every protocol that has a named metadata view.
+///
+/// One list drives every generated accessor, so a protocol added here appears
+/// on the metadata snapshot and on [`crate::Field`] in the same change rather
+/// than in whichever of them someone remembered. `https` is deliberately absent:
+/// it shares the canonical `http:` prefix, and one spelling of one namespace is
+/// what keeps a header from being stored twice.
+macro_rules! for_each_well_known_protocol {
+    ($emit:ident) => {
+        $emit!(http, http_mut, HTTP, "HTTP and HTTPS representation");
+        $emit!(file, file_mut, FILE, "file protocol");
+        $emit!(urn, urn_mut, URN, "uniform resource name");
+        $emit!(
+            postgres,
+            postgres_mut,
+            POSTGRES,
+            "short-spelling PostgreSQL"
+        );
+        $emit!(
+            postgresql,
+            postgresql_mut,
+            POSTGRESQL,
+            "long-spelling PostgreSQL"
+        );
+        $emit!(mysql, mysql_mut, MYSQL, "MySQL");
+        $emit!(arrow, arrow_mut, ARROW, "Arrow");
+        $emit!(sql, sql_mut, SQL, "generic SQL");
+        $emit!(glue, glue_mut, GLUE, "AWS Glue");
+        $emit!(iceberg, iceberg_mut, ICEBERG, "Apache Iceberg");
+        $emit!(fix, fix_mut, FIX, "Financial Information eXchange");
+        $emit!(field, field_mut, FIELD, "Yggdryl field");
+        $emit!(dtype, dtype_mut, DTYPE, "Yggdryl datatype");
+        $emit!(s3, s3_mut, S3, "Amazon S3");
+        $emit!(gs, gs_mut, GS, "Google Cloud Storage");
+        $emit!(az, az_mut, AZ, "Azure Blob Storage");
+        $emit!(spark, spark_mut, SPARK, "Apache Spark");
+        $emit!(polars, polars_mut, POLARS, "Polars");
+        $emit!(pandas, pandas_mut, PANDAS, "pandas");
+    };
+}
+
+pub(crate) use for_each_well_known_protocol;
+
+/// Emit one borrowed protocol view accessor on a metadata snapshot.
+macro_rules! metadata_protocol_accessor {
+    ($name:ident, $mutable:ident, $constant:ident, $label:literal) => {
+        #[doc = concat!("Returns the borrowed ", $label, " property view.")]
+        ///
+        /// This is [`Self::protocol`] with the protocol already chosen.
+        pub fn $name(&self) -> ProtocolMetadata<'_> {
+            self.protocol(&Scheme::$constant)
+        }
+    };
+}
 
 static EMPTY_METADATA: OnceLock<Arc<MetadataMap>> = OnceLock::new();
 
@@ -148,17 +204,15 @@ impl Metadata {
         Some((entry.0.as_str(), entry.1.as_str()))
     }
 
-    /// Looks up a protocol-prefixed property without constructing its full key.
+    /// Looks up a protocol-prefixed property without allocating a full key.
+    ///
+    /// The lookup key is assembled inline - a `scheme:name` pair short enough
+    /// for [`SmolStr`]'s inline storage never allocates - and answered by one
+    /// exact tree lookup rather than by scanning the protocol's range. HTTP
+    /// keeps its protocol-defined ASCII case-insensitive comparison, because
+    /// [`Self::get`] canonicalizes an `http:` key before it looks it up.
     pub fn get_property(&self, scheme: &Scheme, name: &str) -> Option<&str> {
-        let prefix = protocol_metadata_prefix(scheme);
-        self.property_iter(scheme).find_map(|(candidate, value)| {
-            let matches = if prefix == Scheme::HTTP.as_str() {
-                candidate.eq_ignore_ascii_case(name)
-            } else {
-                candidate == name
-            };
-            matches.then_some(value)
-        })
+        self.get(&property_lookup_key(scheme, name))
     }
 
     /// Returns whether a protocol-prefixed property exists.
@@ -211,6 +265,33 @@ impl Metadata {
         }
         None
     }
+
+    /// Returns a borrowed view of one protocol's properties.
+    ///
+    /// The view remembers the protocol, so every read spells the bare property
+    /// name and the `scheme:` prefix is applied once, by the view. Nothing is
+    /// copied: the value borrows this snapshot and answers from the same tree.
+    ///
+    /// ```
+    /// use yggdryl::{Metadata, Scheme};
+    ///
+    /// # fn main() -> yggdryl::Result<()> {
+    /// let metadata = Metadata::from_entries([("iceberg:doc", "closing price")])?;
+    ///
+    /// assert_eq!(metadata.protocol(&Scheme::ICEBERG).get("doc"), Some("closing price"));
+    /// assert_eq!(metadata.iceberg().get("doc"), Some("closing price"));
+    /// assert_eq!(metadata.iceberg().key("doc"), "iceberg:doc");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn protocol(&self, scheme: &Scheme) -> ProtocolMetadata<'_> {
+        ProtocolMetadata {
+            metadata: self,
+            scheme: scheme.clone(),
+        }
+    }
+
+    for_each_well_known_protocol!(metadata_protocol_accessor);
 
     /// Returns the raw HTTP `Accept` field value.
     pub fn accept(&self) -> Option<&str> {
@@ -724,6 +805,382 @@ impl DoubleEndedIterator for PropertyIter<'_, '_> {
 
 impl std::iter::FusedIterator for PropertyIter<'_, '_> {}
 
+/// One protocol's properties, addressed by their bare names.
+///
+/// A protocol property is stored under a `scheme:name` key, and code that
+/// spells that key by hand has to spell it right in every branch it appears in.
+/// This view remembers the protocol once and applies it to every operation, so
+/// a caller writes `doc` where it used to write `"iceberg:doc"`.
+///
+/// The view is a borrow, not a copy: it holds the same snapshot the metadata
+/// holds and answers reads out of the same tree, so constructing one costs a
+/// `Scheme` clone of a known protocol - which allocates nothing - and no map
+/// walk at all. It is therefore cheap enough to build per call rather than
+/// stored, which is what the named accessors such as
+/// [`Metadata::iceberg`] do.
+///
+/// ```
+/// use yggdryl::Metadata;
+///
+/// # fn main() -> yggdryl::Result<()> {
+/// let metadata = Metadata::from_entries([
+///     ("iceberg:doc", "closing price"),
+///     ("iceberg:schema-id", "3"),
+///     ("postgres:table", "trades"),
+/// ])?;
+///
+/// let iceberg = metadata.iceberg();
+/// assert_eq!(iceberg.len(), 2);
+/// assert_eq!(iceberg.get("schema-id"), Some("3"));
+/// assert!(!iceberg.contains_key("table"));
+/// assert_eq!(
+///     iceberg.iter().collect::<Vec<_>>(),
+///     [("doc", "closing price"), ("schema-id", "3")],
+/// );
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct ProtocolMetadata<'metadata> {
+    metadata: &'metadata Metadata,
+    scheme: Scheme,
+}
+
+impl<'metadata> ProtocolMetadata<'metadata> {
+    /// Returns the protocol this view remembers.
+    pub const fn scheme(&self) -> &Scheme {
+        &self.scheme
+    }
+
+    /// Returns the canonical key prefix this view applies.
+    ///
+    /// This is the scheme's own spelling for every protocol but HTTPS, which
+    /// shares HTTP's one namespace.
+    pub fn prefix(&self) -> &str {
+        protocol_metadata_prefix(&self.scheme)
+    }
+
+    /// Returns the full metadata key one property name is stored under.
+    pub fn key(&self, name: &str) -> String {
+        property_key(&self.scheme, name)
+    }
+
+    /// Returns one property value by its bare name.
+    pub fn get(&self, name: &str) -> Option<&'metadata str> {
+        self.metadata.get_property(&self.scheme, name)
+    }
+
+    /// Returns whether one property exists.
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// Returns the number of properties this protocol holds.
+    ///
+    /// The count walks this protocol's contiguous key range rather than the
+    /// whole snapshot, so it costs the properties it counts and not the
+    /// metadata around them.
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    /// Returns whether this protocol holds no properties.
+    pub fn is_empty(&self) -> bool {
+        self.iter().next().is_none()
+    }
+
+    /// Iterates this protocol's names and values in lexical order.
+    pub fn iter(&self) -> PropertyIter<'metadata, '_> {
+        self.metadata.property_iter(&self.scheme)
+    }
+
+    /// Returns the first property after `after_name`, or the first for `None`.
+    ///
+    /// This is the cursor form an owning FFI iterator advances with.
+    pub fn next_entry(&self, after_name: Option<&str>) -> Option<(&'metadata str, &'metadata str)> {
+        self.metadata.next_property_entry(&self.scheme, after_name)
+    }
+
+    /// Returns the complete snapshot this view reads from.
+    pub const fn as_metadata(&self) -> &'metadata Metadata {
+        self.metadata
+    }
+
+    /// Collects this protocol's properties as a standalone snapshot.
+    ///
+    /// Keys keep their `scheme:` prefix, so the result is a metadata value that
+    /// merges back into any other with [`crate::Field::update_metadata`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a property fails the validation it already
+    /// passed, which externally corrupted serialized state can produce.
+    pub fn to_metadata(&self) -> Result<Metadata> {
+        Metadata::from_entries(self.iter().map(|(name, value)| (self.key(name), value)))
+    }
+}
+
+impl fmt::Debug for ProtocolMetadata<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ProtocolMetadata")
+            .field(&self.prefix())
+            .field(&format_args!("{self}"))
+            .finish()
+    }
+}
+
+impl fmt::Display for ProtocolMetadata<'_> {
+    /// Renders this protocol's own names as a deterministic JSON object.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("{")?;
+        for (index, (name, value)) in self.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(",")?;
+            }
+            write_json_string(formatter, name)?;
+            formatter.write_str(":")?;
+            write_json_string(formatter, value)?;
+        }
+        formatter.write_str("}")
+    }
+}
+
+impl PartialEq for ProtocolMetadata<'_> {
+    /// Compares the properties two views hold, not the snapshots behind them.
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for ProtocolMetadata<'_> {}
+
+impl Index<&str> for ProtocolMetadata<'_> {
+    type Output = str;
+
+    fn index(&self, name: &str) -> &Self::Output {
+        self.get(name).unwrap_or_else(|| {
+            panic!(
+                "metadata property {:?} is not present",
+                self.key(name).as_str()
+            )
+        })
+    }
+}
+
+impl<'metadata, 'view> IntoIterator for &'view ProtocolMetadata<'metadata> {
+    type Item = (&'metadata str, &'metadata str);
+    type IntoIter = PropertyIter<'metadata, 'view>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// One protocol's properties on a field, readable and writable by bare name.
+///
+/// This is [`ProtocolMetadata`] with the field's mutations added. It is a
+/// separate value for the reason every mutable view in Rust is: it borrows the
+/// field exclusively, so a read-only view can be handed out freely while this
+/// one exists only where a change is actually being made.
+///
+/// Every mutation goes through the field's own cache-aware methods, so a
+/// protocol write invalidates a populated Arrow projection exactly as a direct
+/// metadata write does, and a rejected value leaves the field untouched.
+///
+/// ```
+/// use yggdryl::{DataType, Field};
+///
+/// # fn main() -> yggdryl::Result<()> {
+/// let mut field = DataType::Int64.required_field("price");
+///
+/// field.iceberg_mut().insert("doc", "closing price")?;
+/// field.iceberg_mut().insert("schema-id", "3")?;
+///
+/// assert_eq!(field.iceberg().get("doc"), Some("closing price"));
+/// assert_eq!(field.get_metadata("iceberg:doc"), Some("closing price"));
+///
+/// assert_eq!(field.iceberg_mut().remove("doc").as_deref(), Some("closing price"));
+/// field.iceberg_mut().clear();
+/// assert!(field.iceberg().is_empty());
+/// # Ok(())
+/// # }
+/// ```
+pub struct ProtocolMetadataMut<'field> {
+    field: &'field mut crate::Field,
+    scheme: Scheme,
+}
+
+impl<'field> ProtocolMetadataMut<'field> {
+    /// Borrows one protocol's properties on a field for reading and writing.
+    pub(crate) fn new(field: &'field mut crate::Field, scheme: Scheme) -> Self {
+        Self { field, scheme }
+    }
+
+    /// Returns the protocol this view remembers.
+    pub const fn scheme(&self) -> &Scheme {
+        &self.scheme
+    }
+
+    /// Returns the canonical key prefix this view applies.
+    pub fn prefix(&self) -> &str {
+        protocol_metadata_prefix(&self.scheme)
+    }
+
+    /// Returns the full metadata key one property name is stored under.
+    pub fn key(&self, name: &str) -> String {
+        property_key(&self.scheme, name)
+    }
+
+    /// Borrows the read-only view of the same protocol.
+    pub fn as_protocol(&self) -> ProtocolMetadata<'_> {
+        self.field.as_metadata().protocol(&self.scheme)
+    }
+
+    /// Returns one property value by its bare name.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.field.get_property(&self.scheme, name)
+    }
+
+    /// Returns whether one property exists.
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.field.has_property(&self.scheme, name)
+    }
+
+    /// Returns the number of properties this protocol holds.
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    /// Returns whether this protocol holds no properties.
+    pub fn is_empty(&self) -> bool {
+        self.iter().next().is_none()
+    }
+
+    /// Iterates this protocol's names and values in lexical order.
+    pub fn iter(&self) -> PropertyIter<'_, '_> {
+        self.field.property_iter(&self.scheme)
+    }
+
+    /// Returns the first property after `after_name`, or the first for `None`.
+    pub fn next_entry(&self, after_name: Option<&str>) -> Option<(&str, &str)> {
+        self.field.next_property_entry(&self.scheme, after_name)
+    }
+
+    /// Inserts or replaces one property and returns its prior value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name or value fails the validation the
+    /// protocol namespace applies, leaving the field unchanged.
+    pub fn insert(&mut self, name: &str, value: impl Into<String>) -> Result<Option<String>> {
+        self.field.set_property(&self.scheme, name, value)
+    }
+
+    /// Overlays several properties, keeping the ones not named.
+    ///
+    /// The whole overlay is validated before any of it is applied, so a
+    /// rejected entry leaves every other entry unwritten too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any name or value fails validation.
+    pub fn update<I, N, V>(&mut self, entries: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: AsRef<str>,
+        V: Into<String>,
+    {
+        let overlay: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|(name, value)| (self.key(name.as_ref()), value.into()))
+            .collect();
+        self.field.update_metadata(overlay)
+    }
+
+    /// Replaces this protocol's properties with exactly these, atomically.
+    ///
+    /// Properties of other protocols and every shared key are untouched, which
+    /// is what makes this a protocol-scoped `set` rather than a metadata one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any name or value fails validation, leaving the
+    /// field unchanged.
+    pub fn set<I, N, V>(&mut self, entries: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: AsRef<str>,
+        V: Into<String>,
+    {
+        let prefix = protocol_metadata_prefix(&self.scheme);
+        let mut replacement: Vec<(String, String)> = self
+            .field
+            .metadata_iter()
+            .filter(|(key, _)| property_name(key, prefix).is_none())
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        for (name, value) in entries {
+            replacement.push((self.key(name.as_ref()), value.into()));
+        }
+        self.field.set_metadata(replacement)
+    }
+
+    /// Removes one property and returns its prior value.
+    pub fn remove(&mut self, name: &str) -> Option<String> {
+        self.field.remove_property(&self.scheme, name)
+    }
+
+    /// Removes every property of this protocol.
+    pub fn clear(&mut self) {
+        self.field.clear_properties(&self.scheme);
+    }
+}
+
+impl fmt::Debug for ProtocolMetadataMut<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ProtocolMetadataMut")
+            .field(&self.prefix())
+            .field(&format_args!("{}", self.as_protocol()))
+            .finish()
+    }
+}
+
+impl fmt::Display for ProtocolMetadataMut<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.as_protocol(), formatter)
+    }
+}
+
+impl Index<&str> for ProtocolMetadataMut<'_> {
+    type Output = str;
+
+    fn index(&self, name: &str) -> &Self::Output {
+        self.get(name).unwrap_or_else(|| {
+            panic!(
+                "metadata property {:?} is not present",
+                self.key(name).as_str()
+            )
+        })
+    }
+}
+
+/// Return the full `scheme:name` key one property is stored under.
+pub(crate) fn property_key(scheme: &Scheme, name: &str) -> String {
+    let prefix = protocol_metadata_prefix(scheme);
+    let mut key = String::with_capacity(prefix.len() + 1 + name.len());
+    key.push_str(prefix);
+    key.push(':');
+    key.push_str(name);
+    key
+}
+
+/// Return the same key without allocating for a name of ordinary length.
+fn property_lookup_key(scheme: &Scheme, name: &str) -> SmolStr {
+    format_smolstr!("{}:{name}", protocol_metadata_prefix(scheme))
+}
+
 fn property_name<'a>(key: &'a str, scheme: &str) -> Option<&'a str> {
     key.strip_prefix(scheme)?.strip_prefix(':')
 }
@@ -760,6 +1217,7 @@ fn validate_entry(key: String, value: String) -> Result<(String, String)> {
         }
         LOCATION_KEY => Url::from_str(&value)?.to_string(),
         FIELD_INIT_KEY => parse_reserved_bool(FIELD_INIT_KEY, &value)?.to_string(),
+        FIELD_PARTITION_KEY => parse_reserved_bool(FIELD_PARTITION_KEY, &value)?.to_string(),
         PARQUET_FIELD_ID_KEY => parse_field_id(&value)?.to_string(),
         _ => {
             if key.starts_with("http:") {

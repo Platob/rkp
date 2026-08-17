@@ -403,8 +403,9 @@ assert_eq!(Scheme::POSTGRES.default_port(), Some(5432));
 assert_eq!(Scheme::S3.default_port(), None);
 assert!(Scheme::S3.is_storage() && !Scheme::ICEBERG.is_storage());
 
-assert_eq!(Scheme::COMPATIBILITY_TARGETS.len(), 4);
+assert_eq!(Scheme::COMPATIBILITY_TARGETS.len(), 5);
 assert!(Scheme::SPARK.is_compatibility_target());
+assert!(Scheme::ICEBERG.is_compatibility_target());
 assert!(!Scheme::HTTPS.is_compatibility_target());
 
 // Any RFC-valid scheme parses; only the listed ones are allocation-free.
@@ -416,8 +417,9 @@ assert!(!custom.is_known() && Scheme::HTTPS.is_known());
 The scheme does double duty: it names a protocol for [`Uri`](uri.md), and it namespaces metadata
 properties on a [`Field`](field.md), which is why `arrow`, `iceberg`, `fix`, and `dtype` sit in the
 same list as `https` and `s3`. `default_port` returns `None` for metadata namespaces and for
-object-storage protocols with no fixed listening port. Only the four compatibility targets are
-accepted by `to_scheme_compat`.
+object-storage protocols with no fixed listening port. Only the five compatibility targets are
+accepted by `to_scheme_compat`, and `iceberg` is both: it namespaces
+[table-format](iceberg.md) metadata and names the schema subset that format can express.
 
 ## Content codings
 

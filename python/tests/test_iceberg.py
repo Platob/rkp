@@ -7,11 +7,14 @@ import pathlib
 import pyarrow as pa
 import pytest
 
-from yggdryl import IOBase
+from yggdryl import DataType, Field, IOBase
 from yggdryl.iceberg import (
+    Catalog,
+    Compaction,
     PartitionSpec,
     Table,
     assign_field_ids,
+    can_promote,
     schema_from_json,
     schema_to_json,
 )
@@ -19,6 +22,13 @@ from yggdryl.iceberg import (
 SCHEMA = pa.schema(
     [
         pa.field("id", pa.int64(), nullable=False),
+        pa.field("venue", pa.string()),
+    ]
+)
+
+NARROW = pa.schema(
+    [
+        pa.field("id", pa.int32(), nullable=False),
         pa.field("venue", pa.string()),
     ]
 )
@@ -44,6 +54,14 @@ def table(tmp_path: pathlib.Path, numbered: object) -> Table:
     return Table.create(IOBase(tmp_path / "trades"), numbered, ["venue"])
 
 
+@pytest.fixture
+def narrow(tmp_path: pathlib.Path) -> Table:
+    """An unpartitioned table holding one row under a 32-bit id."""
+    table = Table.create(IOBase(tmp_path / "narrow"), assign_field_ids(NARROW))
+    table.append(pa.record_batch({"id": [1], "venue": ["XNAS"]}, schema=NARROW))
+    return table
+
+
 class TestSchemasCarryIdentifiers:
     """Iceberg resolves a column by identifier, not by position."""
 
@@ -51,14 +69,14 @@ class TestSchemasCarryIdentifiers:
         numbered = assign_field_ids(SCHEMA)
 
         assert numbered.name == "row"
-        assert [child.id for child in numbered.data_type] == [1, 2]
+        assert [child.parquet_field_id for child in numbered.data_type] == [1, 2]
         # The input is untouched: the numbered schema is a new value.
         assert SCHEMA.field("id").metadata is None
 
     def test_numbering_starts_where_it_is_told_to(self) -> None:
         numbered = assign_field_ids(SCHEMA, 10)
 
-        assert [child.id for child in numbered.data_type] == [10, 11]
+        assert [child.parquet_field_id for child in numbered.data_type] == [10, 11]
 
     def test_a_root_that_is_not_a_non_null_struct_is_refused(
         self, tmp_path: pathlib.Path
@@ -82,7 +100,7 @@ class TestSchemasCarryIdentifiers:
         # `required` inverts into nullability, and `id` becomes PARQUET:field_id.
         assert not schema.data_type[0].nullable
         assert schema.data_type[1].nullable
-        assert [child.id for child in schema.data_type] == [1, 2]
+        assert [child.parquet_field_id for child in schema.data_type] == [1, 2]
 
         assert schema_to_json(schema) == document
 
@@ -316,3 +334,391 @@ class TestScans:
         assert isinstance(scan, pa.RecordBatchReader)
         assert scan.schema.names == ["id", "venue"]
         assert scan.read_next_batch().num_rows == 1
+
+
+class TestCatalog:
+    """A catalog is a warehouse folder, and a dotted name is nested folders."""
+
+    def test_a_pyarrow_append_creates_a_partitioned_table_on_first_write(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        catalog = Catalog(tmp_path / "warehouse")
+        assert catalog.warehouse.name == "warehouse"
+        assert catalog.list_namespaces() == []
+        assert not catalog.has_table("nyc.taxis")
+
+        # The schema's own marks say which columns the layout spells out, and
+        # they ride the Arrow fields' metadata into the very first append.
+        marked = Field(
+            "row",
+            DataType.from_fields(
+                [
+                    Field("id", "int64", nullable=False),
+                    Field("venue", "string"),
+                ]
+            ),
+            nullable=False,
+        ).with_partition_fields(["venue"])
+        columns = pa.schema([child.to_arrow() for child in marked.data_type])
+        rows = pa.table(
+            {"id": [1, 2, 3], "venue": ["XNAS", "XNYS", None]}, schema=columns
+        )
+
+        table = catalog.append("nyc.taxis", rows)
+        assert catalog.has_table("nyc.taxis")
+        assert catalog.list_namespaces() == ["nyc"]
+        assert catalog.list_tables("nyc") == ["nyc.taxis"]
+
+        # The schema was inferred from the reader and numbered, and the marked
+        # column became the identity spec.
+        assert [child.parquet_field_id for child in table.schema.data_type] == [1, 2]
+        assert [field.name for field in table.spec.fields] == ["venue"]
+        assert table.spec.fields[0].transform == "identity"
+        assert table.scan().read_all().num_rows == 3
+
+        # Appending again through the catalog keeps what is stored, and the
+        # name opens the same table it created.
+        assert catalog.append("nyc.taxis", rows).scan().read_all().num_rows == 6
+        assert catalog.table("nyc.taxis").table_uuid == table.table_uuid
+
+    def test_create_table_takes_an_iterable_of_fields(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        catalog = Catalog(IOBase(tmp_path / "warehouse"))
+
+        table = catalog.create_table(
+            "ns.trades", [Field("id", "int64", nullable=False)]
+        )
+        assert catalog.list_tables("ns") == ["ns.trades"]
+        assert table.spec.is_unpartitioned()
+
+        with pytest.raises(ValueError, match="expected no table"):
+            catalog.create_table("ns.trades", [Field("id", "int64", nullable=False)])
+        # An existing table is opened as it is; the schema describes only the
+        # table the call would create.
+        same = catalog.open_or_create_table("ns.trades", SCHEMA)
+        assert same.table_uuid == table.table_uuid
+
+    def test_overwrite_replaces_and_a_missing_table_is_named(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        catalog = Catalog(tmp_path / "warehouse")
+
+        catalog.overwrite("flat", pa.Table.from_batches([_rows()]))
+        replaced = catalog.overwrite("flat", pa.Table.from_batches([_rows(10)]))
+        assert replaced.scan().read_all().column("id").to_pylist() == [10, 11, 12]
+        # The previous snapshot is retained, which is what makes it reversible.
+        assert len(replaced.snapshots) == 2
+
+        with pytest.raises(ValueError, match="expected a table"):
+            catalog.table("absent")
+        with pytest.raises(ValueError, match="path separators"):
+            catalog.create_table("a/b", SCHEMA)
+
+
+class TestTimeTravel:
+    """Every retained snapshot is a complete table, read by ordinary scans."""
+
+    def test_scan_at_reads_the_snapshot_an_overwrite_replaced(
+        self, table: Table
+    ) -> None:
+        table.append(_rows())
+        assert table.current_snapshot is not None
+        first = table.current_snapshot.snapshot_id
+        table.overwrite(_rows(10))
+
+        assert table.scan().read_all().column("id").to_pylist() == [10, 11, 12]
+        old = table.scan_at(first).read_all()
+        assert old.column("id").to_pylist() == [1, 2, 3]
+
+        # Filters take the same (column, value) pairs a lake read takes, and
+        # the schema keeps the columns it names.
+        wanted = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+        filtered = table.scan_at(
+            first, filters={"venue": "XNAS"}, schema=wanted
+        ).read_all()
+        assert filtered.column_names == ["id"]
+        assert filtered.column("id").to_pylist() == [1]
+
+    def test_a_snapshot_the_table_does_not_retain_is_named(
+        self, table: Table
+    ) -> None:
+        table.append(_rows())
+
+        with pytest.raises(ValueError, match="expected a retained snapshot id"):
+            table.scan_at(999)
+
+    def test_snapshot_by_ref_follows_main(self, table: Table) -> None:
+        table.append(_rows())
+        current = table.current_snapshot
+        assert current is not None
+
+        assert table.snapshot_by_ref("main").snapshot_id == current.snapshot_id
+
+    def test_a_ref_the_table_does_not_have_names_the_refs_it_has(
+        self, table: Table
+    ) -> None:
+        table.append(_rows())
+
+        with pytest.raises(ValueError, match=r"got \"nightly\"; it has \[main\]"):
+            table.snapshot_by_ref("nightly")
+
+
+class TestSchemaUpdates:
+    """A column change is a new schema, recorded first and committed once."""
+
+    def test_a_with_block_commits_the_recorded_operations_as_one_document(
+        self, narrow: Table
+    ) -> None:
+        first = narrow.current_snapshot
+        assert first is not None
+        before = narrow.version
+
+        with narrow.update_schema() as update:
+            update.add_column("", "price: float64").update_type(
+                "id", "int64"
+            ).rename_column("venue", "market")
+
+        # One metadata document, however many operations were recorded.
+        assert narrow.version == before + 1
+        children = list(narrow.schema.data_type)
+        assert [child.name for child in children] == ["id", "market", "price"]
+        # The widened type reads back, the renamed column keeps its
+        # identifier, and the added column is numbered above every identifier
+        # the table has ever assigned.
+        assert children[0].data_type.id == "int64"
+        assert [child.parquet_field_id for child in children] == [1, 2, 3]
+        assert children[2].nullable
+
+        rows = narrow.scan().read_all()
+        assert rows.schema.field("id").type == pa.int64()
+        assert rows.column("id").to_pylist() == [1]
+        assert rows.column("price").to_pylist() == [None]
+        # The pre-rename snapshot reads as the schema it was written under, so
+        # the stored value is a time travel away under its old name.
+        assert narrow.scan_at(first.snapshot_id).read_all().column(
+            "venue"
+        ).to_pylist() == ["XNAS"]
+
+        # A row appended after the evolution carries the new shape.
+        narrow.append(
+            pa.record_batch(
+                {"id": [2], "market": ["XNYS"], "price": [1.5]},
+                schema=pa.schema(
+                    [
+                        pa.field("id", pa.int64(), nullable=False),
+                        pa.field("market", pa.string()),
+                        pa.field("price", pa.float64()),
+                    ]
+                ),
+            )
+        )
+        assert narrow.scan().read_all().column("market").to_pylist()[-1] == "XNYS"
+
+    def test_an_exception_discards_the_update(self, narrow: Table) -> None:
+        before = narrow.version
+
+        with pytest.raises(RuntimeError, match="stop"):
+            with narrow.update_schema() as update:
+                update.add_column("", "price: float64")
+                raise RuntimeError("stop")
+
+        assert narrow.version == before
+        assert [child.name for child in narrow.schema.data_type] == ["id", "venue"]
+
+    def test_an_update_that_records_nothing_commits_nothing(
+        self, narrow: Table
+    ) -> None:
+        before = narrow.version
+
+        with narrow.update_schema():
+            pass
+
+        assert narrow.version == before
+
+    def test_an_illegal_promotion_is_refused_naming_both_sides(
+        self, narrow: Table
+    ) -> None:
+        before = narrow.version
+
+        with pytest.raises(
+            ValueError, match="expected an Iceberg-legal promotion, got int32 to int16"
+        ):
+            with narrow.update_schema() as update:
+                update.update_type("id", "int16")
+
+        assert narrow.version == before
+
+    def test_docs_and_nullability_evolve_too(self, narrow: Table) -> None:
+        with narrow.update_schema() as update:
+            update.update_doc("id", "row identifier").make_nullable("id")
+
+        evolved = narrow.schema.data_type[0]
+        assert evolved.nullable
+        assert evolved.iceberg["doc"] == "row identifier"
+
+    def test_a_dropped_column_retires_its_identifier(self, narrow: Table) -> None:
+        with narrow.update_schema() as update:
+            update.drop_column("venue").add_column("", "note: string")
+
+        children = list(narrow.schema.data_type)
+        assert [child.name for child in children] == ["id", "note"]
+        # The added column is numbered above the dropped one, never as it.
+        assert children[1].parquet_field_id == 3
+
+    def test_a_spent_update_is_refused(self, narrow: Table) -> None:
+        update = narrow.update_schema()
+        update.add_column("", "price: float64")
+        update.commit()
+
+        with pytest.raises(ValueError, match="already committed or discarded"):
+            update.commit()
+        with pytest.raises(ValueError, match="already committed or discarded"):
+            update.drop_column("price")
+
+
+class TestProperties:
+    """A property change is a metadata-only commit, and a no-op is free."""
+
+    def test_update_properties_round_trips_and_reaches_the_write_target(
+        self, table: Table
+    ) -> None:
+        assert table.target_file_size == 512 * 1024 * 1024
+        before = table.version
+
+        table.update_properties({"write.target-file-size-bytes": "1048576"})
+        assert table.version == before + 1
+        assert table.properties["write.target-file-size-bytes"] == "1048576"
+        assert table.target_file_size == 1048576
+
+        # A sequence of pairs spells the same thing, and updates land before
+        # removes inside the one commit.
+        table.update_properties(
+            [("commit.retry.num-retries", "4")],
+            ["write.target-file-size-bytes"],
+        )
+        assert table.version == before + 2
+        assert "write.target-file-size-bytes" not in table.properties
+        assert table.properties["commit.retry.num-retries"] == "4"
+        assert table.target_file_size == 512 * 1024 * 1024
+
+    def test_a_call_given_nothing_commits_nothing(self, table: Table) -> None:
+        before = table.version
+
+        table.update_properties()
+        table.update_properties({}, [])
+
+        assert table.version == before
+
+
+class TestCompaction:
+    """Compaction merges undersized files and reports what it rewrote."""
+
+    def test_compact_merges_the_small_files_of_a_partition(
+        self, tmp_path: pathlib.Path, numbered: object
+    ) -> None:
+        table = Table.create(IOBase(tmp_path / "flat"), numbered)
+        for start in (1, 4, 7):
+            table.append(_rows(start))
+
+        files = table.inspect_files().read_all()
+        assert files.num_rows == 3
+        recorded = sum(files.column("file_size_in_bytes").to_pylist())
+
+        result = table.compact()
+        assert isinstance(result, Compaction)
+        assert result.files_before == 3
+        assert result.files_after == 1
+        assert result.bytes_rewritten == recorded
+
+        assert table.inspect_files().read_all().num_rows == 1
+        assert table.scan().read_all().num_rows == 9
+        assert table.current_snapshot is not None
+        assert table.current_snapshot.operation == "replace"
+
+        # The pre-compaction snapshot still reads exactly what it always read.
+        previous = table.snapshots[-2]
+        assert table.scan_at(previous.snapshot_id).read_all().num_rows == 9
+
+    def test_a_table_with_nothing_to_do_commits_nothing(
+        self, tmp_path: pathlib.Path, numbered: object
+    ) -> None:
+        table = Table.create(IOBase(tmp_path / "flat"), numbered)
+        table.append(_rows())
+        version = table.version
+
+        result = table.compact()
+
+        assert (result.files_before, result.files_after, result.bytes_rewritten) == (
+            0,
+            0,
+            0,
+        )
+        assert table.version == version
+
+
+class TestInspection:
+    """The table's own record renders as record batches."""
+
+    def test_the_inspection_readers_use_pyiceberg_column_names(
+        self, table: Table
+    ) -> None:
+        table.append(_rows())
+        table.overwrite(_rows(10))
+
+        history = table.inspect_history().read_all()
+        assert history.column_names == [
+            "made_current_at",
+            "snapshot_id",
+            "parent_id",
+            "is_current_ancestor",
+        ]
+        assert history.num_rows == 2
+        assert history.column("is_current_ancestor").to_pylist() == [True, True]
+
+        snapshots = table.inspect_snapshots().read_all()
+        assert snapshots.column_names == [
+            "committed_at",
+            "snapshot_id",
+            "parent_id",
+            "operation",
+            "manifest_list",
+            "summary",
+        ]
+        assert snapshots.column("operation").to_pylist() == ["append", "overwrite"]
+
+        files = table.inspect_files().read_all()
+        assert files.column_names == [
+            "file_path",
+            "file_format",
+            "spec_id",
+            "partition",
+            "record_count",
+            "file_size_in_bytes",
+        ]
+        assert files.num_rows == 3
+        assert sorted(files.column("partition").to_pylist()) == [
+            "venue=XNAS",
+            "venue=XNYS",
+            "venue=null",
+        ]
+
+
+class TestPromotions:
+    """`can_promote` is the one place the legal type promotions live."""
+
+    def test_the_legal_promotions_pass(self) -> None:
+        assert can_promote("int32", "int64") is None
+        assert can_promote(pa.float32(), pa.float64()) is None
+        assert can_promote("decimal128(10, 2)", "decimal128(20, 2)") is None
+        assert can_promote(DataType("int32"), DataType("int32")) is None
+
+    def test_everything_else_is_refused_naming_both_sides(self) -> None:
+        with pytest.raises(
+            ValueError, match="expected an Iceberg-legal promotion, got int64 to int32"
+        ):
+            can_promote("int64", "int32")
+        with pytest.raises(ValueError, match="promotion"):
+            can_promote("decimal128(10, 2)", "decimal128(10, 3)")
+        with pytest.raises(ValueError, match="promotion"):
+            can_promote(pa.int32(), pa.string())

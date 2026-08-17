@@ -112,6 +112,15 @@ path = "benchmarks/io.rs"
 harness = false
 required-features = ["parquet"]
 
+# The Iceberg table format: scan planning, metadata parsing, manifest
+# decoding, and the partition-text renderer. It needs the table format, which
+# implies Parquet, so it is not compiled in a default build.
+[[bench]]
+name = "iceberg"
+path = "benchmarks/iceberg.rs"
+harness = false
+required-features = ["iceberg"]
+
 [[test]]
 name = "batch_cast"
 required-features = ["arrow"]

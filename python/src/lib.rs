@@ -14,7 +14,7 @@ use crate::codec::{
     codec_encode_writer, codec_infer, codec_infer_path, codec_infer_text, codec_normalize_format,
 };
 use crate::datatype::{PyDataType, PyDataTypeIterator};
-use crate::field::{PyField, PyFieldMetadataIterator, PyFieldPropertyIterator};
+use crate::field::{PyField, PyFieldMetadataIterator, PyFieldPropertyIterator, PyProtocolMetadata};
 use crate::media::{PyMediaType, PyMediaTypeIterator, PyMimeType};
 use crate::uri::{PyUri, PyUriPathIterator, PyUrl, PyUrn};
 
@@ -104,6 +104,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyDataTypeIterator>()?;
     module.add_class::<PyFieldMetadataIterator>()?;
     module.add_class::<PyFieldPropertyIterator>()?;
+    module.add_class::<PyProtocolMetadata>()?;
     module.add_class::<PyDifferenceIterator>()?;
     module.add_class::<PyMimeType>()?;
     module.add_class::<PyMediaType>()?;
@@ -116,13 +117,17 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<io::PyIOBase>()?;
     module.add_class::<io::PyIOBaseIterator>()?;
     module.add_class::<record::PyRecordOptions>()?;
+    module.add_class::<iceberg::PyCatalog>()?;
     module.add_class::<iceberg::PyTable>()?;
+    module.add_class::<iceberg::PySchemaUpdate>()?;
+    module.add_class::<iceberg::PyCompaction>()?;
     module.add_class::<iceberg::PyPartitionSpec>()?;
     module.add_class::<iceberg::PyPartitionField>()?;
     module.add_class::<iceberg::PySnapshot>()?;
     module.add_class::<iceberg::PyManifestFile>()?;
     module.add_class::<iceberg::PyDataFile>()?;
     module.add_function(wrap_pyfunction!(iceberg::iceberg_assign_field_ids, module)?)?;
+    module.add_function(wrap_pyfunction!(iceberg::iceberg_can_promote, module)?)?;
     module.add_function(wrap_pyfunction!(iceberg::iceberg_schema_from_json, module)?)?;
     module.add_function(wrap_pyfunction!(iceberg::iceberg_schema_to_json, module)?)?;
     module.add_function(wrap_pyfunction!(codec_encode, module)?)?;

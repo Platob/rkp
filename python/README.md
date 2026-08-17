@@ -13,7 +13,7 @@ clock = DataType.time("microseconds")
 text = DataType(str)
 field = Field("price", price, nullable=False)
 field.set_table_name("bars")
-field.set_id(17)
+field.set_parquet_field_id(17)
 field.set_location("s3://warehouse/bars/data.arrow")
 field.set_property("postgres", "type", "numeric(18,4)")
 scalar = field.arrow_scalar(Decimal("12.5000"))
@@ -24,7 +24,7 @@ assert str(price) == "decimal128(18,4)"
 assert str(clock) == "time64(us)"
 assert text == DataType("utf8")
 assert field.to_arrow().name == "price"
-assert field.id == 17
+assert field.parquet_field_id == 17
 assert field["PARQUET:field_id"] == "17"
 assert field.location.scheme == "s3"
 assert field.get_property("postgres", "type") == "numeric(18,4)"
@@ -96,7 +96,7 @@ price = Field.from_pyhint(
 )
 
 assert price.to_arrow().type == pa.decimal128(9, 0)
-assert price.id == 7
+assert price.parquet_field_id == 7
 ```
 
 ```python

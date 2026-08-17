@@ -240,9 +240,13 @@ impl TableMetadata {
     ) -> Result<Self> {
         schema.validate_struct_root()?;
         let last_column_id = super::last_field_id(&schema)?;
+        // The schema says how the table is laid out, so the columns the spec
+        // partitions on are marked on it rather than only named beside it.
+        let schema = spec.mark_partitions(&schema)?;
         let last_partition_id = spec.last_field_id();
         let current_schema_id = schema
-            .get_metadata(super::schema::SCHEMA_ID_KEY)
+            .iceberg()
+            .get(super::schema::SCHEMA_ID)
             .and_then(|id| id.parse::<i32>().ok())
             .unwrap_or_default();
         Ok(Self {
@@ -288,7 +292,8 @@ impl TableMetadata {
     pub fn schema_by_id(&self, schema_id: i32) -> Option<&Field> {
         self.schemas.iter().find(|schema| {
             schema
-                .get_metadata(super::schema::SCHEMA_ID_KEY)
+                .iceberg()
+                .get(super::schema::SCHEMA_ID)
                 .and_then(|id| id.parse::<i32>().ok())
                 .unwrap_or_default()
                 == schema_id
@@ -341,30 +346,45 @@ impl TableMetadata {
             .find_map(|(name, value)| (name == key).then(|| value.as_str()))
     }
 
-    /// Add a schema, or return the identifier of an equal one already present.
+    /// Add a schema, numbering any unnumbered column, and return its fresh id.
     ///
     /// This is what schema evolution is at the metadata level: the old schema
-    /// stays, so a snapshot written under it still reads correctly, and the new
-    /// one becomes current. Column identifiers continue above `last-column-id`,
-    /// which is why an added column can never be confused with a dropped one.
+    /// stays, so a snapshot written under it still reads correctly, and the
+    /// caller chooses when the new one becomes current with
+    /// [`Self::set_current_schema`]. A column that carries no identifier is
+    /// numbered above `last-column-id` - above every identifier the table has
+    /// ever assigned, not merely the ones still in use - which is why an added
+    /// column can never be confused with a dropped one.
     ///
     /// # Errors
     ///
-    /// Returns an error when the schema is not a valid non-null struct root.
+    /// Returns an error when the schema is not a valid non-null struct root or
+    /// a column identifier would overflow.
     pub fn add_schema(&mut self, mut schema: Field) -> Result<i32> {
         schema.validate_struct_root()?;
+        let start = self.last_column_id.checked_add(1).ok_or_else(|| {
+            invalid(format_smolstr!(
+                "expected a last-column-id below {}, got {}",
+                i32::MAX,
+                self.last_column_id
+            ))
+        })?;
+        schema.assign_parquet_field_ids(start)?;
         let next_id = self
             .schemas
             .iter()
             .map(|existing| {
                 existing
-                    .get_metadata(super::schema::SCHEMA_ID_KEY)
+                    .iceberg()
+                    .get(super::schema::SCHEMA_ID)
                     .and_then(|id| id.parse::<i32>().ok())
                     .unwrap_or_default()
             })
             .max()
             .map_or(0, |highest| highest + 1);
-        schema.insert_metadata(super::schema::SCHEMA_ID_KEY, next_id.to_string())?;
+        schema
+            .iceberg_mut()
+            .insert(super::schema::SCHEMA_ID, next_id.to_string())?;
         self.last_column_id = self.last_column_id.max(super::last_field_id(&schema)?);
         self.schemas.push(schema);
         Ok(next_id)
@@ -433,6 +453,23 @@ impl TableMetadata {
             });
         }
 
+        // A document records the layout in its spec; a Field records it on the
+        // columns. Marking them here is what makes a table read back with the
+        // same schema it was created with, marks included.
+        let default_spec_id = document
+            .get_key_str("default-spec-id")
+            .and_then(Value::as_i64)
+            .and_then(|id| i32::try_from(id).ok())
+            .unwrap_or_default();
+        if let Some(spec) = partition_specs
+            .iter()
+            .find(|spec| spec.spec_id == default_spec_id)
+        {
+            for schema in &mut schemas {
+                *schema = spec.mark_partitions(schema)?;
+            }
+        }
+
         let mut sort_orders = Vec::new();
         for entry in document
             .get_key_str("sort-orders")
@@ -471,7 +508,7 @@ impl TableMetadata {
             .and_then(Value::as_i64)
             .filter(|id| *id >= 0);
 
-        Ok(Self {
+        let metadata = Self {
             format_version,
             table_uuid: SmolStr::new(
                 document
@@ -499,16 +536,20 @@ impl TableMetadata {
                 .and_then(|id| i32::try_from(id).ok())
                 .unwrap_or_default(),
             schemas,
-            default_spec_id: document
-                .get_key_str("default-spec-id")
-                .and_then(Value::as_i64)
-                .and_then(|id| i32::try_from(id).ok())
-                .unwrap_or_default(),
+            default_spec_id,
             last_partition_id: document
                 .get_key_str("last-partition-id")
                 .and_then(Value::as_i64)
                 .and_then(|id| i32::try_from(id).ok())
-                .unwrap_or(super::FIRST_PARTITION_ID - 1),
+                // v1 could omit the key, so it is recovered from the specs the
+                // way Iceberg's own reader recovers it.
+                .unwrap_or_else(|| {
+                    partition_specs
+                        .iter()
+                        .map(PartitionSpec::last_field_id)
+                        .max()
+                        .unwrap_or(super::FIRST_PARTITION_ID - 1)
+                }),
             partition_specs,
             default_sort_order_id: document
                 .get_key_str("default-sort-order-id")
@@ -533,7 +574,9 @@ impl TableMetadata {
             metadata_log: metadata_log(document),
             refs,
             next_row_id: document.get_key_str("next-row-id").and_then(Value::as_i64),
-        })
+        };
+        metadata.validate()?;
+        Ok(metadata)
     }
 
     /// Write this table metadata as the document its format version requires.
@@ -697,6 +740,686 @@ impl TableMetadata {
         }
         self.snapshots.push(snapshot);
     }
+
+    /// Set one table property, returning the value it replaces.
+    ///
+    /// Keys are unique and keep their insertion order, so a document written
+    /// after repeated updates lists its properties in the order they first
+    /// appeared.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key is empty; the properties are unchanged.
+    pub fn set_property(
+        &mut self,
+        key: impl Into<SmolStr>,
+        value: impl Into<SmolStr>,
+    ) -> Result<Option<SmolStr>> {
+        let key = key.into();
+        if key.is_empty() {
+            return Err(invalid(SmolStr::new_static(
+                "expected a non-empty property key, got \"\"",
+            )));
+        }
+        let value = value.into();
+        match self.properties.iter_mut().find(|(name, _)| *name == key) {
+            Some(entry) => Ok(Some(std::mem::replace(&mut entry.1, value))),
+            None => {
+                self.properties.push((key, value));
+                Ok(None)
+            }
+        }
+    }
+
+    /// Remove one table property, returning the value it held.
+    pub fn remove_property(&mut self, key: &str) -> Option<SmolStr> {
+        let index = self.properties.iter().position(|(name, _)| name == key)?;
+        Some(self.properties.remove(index).1)
+    }
+
+    /// Replace the table's base location.
+    pub fn set_location(&mut self, location: impl Into<SmolStr>) {
+        self.location = location.into();
+    }
+
+    /// Replace the table's UUID, validating the canonical 8-4-4-4-12 shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the input when it is not hyphenated hex of that
+    /// shape; the stored UUID is unchanged.
+    pub fn assign_uuid(&mut self, uuid: impl Into<SmolStr>) -> Result<()> {
+        let uuid = uuid.into();
+        if !is_uuid_shaped(&uuid) {
+            return Err(invalid(format_smolstr!(
+                "expected a UUID shaped 8-4-4-4-12 hex, got {:?}",
+                crate::text::elide_to(&uuid, 64)
+            )));
+        }
+        self.table_uuid = uuid;
+        Ok(())
+    }
+
+    /// Raise the format version, which is the only direction it can move.
+    ///
+    /// Upgrading to [`FormatVersion::V3`] initializes `next-row-id` to zero
+    /// when the table does not carry one yet, because v3 requires it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming both versions when `version` is below the
+    /// current one; the metadata is unchanged.
+    pub fn upgrade_format_version(&mut self, version: FormatVersion) -> Result<()> {
+        if version < self.format_version {
+            return Err(invalid(format_smolstr!(
+                "expected a format version of at least {}, got {}",
+                self.format_version.number(),
+                version.number()
+            )));
+        }
+        self.format_version = version;
+        if version >= FormatVersion::V3 && self.next_row_id.is_none() {
+            self.next_row_id = Some(0);
+        }
+        Ok(())
+    }
+
+    /// Make one already-added schema the one new data is written against.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the id when no schema carries it.
+    pub fn set_current_schema(&mut self, schema_id: i32) -> Result<()> {
+        if self.schema_by_id(schema_id).is_none() {
+            return Err(invalid(format_smolstr!(
+                "expected a schema with id {schema_id}, got {} schemas",
+                self.schemas.len()
+            )));
+        }
+        self.current_schema_id = schema_id;
+        Ok(())
+    }
+
+    /// Add a partition spec under the identifier it carries.
+    ///
+    /// `last-partition-id` stays monotone: it grows to cover the new spec's
+    /// highest field and never shrinks, so a retired partition field id is
+    /// never reassigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the id when the table already has a spec with
+    /// it; the specs are unchanged.
+    pub fn add_spec(&mut self, spec: PartitionSpec) -> Result<i32> {
+        if self.spec_by_id(spec.spec_id).is_some() {
+            return Err(invalid(format_smolstr!(
+                "expected an unused partition spec id, got {} which the table already has",
+                spec.spec_id
+            )));
+        }
+        self.last_partition_id = self.last_partition_id.max(spec.last_field_id());
+        let spec_id = spec.spec_id;
+        self.partition_specs.push(spec);
+        Ok(spec_id)
+    }
+
+    /// Make one already-added spec the one new data is written against.
+    ///
+    /// Every schema is re-marked with the spec's partition columns, the same
+    /// way [`Self::new`] and [`Self::from_json`] mark them, so a schema keeps
+    /// reporting the layout its rows are stored in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the id when no spec carries it, or a marking
+    /// failure; the metadata is unchanged on error.
+    pub fn set_default_spec(&mut self, spec_id: i32) -> Result<()> {
+        let Some(spec) = self.spec_by_id(spec_id) else {
+            return Err(invalid(format_smolstr!(
+                "expected a partition spec with id {spec_id}, got {} specs",
+                self.partition_specs.len()
+            )));
+        };
+        let spec = spec.clone();
+        let mut schemas = Vec::with_capacity(self.schemas.len());
+        for schema in &self.schemas {
+            schemas.push(spec.mark_partitions(schema)?);
+        }
+        self.schemas = schemas;
+        self.default_spec_id = spec_id;
+        Ok(())
+    }
+
+    /// Add a sort order under the identifier it carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the id when the table already has an order with
+    /// it; the orders are unchanged.
+    pub fn add_sort_order(&mut self, order: SortOrder) -> Result<i32> {
+        if self
+            .sort_orders
+            .iter()
+            .any(|existing| existing.order_id == order.order_id)
+        {
+            return Err(invalid(format_smolstr!(
+                "expected an unused sort order id, got {} which the table already has",
+                order.order_id
+            )));
+        }
+        let order_id = order.order_id;
+        self.sort_orders.push(order);
+        Ok(order_id)
+    }
+
+    /// Make one already-added sort order the one new data is written in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the id when no order carries it.
+    pub fn set_default_sort_order(&mut self, order_id: i32) -> Result<()> {
+        if !self
+            .sort_orders
+            .iter()
+            .any(|order| order.order_id == order_id)
+        {
+            return Err(invalid(format_smolstr!(
+                "expected a sort order with id {order_id}, got {} orders",
+                self.sort_orders.len()
+            )));
+        }
+        self.default_sort_order_id = order_id;
+        Ok(())
+    }
+
+    /// Point a named branch or tag at one retained snapshot.
+    ///
+    /// The reserved `main` branch is the current snapshot, so pointing it
+    /// somewhere also moves `current-snapshot-id` and records the move in the
+    /// snapshot log, the same way [`Self::set_current_snapshot`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot is not retained, or when `main` is
+    /// given anything but a branch; the refs are unchanged.
+    pub fn set_snapshot_ref(
+        &mut self,
+        name: impl Into<SmolStr>,
+        reference: SnapshotRef,
+    ) -> Result<()> {
+        let name = name.into();
+        if self.snapshot_by_id(reference.snapshot_id).is_none() {
+            return Err(invalid(format_smolstr!(
+                "expected a retained snapshot for ref {:?}, got unknown snapshot id {}",
+                crate::text::elide_to(&name, 64),
+                reference.snapshot_id
+            )));
+        }
+        if name == MAIN_BRANCH {
+            if reference.kind != "branch" {
+                return Err(invalid(format_smolstr!(
+                    "expected the reserved \"main\" ref to be a branch, got {:?}",
+                    crate::text::elide_to(&reference.kind, 64)
+                )));
+            }
+            if self.current_snapshot_id != Some(reference.snapshot_id) {
+                self.last_updated_ms = now_ms();
+                self.current_snapshot_id = Some(reference.snapshot_id);
+                self.snapshot_log
+                    .push((self.last_updated_ms, reference.snapshot_id));
+            }
+        }
+        match self.refs.iter_mut().find(|(existing, _)| *existing == name) {
+            Some(entry) => entry.1 = reference,
+            None => self.refs.push((name, reference)),
+        }
+        Ok(())
+    }
+
+    /// Remove one named reference, returning what it pointed at.
+    ///
+    /// Removing the reserved `main` branch clears `current-snapshot-id`, which
+    /// keeps the two spellings of "what a reader sees" agreeing: a table whose
+    /// main branch is gone has no current snapshot.
+    pub fn remove_snapshot_ref(&mut self, name: &str) -> Option<SnapshotRef> {
+        let index = self
+            .refs
+            .iter()
+            .position(|(existing, _)| existing == name)?;
+        let (_, reference) = self.refs.remove(index);
+        if name == MAIN_BRANCH {
+            self.current_snapshot_id = None;
+        }
+        Some(reference)
+    }
+
+    /// Return one named reference, when the table has it.
+    pub fn ref_by_name(&self, name: &str) -> Option<&SnapshotRef> {
+        self.refs
+            .iter()
+            .find_map(|(existing, reference)| (existing == name).then_some(reference))
+    }
+
+    /// Create a branch at one retained snapshot.
+    ///
+    /// ```
+    /// use yggdryl::iceberg::{FormatVersion, PartitionSpec, Snapshot, TableMetadata};
+    /// use yggdryl::iceberg::assign_field_ids;
+    /// use yggdryl::DataType;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+    ///     .required_field("row");
+    /// assign_field_ids(&mut schema, 1)?;
+    /// let mut metadata = TableMetadata::new(
+    ///     FormatVersion::V2,
+    ///     "file:///tmp/branches",
+    ///     schema,
+    ///     PartitionSpec::unpartitioned(),
+    /// )?;
+    /// metadata.set_current_snapshot(Snapshot {
+    ///     snapshot_id: 7,
+    ///     parent_snapshot_id: None,
+    ///     sequence_number: Some(1),
+    ///     timestamp_ms: 0,
+    ///     manifest_list: "".into(),
+    ///     summary: Vec::new(),
+    ///     schema_id: Some(0),
+    ///     first_row_id: None,
+    ///     added_rows: None,
+    /// });
+    ///
+    /// metadata.create_branch("dev", 7)?;
+    /// metadata.create_tag("v1", 7)?;
+    /// assert!(metadata.ref_by_name("dev").unwrap().is_branch());
+    /// assert!(metadata.ref_by_name("v1").unwrap().is_tag());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table already has a ref with this name or
+    /// when the snapshot is not retained; the refs are unchanged.
+    pub fn create_branch(&mut self, name: impl Into<SmolStr>, snapshot_id: i64) -> Result<()> {
+        let name = name.into();
+        self.expect_no_ref(&name)?;
+        self.set_snapshot_ref(name, SnapshotRef::branch(snapshot_id))
+    }
+
+    /// Create a tag at one retained snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table already has a ref with this name or
+    /// when the snapshot is not retained; the refs are unchanged.
+    pub fn create_tag(&mut self, name: impl Into<SmolStr>, snapshot_id: i64) -> Result<()> {
+        let name = name.into();
+        self.expect_no_ref(&name)?;
+        self.set_snapshot_ref(name, SnapshotRef::tag(snapshot_id))
+    }
+
+    /// Rename one reference, keeping what it points at and how it is retained.
+    ///
+    /// Renaming a branch *to* `main` goes through the same reserved-name rules
+    /// as pointing `main` anywhere: the branch's snapshot becomes the current
+    /// one, and a tag is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `from` is the reserved `main` branch, names no
+    /// ref, or `to` names one the table already has; the refs are unchanged.
+    pub fn rename_ref(&mut self, from: &str, to: impl Into<SmolStr>) -> Result<()> {
+        let to = to.into();
+        if from == MAIN_BRANCH {
+            return Err(invalid(SmolStr::new_static(
+                "expected a renameable ref, got the reserved \"main\" branch",
+            )));
+        }
+        let Some(reference) = self.ref_by_name(from) else {
+            return Err(invalid(format_smolstr!(
+                "expected a ref named {:?}, got {} refs",
+                crate::text::elide_to(from, 64),
+                self.refs.len()
+            )));
+        };
+        self.expect_no_ref(&to)?;
+        let reference = reference.clone();
+        self.set_snapshot_ref(to, reference)?;
+        self.remove_snapshot_ref(from);
+        Ok(())
+    }
+
+    /// Move a branch forward to a descendant of its current head.
+    ///
+    /// Fast-forwarding is the one branch move that cannot lose history, which
+    /// is why it is checked: the target must reach the current head by walking
+    /// parent ids. Moving `main` keeps `current-snapshot-id` and the snapshot
+    /// log in step, exactly as [`Self::set_snapshot_ref`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is not a branch, the target is not
+    /// retained, or the target does not descend from the branch's head; the
+    /// refs are unchanged.
+    pub fn fast_forward_branch(&mut self, name: &str, to_snapshot_id: i64) -> Result<()> {
+        let Some(reference) = self.ref_by_name(name) else {
+            return Err(invalid(format_smolstr!(
+                "expected a branch named {:?}, got {} refs",
+                crate::text::elide_to(name, 64),
+                self.refs.len()
+            )));
+        };
+        if !reference.is_branch() {
+            return Err(invalid(format_smolstr!(
+                "expected a branch named {:?}, got a {:?}",
+                crate::text::elide_to(name, 64),
+                crate::text::elide_to(&reference.kind, 64)
+            )));
+        }
+        let mut moved = reference.clone();
+        let head = moved.snapshot_id;
+        if self.snapshot_by_id(to_snapshot_id).is_none() {
+            return Err(invalid(format_smolstr!(
+                "expected a retained snapshot for ref {:?}, got unknown snapshot id \
+                 {to_snapshot_id}",
+                crate::text::elide_to(name, 64)
+            )));
+        }
+        if !self.descends_from(to_snapshot_id, head) {
+            return Err(invalid(format_smolstr!(
+                "expected {to_snapshot_id} to descend from {head}"
+            )));
+        }
+        moved.snapshot_id = to_snapshot_id;
+        self.set_snapshot_ref(SmolStr::new(name), moved)
+    }
+
+    /// Expire snapshots, honoring what every reference says to retain.
+    ///
+    /// `older_than_ms` is the default age cutoff: a snapshot committed before
+    /// it is old. What survives is exactly what the Iceberg retention rules
+    /// name - every ref target; for each branch, its head's ancestors younger
+    /// than the branch's own `max-snapshot-age-ms` when it has one (younger
+    /// than `older_than_ms` otherwise) and at least `min-snapshots-to-keep`
+    /// most recent ones; and the current snapshot, always. A tag keeps only
+    /// its target. Before any of that, a reference older than its own
+    /// `max-ref-age-ms` - measured from its snapshot's commit time - is
+    /// removed, except `main`, which never expires. The snapshot log is
+    /// trimmed with the removed snapshots, as [`Self::remove_snapshots`]
+    /// trims it.
+    ///
+    /// Returns the removed snapshot ids, sorted; a table with nothing old
+    /// returns an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the removal machinery refuses an id, which
+    /// the retained set rules out; nothing is removed on error.
+    pub fn expire_snapshots_older_than(&mut self, older_than_ms: i64) -> Result<Vec<i64>> {
+        let now = now_ms();
+
+        // Refs expire first, so a snapshot a dead ref pointed at is no longer
+        // anchored when retention is computed.
+        let expired: Vec<SmolStr> = self
+            .refs
+            .iter()
+            .filter(|(name, reference)| {
+                if name == MAIN_BRANCH {
+                    return false;
+                }
+                let Some(limit) = reference.max_ref_age_ms else {
+                    return false;
+                };
+                self.snapshot_by_id(reference.snapshot_id)
+                    .is_some_and(|snapshot| now.saturating_sub(snapshot.timestamp_ms) > limit)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &expired {
+            self.remove_snapshot_ref(name);
+        }
+
+        let mut retained: Vec<i64> = self.current_snapshot_id.into_iter().collect();
+        for (_, reference) in &self.refs {
+            retained.push(reference.snapshot_id);
+            if !reference.is_branch() {
+                continue;
+            }
+            let cutoff = match reference.max_snapshot_age_ms {
+                Some(age_ms) => now.saturating_sub(age_ms),
+                None => older_than_ms,
+            };
+            let keep_at_least = reference
+                .min_snapshots_to_keep
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(1);
+            let mut position = 1_usize;
+            let mut cursor = self
+                .snapshot_by_id(reference.snapshot_id)
+                .and_then(|head| head.parent_snapshot_id);
+            while let Some(id) = cursor {
+                position += 1;
+                // A corrupt parent chain could cycle; the walk is bounded by
+                // the ancestors a table can actually hold.
+                let Some(snapshot) = self
+                    .snapshot_by_id(id)
+                    .filter(|_| position <= self.snapshots.len())
+                else {
+                    break;
+                };
+                if position <= keep_at_least || snapshot.timestamp_ms >= cutoff {
+                    retained.push(id);
+                }
+                cursor = snapshot.parent_snapshot_id;
+            }
+        }
+
+        let mut removed: Vec<i64> = self
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id)
+            .filter(|id| !retained.contains(id))
+            .collect();
+        removed.sort_unstable();
+        if !removed.is_empty() {
+            self.remove_snapshots(&removed)?;
+        }
+        Ok(removed)
+    }
+
+    /// Refuse a name the table already has a reference under.
+    fn expect_no_ref(&self, name: &str) -> Result<()> {
+        let Some(existing) = self.ref_by_name(name) else {
+            return Ok(());
+        };
+        Err(invalid(format_smolstr!(
+            "expected no ref named {:?}, got a {:?}",
+            crate::text::elide_to(name, 64),
+            crate::text::elide_to(&existing.kind, 64)
+        )))
+    }
+
+    /// Return whether one snapshot reaches another by walking parent ids.
+    fn descends_from(&self, descendant: i64, ancestor: i64) -> bool {
+        let mut cursor = Some(descendant);
+        let mut steps = 0_usize;
+        while let Some(id) = cursor {
+            if id == ancestor {
+                return true;
+            }
+            // A corrupt parent chain could cycle; the walk is bounded by the
+            // ancestors a table can actually hold.
+            steps += 1;
+            if steps > self.snapshots.len() {
+                return false;
+            }
+            cursor = self
+                .snapshot_by_id(id)
+                .and_then(|snapshot| snapshot.parent_snapshot_id);
+        }
+        false
+    }
+
+    /// Expire snapshots by id, trimming the snapshot log with them.
+    ///
+    /// An id the table does not hold is ignored, so a caller can expire a set
+    /// without checking it first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the snapshot - and the ref, when one points at
+    /// it - when an id is the current snapshot or a named reference's target;
+    /// nothing is removed on error.
+    pub fn remove_snapshots(&mut self, ids: &[i64]) -> Result<()> {
+        for id in ids {
+            if self.current_snapshot_id == Some(*id) {
+                return Err(invalid(format_smolstr!(
+                    "expected non-current snapshots to remove, got the current snapshot {id}"
+                )));
+            }
+            if let Some((name, _)) = self
+                .refs
+                .iter()
+                .find(|(_, reference)| reference.snapshot_id == *id)
+            {
+                return Err(invalid(format_smolstr!(
+                    "expected unreferenced snapshots to remove, got {id} which ref {name:?} \
+                     points at"
+                )));
+            }
+        }
+        self.snapshots
+            .retain(|snapshot| !ids.contains(&snapshot.snapshot_id));
+        self.snapshot_log.retain(|(_, id)| !ids.contains(id));
+        Ok(())
+    }
+
+    /// Check that this document's cross-references resolve.
+    ///
+    /// This is what [`Self::from_json`] runs after reading and what a commit
+    /// runs before writing: the current schema, spec, sort order, and snapshot
+    /// ids resolve; the current schema's field ids are unique and non-zero
+    /// with `last-column-id` at or above them; `last-partition-id` covers
+    /// every spec; and every named ref points at a retained snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the first identifier that does not hold.
+    pub fn validate(&self) -> Result<()> {
+        let schema = self.current_schema()?;
+        let mut ids = Vec::new();
+        collect_field_ids(schema, &mut ids)?;
+        if ids.contains(&0) {
+            return Err(invalid(format_smolstr!(
+                "expected non-zero field ids in schema {}, got 0",
+                self.current_schema_id
+            )));
+        }
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        for pair in sorted.windows(2) {
+            if pair[0] == pair[1] {
+                return Err(invalid(format_smolstr!(
+                    "expected unique field ids in schema {}, got {} more than once",
+                    self.current_schema_id,
+                    pair[0]
+                )));
+            }
+        }
+        if let Some(highest) = sorted.last().copied() {
+            if self.last_column_id < highest {
+                return Err(invalid(format_smolstr!(
+                    "expected a last-column-id of at least {highest}, got {}",
+                    self.last_column_id
+                )));
+            }
+        }
+        self.default_spec()?;
+        for spec in &self.partition_specs {
+            if !spec.fields.is_empty() && spec.last_field_id() > self.last_partition_id {
+                return Err(invalid(format_smolstr!(
+                    "expected a last-partition-id of at least {} for partition spec {}, got {}",
+                    spec.last_field_id(),
+                    spec.spec_id,
+                    self.last_partition_id
+                )));
+            }
+        }
+        if !self
+            .sort_orders
+            .iter()
+            .any(|order| order.order_id == self.default_sort_order_id)
+        {
+            return Err(invalid(format_smolstr!(
+                "expected a sort order with id {}, got {} orders",
+                self.default_sort_order_id,
+                self.sort_orders.len()
+            )));
+        }
+        if let Some(current) = self.current_snapshot_id {
+            if self.snapshot_by_id(current).is_none() {
+                return Err(invalid(format_smolstr!(
+                    "expected a snapshot with id {current}, got {} snapshots",
+                    self.snapshots.len()
+                )));
+            }
+        }
+        for (name, reference) in &self.refs {
+            if self.snapshot_by_id(reference.snapshot_id).is_none() {
+                return Err(invalid(format_smolstr!(
+                    "expected a retained snapshot for ref {:?}, got unknown snapshot id {}",
+                    crate::text::elide_to(name, 64),
+                    reference.snapshot_id
+                )));
+            }
+            // The two branch retention limits describe ancestors, which only
+            // a branch has, so anything else carrying one is malformed.
+            if !reference.is_branch() {
+                let branch_only = if reference.min_snapshots_to_keep.is_some() {
+                    Some("min-snapshots-to-keep")
+                } else if reference.max_snapshot_age_ms.is_some() {
+                    Some("max-snapshot-age-ms")
+                } else {
+                    None
+                };
+                if let Some(key) = branch_only {
+                    return Err(invalid(format_smolstr!(
+                        "expected a branch for {key} on ref {:?}, got a {:?}",
+                        crate::text::elide_to(name, 64),
+                        crate::text::elide_to(&reference.kind, 64)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Collect every field identifier below a schema root, depth first.
+fn collect_field_ids(node: &Field, ids: &mut Vec<i32>) -> Result<()> {
+    for index in 0..node.data_type().field_len() {
+        let Some(child) = node.data_type().get_field(index) else {
+            continue;
+        };
+        if let Some(id) = child.parquet_field_id()? {
+            ids.push(id);
+        }
+        collect_field_ids(child, ids)?;
+    }
+    Ok(())
+}
+
+/// Return whether text has the canonical hyphenated 8-4-4-4-12 UUID shape.
+fn is_uuid_shaped(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(index, byte)| match index {
+        8 | 13 | 18 | 23 => *byte == b'-',
+        _ => byte.is_ascii_hexdigit(),
+    })
 }
 
 /// Read a `snapshot-log`-shaped array of timestamped identifiers.
