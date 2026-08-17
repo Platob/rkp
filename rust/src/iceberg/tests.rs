@@ -150,14 +150,17 @@ mod schema_documents {
         .required_field("row");
 
         assert_eq!(assign_field_ids(&mut schema, 1).unwrap(), 4);
-        assert_eq!(schema.fields()[0].id().unwrap(), Some(1));
-        assert_eq!(schema.fields()[1].id().unwrap(), Some(2));
-        assert_eq!(schema.fields()[1].fields()[0].id().unwrap(), Some(3));
+        assert_eq!(schema.fields()[0].parquet_field_id().unwrap(), Some(1));
+        assert_eq!(schema.fields()[1].parquet_field_id().unwrap(), Some(2));
+        assert_eq!(
+            schema.fields()[1].fields()[0].parquet_field_id().unwrap(),
+            Some(3)
+        );
         assert_eq!(super::super::last_field_id(&schema).unwrap(), 3);
 
         // A second pass changes nothing, because every field already has an id.
         assert_eq!(assign_field_ids(&mut schema, 100).unwrap(), 100);
-        assert_eq!(schema.fields()[0].id().unwrap(), Some(1));
+        assert_eq!(schema.fields()[0].parquet_field_id().unwrap(), Some(1));
     }
 
     #[test]
@@ -568,7 +571,10 @@ mod partition_specs {
         let partition = spec.partition_field(&schema).unwrap();
         assert!(!schema.fields()[0].is_nullable());
         assert!(partition.fields()[0].is_nullable());
-        assert_eq!(partition.fields()[0].id().unwrap(), Some(1000));
+        assert_eq!(
+            partition.fields()[0].parquet_field_id().unwrap(),
+            Some(1000)
+        );
     }
 }
 
@@ -1671,10 +1677,7 @@ fn time_travel_reads_a_previous_snapshot_by_id_and_by_ref() {
         .commit_changes(|metadata| {
             metadata.refs.push((
                 smol_str::SmolStr::new("audit"),
-                crate::iceberg::SnapshotRef {
-                    snapshot_id: past,
-                    kind: smol_str::SmolStr::new_static("tag"),
-                },
+                crate::iceberg::SnapshotRef::tag(past),
             ));
             Ok(())
         })
@@ -2242,7 +2245,7 @@ fn a_wide_schema_round_trips_with_every_field_numbered() {
     .unwrap()
     .required_field("row");
     assign_field_ids(&mut schema, 1).unwrap();
-    assert_eq!(schema.max_id().unwrap(), Some(300));
+    assert_eq!(schema.max_parquet_field_id().unwrap(), Some(300));
 
     let mut table = Table::create(
         Folder::new(&path).unwrap(),

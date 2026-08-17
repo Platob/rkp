@@ -232,7 +232,10 @@ fn a_table_written_by_pyiceberg_reads_here() {
 
     let schema = table.schema().expect("an external schema");
     assert_eq!(schema.field_len(), 3);
-    assert_eq!(schema.fields()[0].id().expect("an id"), Some(1));
+    assert_eq!(
+        schema.fields()[0].parquet_field_id().expect("an id"),
+        Some(1)
+    );
 
     let files = table.data_files().expect("external data files");
     assert!(!files.is_empty(), "an external table names its data files");

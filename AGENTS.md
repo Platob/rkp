@@ -607,12 +607,17 @@ Keep these conversion names exact; do not add alternate aliases:
   `has_partition_fields`, `only_partition_fields`, `without_partition_fields`,
   and `with_partition_fields`. An unmarked field stores no marker at all, so
   two schemas that partition the same way stay exactly equal.
-- Arrow/Parquet Field identity is exactly `id`, `set_id`, `remove_id`, and
-  `with_id`. Store it under the exact Arrow convention `PARQUET:field_id` as a
-  canonical signed 32-bit decimal integer. Generic metadata construction,
-  import, parsing, and deserialization must apply the same validation and
-  canonicalization; do not introduce a second `id` key or confuse it with an
-  independent protocol property such as `iceberg:field_id`.
+- Arrow/Parquet Field identity is exactly `parquet_field_id`,
+  `set_parquet_field_id`, `remove_parquet_field_id`, and
+  `with_parquet_field_id`, with the schema-tree walks
+  `assign_parquet_field_ids`, `max_parquet_field_id`, and
+  `field_by_parquet_field_id`. Store it under the exact Arrow convention
+  `PARQUET:field_id` as a canonical signed 32-bit decimal integer. Generic
+  metadata construction, import, parsing, and deserialization must apply the
+  same validation and canonicalization; do not introduce a second field-id
+  key, do not add a generically named `id` alias on `Field`, and do not
+  confuse it with an independent protocol property such as
+  `iceberg:field_id`.
 - HTTP Field reads expose raw `accept*`, `cache_control`, `content_*`, `etag`,
   `expires`, `last_modified`, `range`, and `vary` values plus typed
   `content_length`, `http_location`, `mime_type`, and `media_type` projections.

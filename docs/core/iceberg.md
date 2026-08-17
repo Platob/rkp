@@ -1870,17 +1870,17 @@ by id survives a rename, and a new column can never reuse a retired id.
 
     // Depth first from `start`; the return value is the first id it did not use.
     assert_eq!(assign_field_ids(&mut schema, 1)?, 4);
-    assert_eq!(schema.fields()[0].id()?, Some(1));
-    assert_eq!(schema.fields()[1].id()?, Some(2));
-    assert_eq!(schema.fields()[1].fields()[0].id()?, Some(3));
+    assert_eq!(schema.fields()[0].parquet_field_id()?, Some(1));
+    assert_eq!(schema.fields()[1].parquet_field_id()?, Some(2));
+    assert_eq!(schema.fields()[1].fields()[0].parquet_field_id()?, Some(3));
     assert_eq!(last_field_id(&schema)?, 3, "what a table records as last-column-id");
 
     // The root is not a column, so it is not numbered.
-    assert_eq!(schema.id()?, None);
+    assert_eq!(schema.parquet_field_id()?, None);
 
     // A field that already carries an id keeps it, so a second pass changes nothing.
     assert_eq!(assign_field_ids(&mut schema, 100)?, 100);
-    assert_eq!(schema.fields()[0].id()?, Some(1));
+    assert_eq!(schema.fields()[0].parquet_field_id()?, Some(1));
     ```
 
 === "Python"
@@ -1901,14 +1901,14 @@ by id survives a rename, and a new column can never reuse a retired id.
     # Depth first from `start`; the numbered schema is what comes back, so the
     # schema handed in is left as it was.
     schema = assign_field_ids(columns, 1)
-    assert [child.id for child in schema.data_type] == [1, 2]
-    assert schema.data_type[1].data_type[0].id == 3
+    assert [child.parquet_field_id for child in schema.data_type] == [1, 2]
+    assert schema.data_type[1].data_type[0].parquet_field_id == 3
 
     # The root is not a column, so it is not numbered.
-    assert schema.id is None
+    assert schema.parquet_field_id is None
 
     # A field that already carries an id keeps it, so a second pass changes nothing.
-    assert [child.id for child in assign_field_ids(schema, 100).data_type] == [1, 2]
+    assert [child.parquet_field_id for child in assign_field_ids(schema, 100).data_type] == [1, 2]
     ```
 
 === "JavaScript"
@@ -1923,16 +1923,16 @@ by id survives a rename, and a new column can never reuse a retired id.
     // Depth first from `start`; the numbered schema is what comes back, so the
     // schema handed in is left as it was.
     const schema = iceberg.assignFieldIds(plain)
-    assert.equal(plain.dataType.at(0).id, null)
-    assert.equal(schema.dataType.at(0).id, 1)
-    assert.equal(schema.dataType.at(1).id, 2)
-    assert.equal(schema.dataType.at(1).dataType.at(0).id, 3)
+    assert.equal(plain.dataType.at(0).parquetFieldId, null)
+    assert.equal(schema.dataType.at(0).parquetFieldId, 1)
+    assert.equal(schema.dataType.at(1).parquetFieldId, 2)
+    assert.equal(schema.dataType.at(1).dataType.at(0).parquetFieldId, 3)
 
     // The root is not a column, so it is not numbered.
-    assert.equal(schema.id, null)
+    assert.equal(schema.parquetFieldId, null)
 
     // A field that already carries an id keeps it, so a second pass changes nothing.
-    assert.equal(iceberg.assignFieldIds(schema, 100).dataType.at(0).id, 1)
+    assert.equal(iceberg.assignFieldIds(schema, 100).dataType.at(0).parquetFieldId, 1)
     ```
 
 Numbering is explicit, never implicit: a field tree built in Rust has no ids until `assign_field_ids`
@@ -2043,8 +2043,8 @@ accepted, so a change that would reinterpret stored values is refused naming bot
     let current = table.schema()?;
     assert_eq!(current.get_field_by_name("id").expect("the column").data_type(), &DataType::Int64);
     // A renamed column keeps its identifier: the name is a label, the id is the column.
-    assert_eq!(current.get_field_by_name("ticker").expect("the column").id()?, Some(2));
-    assert_eq!(current.get_field_by_name("venue").expect("the column").id()?, Some(3));
+    assert_eq!(current.get_field_by_name("ticker").expect("the column").parquet_field_id()?, Some(2));
+    assert_eq!(current.get_field_by_name("venue").expect("the column").parquet_field_id()?, Some(3));
 
     let _ = std::fs::remove_dir_all(&root);
     ```
@@ -2084,7 +2084,7 @@ accepted, so a change that would reinterpret stored values is refused naming bot
     assert [child.name for child in children] == ["id", "ticker", "venue"]
     assert str(children[0].data_type) == "int64"
     # A renamed column keeps its identifier: the name is a label, the id is the column.
-    assert [child.id for child in children] == [1, 2, 3]
+    assert [child.parquet_field_id for child in children] == [1, 2, 3]
 
     shutil.rmtree(root.parent)
     ```
@@ -2124,7 +2124,7 @@ accepted, so a change that would reinterpret stored values is refused naming bot
     assert.deepEqual(Array.from(evolved.dataType, (child) => child.name), ['id', 'ticker', 'venue'])
     assert.equal(String(evolved.dataType.at(0).dataType), 'int64')
     // A renamed column keeps its identifier: the name is a label, the id is the column.
-    assert.deepEqual(Array.from(evolved.dataType, (child) => child.id), [1, 2, 3])
+    assert.deepEqual(Array.from(evolved.dataType, (child) => child.parquetFieldId), [1, 2, 3])
 
     fs.rmSync(path.dirname(root), { recursive: true, force: true })
     ```
@@ -2165,7 +2165,7 @@ grows, so a reader of an old file can never mistake a retired column for a new o
     // `required` inverts into nullability, and `id` becomes PARQUET:field_id.
     assert!(!schema.fields()[0].is_nullable());
     assert!(schema.fields()[1].is_nullable());
-    assert_eq!(schema.fields()[0].id()?, Some(1));
+    assert_eq!(schema.fields()[0].parquet_field_id()?, Some(1));
     assert_eq!(schema.fields()[0].get_metadata("PARQUET:field_id"), Some("1"));
 
     // The same document comes back out.
@@ -2194,7 +2194,7 @@ grows, so a reader of an old file can never mistake a retired column for a new o
     # `required` inverts into nullability, and `id` becomes PARQUET:field_id.
     assert not schema.data_type[0].nullable
     assert schema.data_type[1].nullable
-    assert schema.data_type[0].id == 1
+    assert schema.data_type[0].parquet_field_id == 1
     assert schema.data_type[0]["PARQUET:field_id"] == "1"
 
     # The same document comes back out.
@@ -2224,7 +2224,7 @@ grows, so a reader of an old file can never mistake a retired column for a new o
     // `required` inverts into nullability, and `id` becomes PARQUET:field_id.
     assert.equal(schema.dataType.at(0).nullable, false)
     assert.equal(schema.dataType.at(1).nullable, true)
-    assert.equal(schema.dataType.at(0).id, 1)
+    assert.equal(schema.dataType.at(0).parquetFieldId, 1)
     assert.equal(schema.dataType.at(0).get('PARQUET:field_id'), '1')
 
     // The same document comes back out.
@@ -2391,7 +2391,7 @@ let schema = schema_from_json("row", &document)?;
 let legs = &schema.fields()[0];
 let DataType::List(element) = legs.data_type() else { panic!("expected a list") };
 assert_eq!(element.name(), "element");
-assert_eq!(element.id()?, Some(2));
+assert_eq!(element.parquet_field_id()?, Some(2));
 assert!(!element.is_nullable());
 assert_eq!(element.fields()[0].name(), "price");
 
@@ -2402,7 +2402,7 @@ assert_eq!(map.entries().name(), "entries");
 assert!(!map.entries().is_nullable());
 assert!(!map.entries().fields()[0].is_nullable());
 assert!(map.entries().fields()[1].is_nullable());
-assert_eq!(map.entries().fields()[0].id()?, Some(5));
+assert_eq!(map.entries().fields()[0].parquet_field_id()?, Some(5));
 
 assert_eq!(schema_to_json(&schema)?, document);
 ```
@@ -2443,8 +2443,8 @@ media.write_batch_reader(arrow::batch_reader(
 
 // The ids Iceberg assigned are the ids in the file.
 let written = media.read_field()?;
-assert_eq!(written.fields()[0].id()?, Some(7));
-assert_eq!(written.fields()[1].id()?, Some(8));
+assert_eq!(written.fields()[0].parquet_field_id()?, Some(7));
+assert_eq!(written.fields()[1].parquet_field_id()?, Some(8));
 assert!(!written.fields()[0].is_nullable());
 ```
 

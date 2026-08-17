@@ -133,7 +133,7 @@ impl Filter {
                 crate::text::elide_display(&columns),
             ))
         })?;
-        let id = field.id()?.ok_or_else(|| {
+        let id = field.parquet_field_id()?.ok_or_else(|| {
             invalid(format_smolstr!(
                 "expected a PARQUET:field_id on the filter column {column:?}, got none"
             ))

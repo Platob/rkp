@@ -204,8 +204,8 @@ impl JsField {
 
     /// Arrow/Parquet signed 32-bit field identifier stored in metadata.
     #[napi(getter)]
-    pub fn id(&self) -> Result<Option<i32>> {
-        self.inner.id().map_err(napi_error)
+    pub fn parquet_field_id(&self) -> Result<Option<i32>> {
+        self.inner.parquet_field_id().map_err(napi_error)
     }
 
     /// Typed location URL stored canonically in Arrow-compatible metadata.
@@ -442,15 +442,15 @@ impl JsField {
 
     /// Set the canonical Arrow/Parquet signed 32-bit field identifier.
     #[napi]
-    pub fn set_id(&mut self, id: f64) -> Result<()> {
-        self.inner.set_id(exact_i32(id, "field ID")?);
+    pub fn set_parquet_field_id(&mut self, id: f64) -> Result<()> {
+        self.inner.set_parquet_field_id(exact_i32(id, "field ID")?);
         Ok(())
     }
 
     /// Remove and return the Arrow/Parquet signed 32-bit field identifier.
     #[napi]
-    pub fn remove_id(&mut self) -> Result<Option<i32>> {
-        self.inner.remove_id().map_err(napi_error)
+    pub fn remove_parquet_field_id(&mut self) -> Result<Option<i32>> {
+        self.inner.remove_parquet_field_id().map_err(napi_error)
     }
 
     /// Set a typed location from any native identifier wrapper or URL string.

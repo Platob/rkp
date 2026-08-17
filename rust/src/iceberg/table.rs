@@ -1335,7 +1335,7 @@ impl KeyBounds {
                     crate::text::elide_display(&stored),
                 ))
             })?;
-            let id = field.id()?;
+            let id = field.parquet_field_id()?;
             let mut bound = KeyBound {
                 id: id.unwrap_or_default(),
                 data_type: field.data_type().clone(),

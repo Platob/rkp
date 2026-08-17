@@ -228,7 +228,7 @@ test('typed names, locations, and protocol properties share Arrow metadata', () 
   field.setCatalogName('analytics')
   field.setSchemaName('market')
   field.setTableName('bars')
-  field.setId(-2147483648)
+  field.setParquetFieldId(-2147483648)
   field.setLocation(
     Uri.fromString('s3://warehouse/bars/day=2026-08-15/data.parquet'),
   )
@@ -237,7 +237,7 @@ test('typed names, locations, and protocol properties share Arrow metadata', () 
   assert.equal(field.catalogName, 'analytics')
   assert.equal(field.schemaName, 'market')
   assert.equal(field.tableName, 'bars')
-  assert.equal(field.id, -2147483648)
+  assert.equal(field.parquetFieldId, -2147483648)
   assert.equal(field.get('PARQUET:field_id'), '-2147483648')
   assert.ok(
     field.location.equals(
@@ -271,35 +271,35 @@ test('typed names, locations, and protocol properties share Arrow metadata', () 
   assert.equal(field.removeCatalogName(), 'analytics')
   assert.equal(field.removeSchemaName(), 'market')
   assert.equal(field.removeTableName(), 'bars')
-  assert.equal(field.removeId(), -2147483648)
+  assert.equal(field.removeParquetFieldId(), -2147483648)
   assert.ok(
     field
       .removeLocation()
       .equals(Url.fromString('s3://warehouse/bars/day=2026-08-15/data.parquet')),
   )
   assert.equal(field.location, null)
-  assert.equal(field.id, null)
+  assert.equal(field.parquetFieldId, null)
 })
 
 test('field ID uses canonical signed int32 Arrow metadata', () => {
   const field = new Field('id', 'int64', false)
   field.set('PARQUET:field_id', '+00017')
-  assert.equal(field.id, 17)
+  assert.equal(field.parquetFieldId, 17)
   assert.equal(field.get('PARQUET:field_id'), '17')
 
-  field.setId(2147483647)
-  assert.equal(Field.fromJSON(field.toJSON()).id, 2147483647)
-  assert.equal(Field.fromString(field.toString()).id, 2147483647)
+  field.setParquetFieldId(2147483647)
+  assert.equal(Field.fromJSON(field.toJSON()).parquetFieldId, 2147483647)
+  assert.equal(Field.fromString(field.toString()).parquetFieldId, 2147483647)
 
   assert.throws(() => field.set('PARQUET:field_id', '2147483648'))
   assert.throws(() => field.set('PARQUET:field_id', '1.0'))
-  assert.throws(() => field.setId(2147483648))
-  assert.throws(() => field.setId(-2147483649))
-  assert.throws(() => field.setId(1.5))
-  assert.throws(() => field.setId(Number.NaN))
-  assert.throws(() => field.setId(Number.POSITIVE_INFINITY))
-  assert.throws(() => field.setId('17'))
-  assert.equal(field.id, 2147483647)
+  assert.throws(() => field.setParquetFieldId(2147483648))
+  assert.throws(() => field.setParquetFieldId(-2147483649))
+  assert.throws(() => field.setParquetFieldId(1.5))
+  assert.throws(() => field.setParquetFieldId(Number.NaN))
+  assert.throws(() => field.setParquetFieldId(Number.POSITIVE_INFINITY))
+  assert.throws(() => field.setParquetFieldId('17'))
+  assert.equal(field.parquetFieldId, 2147483647)
 })
 
 test('typed metadata rejects invalid updates atomically', () => {

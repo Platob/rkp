@@ -82,7 +82,7 @@ pub(super) fn data_file(schema: &Field, statistics: &FileStatistics) -> Result<D
 fn leaf_columns(schema: &Field) -> Result<Vec<(String, i32, DataType)>> {
     let mut columns = Vec::with_capacity(schema.field_len());
     for field in schema.fields() {
-        let id = field.id()?.ok_or_else(|| {
+        let id = field.parquet_field_id()?.ok_or_else(|| {
             invalid(format_smolstr!(
                 "expected a PARQUET:field_id on {:?}; call assign_field_ids first",
                 field.name()

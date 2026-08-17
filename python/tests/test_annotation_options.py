@@ -32,7 +32,7 @@ def test_field_options_resolve_left_to_right_before_caller_metadata() -> None:
 
     assert field.to_arrow().type == pa.decimal128(9, 0)
     assert not field.nullable
-    assert field.id == 7
+    assert field.parquet_field_id == 7
     assert dict(field.items()) == {
         "PARQUET:field_id": "7",
         "nullable": "metadata-value",
@@ -53,7 +53,7 @@ def test_field_options_resolve_left_to_right_before_caller_metadata() -> None:
             ("metadata", {"PARQUET:field_id": "+003"}),
         ],
     )
-    assert canonical_id.id == 3
+    assert canonical_id.parquet_field_id == 3
     with pytest.raises(TypeError, match=r"conflicting Annotated id"):
         Field.from_pyhint(
             "id",
@@ -156,7 +156,7 @@ def test_only_final_structural_option_values_are_validated() -> None:
         ],
     )
     assert field.nullable
-    assert field.id == 7
+    assert field.parquet_field_id == 7
 
     dictionary = Field.from_pyhint(
         "value",
@@ -204,7 +204,7 @@ def test_only_final_structural_option_values_are_validated() -> None:
             ("metadata", {"layer": "outer"}),
         ],
     )
-    assert alias_overlay.id == 2
+    assert alias_overlay.parquet_field_id == 2
     assert alias_overlay["layer"] == "outer"
     assert alias_overlay["inner"] == "kept"
 
@@ -266,7 +266,7 @@ def test_extension_override_preserves_identity_and_protects_metadata() -> None:
         ]
         promoted = Field.from_pyhint("code", member | None)
         assert promoted.to_arrow().type == extension
-        assert promoted.id == 17
+        assert promoted.parquet_field_id == 17
         assert promoted["member"] == "preserved"
 
         identical = Field.from_pyhint(
@@ -543,7 +543,7 @@ def test_optional_collapse_promotes_sole_member_field_state() -> None:
     ]
     promoted = Field.from_pyhint("value", typing.Optional[member])
     assert not promoted.nullable
-    assert promoted.id == 7
+    assert promoted.parquet_field_id == 7
     assert promoted["member"] == "preserved"
 
     identity_override = Field.from_pyhint(
@@ -564,7 +564,7 @@ def test_optional_collapse_promotes_sole_member_field_state() -> None:
         ],
     )
     assert outer.nullable
-    assert outer.id == 8
+    assert outer.parquet_field_id == 8
     assert outer["member"] == "outer"
 
     constrained = typing.TypeVar(
@@ -574,23 +574,23 @@ def test_optional_collapse_promotes_sole_member_field_state() -> None:
     )
     promoted_constraint = Field.from_pyhint("value", constrained)
     assert not promoted_constraint.nullable
-    assert promoted_constraint.id == 7
+    assert promoted_constraint.parquet_field_id == 7
     assert promoted_constraint["member"] == "preserved"
 
     bound = typing.TypeVar("bound", bound=typing.Optional[member])
     promoted_bound = Field.from_pyhint("value", bound)
     assert not promoted_bound.nullable
-    assert promoted_bound.id == 7
+    assert promoted_bound.parquet_field_id == 7
 
     wrapped = typing.NewType("wrapped", typing.Optional[member])
     promoted_newtype = Field.from_pyhint("value", wrapped)
     assert not promoted_newtype.nullable
-    assert promoted_newtype.id == 7
+    assert promoted_newtype.parquet_field_id == 7
 
     plain_bound = typing.TypeVar("plain_bound", bound=member)
-    assert Field.from_pyhint("value", plain_bound).id == 7
+    assert Field.from_pyhint("value", plain_bound).parquet_field_id == 7
     plain_newtype = typing.NewType("plain_newtype", member)
-    assert Field.from_pyhint("value", plain_newtype).id == 7
+    assert Field.from_pyhint("value", plain_newtype).parquet_field_id == 7
 
 
 def test_plain_class_classvar_options_do_not_disappear() -> None:

@@ -69,14 +69,14 @@ class TestSchemasCarryIdentifiers:
         numbered = assign_field_ids(SCHEMA)
 
         assert numbered.name == "row"
-        assert [child.id for child in numbered.data_type] == [1, 2]
+        assert [child.parquet_field_id for child in numbered.data_type] == [1, 2]
         # The input is untouched: the numbered schema is a new value.
         assert SCHEMA.field("id").metadata is None
 
     def test_numbering_starts_where_it_is_told_to(self) -> None:
         numbered = assign_field_ids(SCHEMA, 10)
 
-        assert [child.id for child in numbered.data_type] == [10, 11]
+        assert [child.parquet_field_id for child in numbered.data_type] == [10, 11]
 
     def test_a_root_that_is_not_a_non_null_struct_is_refused(
         self, tmp_path: pathlib.Path
@@ -100,7 +100,7 @@ class TestSchemasCarryIdentifiers:
         # `required` inverts into nullability, and `id` becomes PARQUET:field_id.
         assert not schema.data_type[0].nullable
         assert schema.data_type[1].nullable
-        assert [child.id for child in schema.data_type] == [1, 2]
+        assert [child.parquet_field_id for child in schema.data_type] == [1, 2]
 
         assert schema_to_json(schema) == document
 
@@ -371,7 +371,7 @@ class TestCatalog:
 
         # The schema was inferred from the reader and numbered, and the marked
         # column became the identity spec.
-        assert [child.id for child in table.schema.data_type] == [1, 2]
+        assert [child.parquet_field_id for child in table.schema.data_type] == [1, 2]
         assert [field.name for field in table.spec.fields] == ["venue"]
         assert table.spec.fields[0].transform == "identity"
         assert table.scan().read_all().num_rows == 3
@@ -487,7 +487,7 @@ class TestSchemaUpdates:
         # identifier, and the added column is numbered above every identifier
         # the table has ever assigned.
         assert children[0].data_type.id == "int64"
-        assert [child.id for child in children] == [1, 2, 3]
+        assert [child.parquet_field_id for child in children] == [1, 2, 3]
         assert children[2].nullable
 
         rows = narrow.scan().read_all()
@@ -564,7 +564,7 @@ class TestSchemaUpdates:
         children = list(narrow.schema.data_type)
         assert [child.name for child in children] == ["id", "note"]
         # The added column is numbered above the dropped one, never as it.
-        assert children[1].id == 3
+        assert children[1].parquet_field_id == 3
 
     def test_a_spent_update_is_refused(self, narrow: Table) -> None:
         update = narrow.update_schema()

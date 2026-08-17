@@ -220,7 +220,7 @@ export declare class Field {
   /** Shared table name stored in Arrow-compatible metadata. */
   get tableName(): string | null
   /** Arrow/Parquet signed 32-bit field identifier stored in metadata. */
-  get id(): number | null
+  get parquetFieldId(): number | null
   /** Typed location URL stored canonically in Arrow-compatible metadata. */
   get location(): JsUrl | null
   /** Raw HTTP Accept field value. */
@@ -290,9 +290,9 @@ export declare class Field {
   /** Remove and return the shared table name. */
   removeTableName(): string | null
   /** Set the canonical Arrow/Parquet signed 32-bit field identifier. */
-  setId(id: number): void
+  setParquetFieldId(id: number): void
   /** Remove and return the Arrow/Parquet signed 32-bit field identifier. */
-  removeId(): number | null
+  removeParquetFieldId(): number | null
   /** Set a typed location from any native identifier wrapper or URL string. */
   setLocation(value: JsUrl | JsUri | JsUrn | string): void
   /** Remove and return the typed location URL. */

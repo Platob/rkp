@@ -37,14 +37,14 @@ test('numbering a schema is a copy, and the numbers are Arrow field ids', () => 
   })
   const numbered = schema()
 
-  assert.equal(plain.dataType.at(0).id, null)
-  assert.equal(numbered.dataType.at(0).id, 1)
-  assert.equal(numbered.dataType.at(1).id, 2)
+  assert.equal(plain.dataType.at(0).parquetFieldId, null)
+  assert.equal(numbered.dataType.at(0).parquetFieldId, 1)
+  assert.equal(numbered.dataType.at(1).parquetFieldId, 2)
   assert.equal(numbered.dataType.at(0).get('PARQUET:field_id'), '1')
 
   // Numbering starts where a caller says, so an evolution never reuses one.
   const later = iceberg.assignFieldIds(plain, 10)
-  assert.equal(later.dataType.at(0).id, 10)
+  assert.equal(later.dataType.at(0).parquetFieldId, 10)
 })
 
 test('a table is a folder, and a new one has no current snapshot', (t) => {
@@ -226,7 +226,7 @@ test('a catalog maps a dotted name onto folders and creates on first write', (t)
   const table = catalog.append('nyc.taxis', rows([1n, 2n], ['XNAS', 'XNYS']))
   assert.ok(catalog.hasTable('nyc.taxis'))
   assert.equal(table.schema.name, 'row')
-  assert.equal(table.schema.dataType.at(0).id, 1)
+  assert.equal(table.schema.dataType.at(0).parquetFieldId, 1)
   assert.equal(table.scan().toTable().numRows, 2)
 
   // The dotted name is the folder nyc/taxis, one level per dot.
@@ -330,8 +330,8 @@ test('a schema evolves through one recorded chain, committed once', (t) => {
   )
   assert.equal(evolved.dataType.at(0).dataType.id, 'int64')
   // The renamed column keeps its identifier; the added one is numbered fresh.
-  assert.equal(evolved.dataType.at(1).id, 2)
-  assert.equal(evolved.dataType.at(2).id, 3)
+  assert.equal(evolved.dataType.at(1).parquetFieldId, 2)
+  assert.equal(evolved.dataType.at(2).parquetFieldId, 3)
 
   // The rows written under the old schema are preserved and read as the new
   // shape: the promoted column widens, the added column reads null.

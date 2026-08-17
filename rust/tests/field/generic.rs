@@ -619,7 +619,7 @@ fn typed_field_id_uses_canonical_arrow_parquet_metadata() {
         ),
     );
     let imported = Field::from_arrow_ref(Arc::clone(&imported_arrow)).unwrap();
-    assert_eq!(imported.id().unwrap(), Some(17));
+    assert_eq!(imported.parquet_field_id().unwrap(), Some(17));
     let canonical_arrow = imported.to_arrow_ref().unwrap();
     assert!(!Arc::ptr_eq(&imported_arrow, &canonical_arrow));
     assert_eq!(
@@ -632,7 +632,7 @@ fn typed_field_id_uses_canonical_arrow_parquet_metadata() {
     assert_eq!(
         Field::from_arrow(canonical_arrow.as_ref())
             .unwrap()
-            .id()
+            .parquet_field_id()
             .unwrap(),
         Some(17)
     );
@@ -644,15 +644,15 @@ fn typed_field_id_uses_canonical_arrow_parquet_metadata() {
         [("PARQUET:field_id", "+00017")],
     )
     .unwrap();
-    assert_eq!(field.id().unwrap(), Some(17));
+    assert_eq!(field.parquet_field_id().unwrap(), Some(17));
     assert_eq!(field.get_metadata("PARQUET:field_id"), Some("17"));
 
     let cached = field.to_arrow_ref().unwrap();
-    field.set_id(17);
+    field.set_parquet_field_id(17);
     assert!(Arc::ptr_eq(&cached, &field.to_arrow_ref().unwrap()));
 
-    field.set_id(i32::MIN);
-    assert_eq!(field.id().unwrap(), Some(i32::MIN));
+    field.set_parquet_field_id(i32::MIN);
+    assert_eq!(field.parquet_field_id().unwrap(), Some(i32::MIN));
     assert!(!Arc::ptr_eq(&cached, &field.to_arrow_ref().unwrap()));
     assert_eq!(
         field
@@ -664,12 +664,12 @@ fn typed_field_id_uses_canonical_arrow_parquet_metadata() {
         Some("-2147483648")
     );
 
-    field.set_id(i32::MAX);
+    field.set_parquet_field_id(i32::MAX);
     let json = field.to_json().unwrap();
     let restored = Field::from_json(&json).unwrap();
-    assert_eq!(restored.id().unwrap(), Some(i32::MAX));
-    assert_eq!(field.remove_id().unwrap(), Some(i32::MAX));
-    assert_eq!(field.remove_id().unwrap(), None);
+    assert_eq!(restored.parquet_field_id().unwrap(), Some(i32::MAX));
+    assert_eq!(field.remove_parquet_field_id().unwrap(), Some(i32::MAX));
+    assert_eq!(field.remove_parquet_field_id().unwrap(), None);
 }
 
 #[test]
@@ -694,7 +694,7 @@ fn typed_field_id_rejects_non_i32_metadata_transactionally() {
     .unwrap();
     assert_eq!(metadata.get("PARQUET:field_id"), Some("-7"));
 
-    let mut field = Field::new("trade", DataType::Utf8, false).with_id(7);
+    let mut field = Field::new("trade", DataType::Utf8, false).with_parquet_field_id(7);
     let snapshot = field.clone();
     assert!(
         field
@@ -1181,12 +1181,21 @@ fn one_walk_numbers_finds_and_bounds_every_identifier_in_a_tree() {
 
     // Numbering is depth first in declaration order, over every child a
     // layout has - a list's item and a map's entries included.
-    assert_eq!(schema.assign_ids(1).unwrap(), 6);
-    assert_eq!(schema.max_id().unwrap(), Some(5));
-    assert_eq!(schema.field_by_id(1).map(Field::name), Some("id"));
-    assert_eq!(schema.field_by_id(3).map(Field::name), Some("item"));
-    assert_eq!(schema.field_by_id(5).map(Field::name), Some("depth"));
-    assert_eq!(schema.field_by_id(9), None);
+    assert_eq!(schema.assign_parquet_field_ids(1).unwrap(), 6);
+    assert_eq!(schema.max_parquet_field_id().unwrap(), Some(5));
+    assert_eq!(
+        schema.field_by_parquet_field_id(1).map(Field::name),
+        Some("id")
+    );
+    assert_eq!(
+        schema.field_by_parquet_field_id(3).map(Field::name),
+        Some("item")
+    );
+    assert_eq!(
+        schema.field_by_parquet_field_id(5).map(Field::name),
+        Some("depth")
+    );
+    assert_eq!(schema.field_by_parquet_field_id(9), None);
 
     // A field that already carries an identifier keeps it, so evolving a
     // schema never renumbers the columns that were already there.
@@ -1205,12 +1214,18 @@ fn one_walk_numbers_finds_and_bounds_every_identifier_in_a_tree() {
         .unwrap();
     assert_eq!(
         evolved
-            .assign_ids(schema.max_id().unwrap().unwrap() + 1)
+            .assign_parquet_field_ids(schema.max_parquet_field_id().unwrap().unwrap() + 1)
             .unwrap(),
         7
     );
-    assert_eq!(evolved.field_by_id(1).map(Field::name), Some("id"));
-    assert_eq!(evolved.field_by_id(6).map(Field::name), Some("venue"));
+    assert_eq!(
+        evolved.field_by_parquet_field_id(1).map(Field::name),
+        Some("id")
+    );
+    assert_eq!(
+        evolved.field_by_parquet_field_id(6).map(Field::name),
+        Some("venue")
+    );
 }
 
 #[test]

@@ -294,7 +294,7 @@ impl PartitionSpec {
                     "expected a schema column to partition on, got {column:?}"
                 ))
             })?;
-            let source_id = source.id()?.ok_or_else(|| {
+            let source_id = source.parquet_field_id()?.ok_or_else(|| {
                 invalid(format_smolstr!(
                     "expected a PARQUET:field_id on the partition source {column:?}; call \
                      assign_field_ids first"
@@ -349,7 +349,7 @@ impl PartitionSpec {
         let mut fields = Vec::with_capacity(partition.field_len());
         for child in partition.fields() {
             let name = child.name();
-            let field_id = child.id()?.ok_or_else(|| {
+            let field_id = child.parquet_field_id()?.ok_or_else(|| {
                 invalid(format_smolstr!(
                     "expected a PARQUET:field_id on the partition field {name:?}, got none"
                 ))
@@ -396,7 +396,7 @@ impl PartitionSpec {
             }
             // A spec can name a column of a nested struct, which no path spells
             // out and no top-level marker describes; such a field is left alone.
-            let Some(source) = schema.field_by_id(field.source_id) else {
+            let Some(source) = schema.field_by_parquet_field_id(field.source_id) else {
                 continue;
             };
             if schema.get_field_by_name(source.name()).is_some() {
@@ -469,7 +469,7 @@ impl PartitionSpec {
             // A partition value is nullable even when its source is not: a
             // spec can retire a field, and `void` produces nothing but null.
             let mut child = Field::new(field.name.as_str(), data_type, true);
-            child.set_id(field.field_id);
+            child.set_parquet_field_id(field.field_id);
             child.set_partition(true);
             child
                 .iceberg_mut()
@@ -592,7 +592,7 @@ impl PartitionSpec {
 
 /// Find the schema column one partition field reads.
 fn source_column(schema: &Field, source_id: i32) -> Result<&Field> {
-    schema.field_by_id(source_id).ok_or_else(|| {
+    schema.field_by_parquet_field_id(source_id).ok_or_else(|| {
         invalid(format_smolstr!(
             "expected a schema column with field id {source_id} to partition on, got none"
         ))

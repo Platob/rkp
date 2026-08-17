@@ -142,7 +142,7 @@ mod schema_updates {
         update.add_column("", DataType::Int64.nullable_field("quantity"));
         let evolved = update.apply().unwrap();
         let added = evolved.get_field_by_name("quantity").unwrap();
-        assert_eq!(added.id().unwrap(), Some(6));
+        assert_eq!(added.parquet_field_id().unwrap(), Some(6));
         assert_eq!(evolved.field_len(), 4);
     }
 
@@ -165,9 +165,9 @@ mod schema_updates {
             .unwrap()
             .get_field_by_name("depth")
             .unwrap();
-        assert_eq!(depth.id().unwrap(), Some(6));
-        assert_eq!(depth.fields()[0].id().unwrap(), Some(7));
-        assert_eq!(depth.fields()[1].id().unwrap(), Some(8));
+        assert_eq!(depth.parquet_field_id().unwrap(), Some(6));
+        assert_eq!(depth.fields()[0].parquet_field_id().unwrap(), Some(7));
+        assert_eq!(depth.fields()[1].parquet_field_id().unwrap(), Some(8));
     }
 
     #[test]
@@ -177,11 +177,20 @@ mod schema_updates {
         update.drop_column("id");
         // The added column even carries a stale identifier, which is discarded
         // rather than resurrected.
-        update.add_column("", DataType::Int64.required_field("trade_id").with_id(1));
+        update.add_column(
+            "",
+            DataType::Int64
+                .required_field("trade_id")
+                .with_parquet_field_id(1),
+        );
         let evolved = update.apply().unwrap();
         assert!(evolved.get_field_by_name("id").is_none());
         assert_eq!(
-            evolved.get_field_by_name("trade_id").unwrap().id().unwrap(),
+            evolved
+                .get_field_by_name("trade_id")
+                .unwrap()
+                .parquet_field_id()
+                .unwrap(),
             Some(6),
             "a retired id must never come back"
         );
@@ -197,7 +206,11 @@ mod schema_updates {
         update.rename_column("quote.price", "last_price");
         let evolved = update.apply().unwrap();
         assert_eq!(
-            evolved.get_field_by_name("ticker").unwrap().id().unwrap(),
+            evolved
+                .get_field_by_name("ticker")
+                .unwrap()
+                .parquet_field_id()
+                .unwrap(),
             Some(2)
         );
         let renamed = evolved
@@ -205,7 +218,7 @@ mod schema_updates {
             .unwrap()
             .get_field_by_name("last_price")
             .unwrap();
-        assert_eq!(renamed.id().unwrap(), Some(4));
+        assert_eq!(renamed.parquet_field_id().unwrap(), Some(4));
         assert!(evolved.get_field_by_name("symbol").is_none());
     }
 
@@ -262,7 +275,11 @@ mod schema_updates {
         let evolved = update.apply().unwrap();
         let id = evolved.get_field_by_name("id").unwrap();
         assert_eq!(id.data_type(), &DataType::Int64);
-        assert_eq!(id.id().unwrap(), Some(1), "a promotion keeps the id");
+        assert_eq!(
+            id.parquet_field_id().unwrap(),
+            Some(1),
+            "a promotion keeps the id"
+        );
         assert_eq!(
             evolved
                 .get_field_by_name("quote")
@@ -532,7 +549,7 @@ mod metadata_updates {
         let mut duplicated = metadata();
         let mut schema = duplicated.schemas[0].clone();
         let mut fields = schema.fields().to_vec();
-        fields[1].set_id(1);
+        fields[1].set_parquet_field_id(1);
         schema
             .set_data_type(DataType::from_fields(fields).unwrap())
             .unwrap();

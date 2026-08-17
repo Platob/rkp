@@ -644,13 +644,14 @@ impl Field {
     /// Generic metadata construction validates and canonicalizes the
     /// `PARQUET:field_id` value, so an error can only originate from externally
     /// corrupted serialized state.
-    pub fn id(&self) -> Result<Option<i32>> {
+    pub fn parquet_field_id(&self) -> Result<Option<i32>> {
         self.get_metadata(PARQUET_FIELD_ID_KEY)
             .map(parse_field_id)
             .transpose()
     }
 
-    /// Returns the field anywhere in this tree carrying one identifier.
+    /// Returns the field anywhere in this tree carrying one Arrow/Parquet
+    /// field identifier.
     ///
     /// The walk is over every child a datatype has - struct and union members,
     /// a list's item, a map's entries, a run-end layout's two - because an
@@ -667,22 +668,26 @@ impl Field {
     /// ])?
     /// .required_field("row");
     ///
-    /// assert_eq!(schema.assign_ids(1)?, 4);
-    /// assert_eq!(schema.field_by_id(3).map(yggdryl::Field::name), Some("item"));
-    /// assert_eq!(schema.max_id()?, Some(3));
+    /// assert_eq!(schema.assign_parquet_field_ids(1)?, 4);
+    /// assert_eq!(
+    ///     schema.field_by_parquet_field_id(3).map(yggdryl::Field::name),
+    ///     Some("item"),
+    /// );
+    /// assert_eq!(schema.max_parquet_field_id()?, Some(3));
     /// # Ok(())
     /// # }
     /// ```
-    pub fn field_by_id(&self, id: i32) -> Option<&Self> {
-        if self.id().ok().flatten() == Some(id) {
+    pub fn field_by_parquet_field_id(&self, id: i32) -> Option<&Self> {
+        if self.parquet_field_id().ok().flatten() == Some(id) {
             return Some(self);
         }
         (0..self.data_type.field_len())
             .filter_map(|index| self.data_type.get_field(index))
-            .find_map(|child| child.field_by_id(id))
+            .find_map(|child| child.field_by_parquet_field_id(id))
     }
 
-    /// Returns the highest identifier anywhere in this tree.
+    /// Returns the highest Arrow/Parquet field identifier anywhere in this
+    /// tree.
     ///
     /// A schema evolution numbers above it, so an identifier is never reused
     /// for a different column.
@@ -691,13 +696,13 @@ impl Field {
     ///
     /// Returns an error when a stored identifier is not a canonical integer,
     /// which externally corrupted serialized state can produce.
-    pub fn max_id(&self) -> Result<Option<i32>> {
-        let mut highest = self.id()?;
+    pub fn max_parquet_field_id(&self) -> Result<Option<i32>> {
+        let mut highest = self.parquet_field_id()?;
         for index in 0..self.data_type.field_len() {
             let Some(child) = self.data_type.get_field(index) else {
                 continue;
             };
-            if let Some(id) = child.max_id()? {
+            if let Some(id) = child.max_parquet_field_id()? {
                 highest = Some(highest.map_or(id, |current: i32| current.max(id)));
             }
         }
@@ -705,7 +710,7 @@ impl Field {
     }
 
     /// Numbers every field in this tree that does not already carry an
-    /// identifier, and returns the next unused one.
+    /// Arrow/Parquet field identifier, and returns the next unused one.
     ///
     /// Children are numbered depth first in declaration order, which is the
     /// order every format that stores identifiers assigns them in. A field that
@@ -716,7 +721,7 @@ impl Field {
     ///
     /// Returns an error when the tree is not valid or an identifier would
     /// overflow.
-    pub fn assign_ids(&mut self, start: i32) -> Result<i32> {
+    pub fn assign_parquet_field_ids(&mut self, start: i32) -> Result<i32> {
         self.validate()?;
         let mut next = start;
         self.assign_child_ids(&mut next)?;
@@ -735,8 +740,8 @@ impl Field {
                 continue;
             };
             let mut child = child.clone();
-            if child.id()?.is_none() {
-                child.set_id(*next);
+            if child.parquet_field_id()?.is_none() {
+                child.set_parquet_field_id(*next);
                 *next = next.checked_add(1).ok_or_else(|| Error::InvalidRecord {
                     path: format_smolstr!("$.{}", child.name()),
                     reason: crate::text::expected_got(
@@ -1177,7 +1182,7 @@ impl Field {
     }
 
     /// Sets the canonical Arrow/Parquet signed 32-bit field identifier.
-    pub fn set_id(&mut self, id: i32) {
+    pub fn set_parquet_field_id(&mut self, id: i32) {
         let (_, changed) = self
             .metadata
             .insert_validated(PARQUET_FIELD_ID_KEY.to_owned(), id.to_string());
@@ -1187,8 +1192,8 @@ impl Field {
     }
 
     /// Returns a persistent field with an Arrow/Parquet field identifier.
-    pub fn with_id(mut self, id: i32) -> Self {
-        self.set_id(id);
+    pub fn with_parquet_field_id(mut self, id: i32) -> Self {
+        self.set_parquet_field_id(id);
         self
     }
 
@@ -1240,7 +1245,7 @@ impl Field {
     }
 
     /// Removes and parses the prior Arrow/Parquet field identifier.
-    pub fn remove_id(&mut self) -> Result<Option<i32>> {
+    pub fn remove_parquet_field_id(&mut self) -> Result<Option<i32>> {
         self.remove_metadata(PARQUET_FIELD_ID_KEY)
             .map(|value| parse_field_id(&value))
             .transpose()

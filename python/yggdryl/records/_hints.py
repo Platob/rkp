@@ -337,13 +337,13 @@ class _Inference:
         if options.id is not _MISSING:
             option_id = typing.cast(int, options.id)
             if _PARQUET_FIELD_ID in overlay:
-                if result.id != option_id:
+                if result.parquet_field_id != option_id:
                     raise TypeError(
                         f"conflicting Annotated id and {_PARQUET_FIELD_ID} "
                         f"metadata at {path}"
                     )
             else:
-                result.set_id(option_id)
+                result.set_parquet_field_id(option_id)
 
         dictionary_id = options.dictionary_id
         dictionary_is_ordered = options.dictionary_is_ordered

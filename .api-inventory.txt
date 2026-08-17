@@ -521,10 +521,10 @@
   pub fn catalog_name(&self) -> Option<&str>
   pub fn schema_name(&self) -> Option<&str>
   pub fn table_name(&self) -> Option<&str>
-  pub fn id(&self) -> Result<Option<i32>>
-  pub fn field_by_id(&self, id: i32) -> Option<&Self>
-  pub fn max_id(&self) -> Result<Option<i32>>
-  pub fn assign_ids(&mut self, start: i32) -> Result<i32>
+  pub fn parquet_field_id(&self) -> Result<Option<i32>>
+  pub fn field_by_parquet_field_id(&self, id: i32) -> Option<&Self>
+  pub fn max_parquet_field_id(&self) -> Result<Option<i32>>
+  pub fn assign_parquet_field_ids(&mut self, start: i32) -> Result<i32>
   pub fn is_partition(&self) -> bool
   pub fn set_partition(&mut self, partition: bool)
   pub fn with_partition(mut self, partition: bool) -> Self
@@ -593,11 +593,11 @@
   pub fn set_table_name(&mut self, value: impl Into<String>) -> Result<()>
   pub fn try_with_table_name(mut self, value: impl Into<String>) -> Result<Self>
   pub fn remove_table_name(&mut self) -> Option<String>
-  pub fn set_id(&mut self, id: i32)
-  pub fn with_id(mut self, id: i32) -> Self
+  pub fn set_parquet_field_id(&mut self, id: i32)
+  pub fn with_parquet_field_id(mut self, id: i32) -> Self
   pub fn set_init(&mut self, init: bool)
   pub fn with_init(mut self, init: bool) -> Self
-  pub fn remove_id(&mut self) -> Result<Option<i32>>
+  pub fn remove_parquet_field_id(&mut self) -> Result<Option<i32>>
   pub fn set_location(&mut self, location: Url)
   pub fn with_location(mut self, location: Url) -> Self
   pub fn remove_location(&mut self) -> Result<Option<Url>>

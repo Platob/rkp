@@ -39,7 +39,7 @@
 //! let evolved = update.apply()?;
 //!
 //! // The added column is numbered above every id the table has assigned.
-//! assert_eq!(evolved.get_field_by_name("quantity").unwrap().id()?, Some(3));
+//! assert_eq!(evolved.get_field_by_name("quantity").unwrap().parquet_field_id()?, Some(3));
 //!
 //! let schema_id = metadata.add_schema(evolved)?;
 //! metadata.set_current_schema(schema_id)?;
@@ -253,7 +253,7 @@ impl SchemaUpdate {
             match op {
                 Op::AddColumn { parent, field } => {
                     apply_add(&mut schema, &parent, field)?;
-                    next_id = schema.assign_ids(next_id)?;
+                    next_id = schema.assign_parquet_field_ids(next_id)?;
                 }
                 Op::DropColumn { path } => apply_drop(&mut schema, &path)?,
                 Op::RenameColumn { path, name } => apply_rename(&mut schema, &path, name)?,
@@ -426,9 +426,9 @@ fn missing_column(segment: &str, siblings: &[Field], path: &str) -> Error {
 ///
 /// An added column may be a copy of one that already lived in a schema, and
 /// carrying that identifier in would resurrect a retired id; numbering is
-/// [`Field::assign_ids`]'s job alone.
+/// [`Field::assign_parquet_field_ids`]'s job alone.
 fn strip_ids(field: &mut Field) -> Result<()> {
-    field.remove_id()?;
+    field.remove_parquet_field_id()?;
     let count = field.data_type().field_len();
     if count == 0 {
         return Ok(());

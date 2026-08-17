@@ -615,27 +615,27 @@ def test_typed_int32_field_id_is_canonical_atomic_and_arrow_compatible() -> None
             metadata={b"PARQUET:field_id": b"+00017"},
         )
     )
-    assert imported.id == 17
+    assert imported.parquet_field_id == 17
     assert imported["PARQUET:field_id"] == "17"
     assert imported.to_arrow().metadata[b"PARQUET:field_id"] == b"17"
 
     field = Field("value", "int64")
-    assert field.id is None
+    assert field.parquet_field_id is None
     for value in (-(2**31), 2**31 - 1):
-        field.set_id(value)
-        assert field.id == value
+        field.set_parquet_field_id(value)
+        assert field.parquet_field_id == value
         assert field["PARQUET:field_id"] == str(value)
-    assert field.remove_id() == 2**31 - 1
-    assert field.remove_id() is None
+    assert field.remove_parquet_field_id() == 2**31 - 1
+    assert field.remove_parquet_field_id() is None
 
-    field.set_id(7)
+    field.set_parquet_field_id(7)
     for invalid in (True, 7.0, 2**31, -(2**31) - 1):
         with pytest.raises((TypeError, OverflowError)):
-            field.set_id(invalid)  # type: ignore[arg-type]
-        assert field.id == 7
+            field.set_parquet_field_id(invalid)  # type: ignore[arg-type]
+        assert field.parquet_field_id == 7
     with pytest.raises(ValueError):
         field["PARQUET:field_id"] = "not-an-int32"
-    assert field.id == 7
+    assert field.parquet_field_id == 7
     with pytest.raises(ValueError):
         Field(
             "invalid",
@@ -647,14 +647,14 @@ def test_typed_int32_field_id_is_canonical_atomic_and_arrow_compatible() -> None
         pa.schema([imported.to_arrow()]), class_name="IdentifiedRecord"
     )
     child = row_type.schema_fields()[0]
-    assert child.id == 17
+    assert child.parquet_field_id == 17
     assert row_type.into_arrow_schema().field(0).metadata[
         b"PARQUET:field_id"
     ] == b"17"
     with pytest.raises(TypeError, match="read-only"):
-        child.set_id(18)
+        child.set_parquet_field_id(18)
     with pytest.raises(TypeError, match="read-only"):
-        child.remove_id()
+        child.remove_parquet_field_id()
 
 
 def test_typed_metadata_validation_is_atomic_and_arrow_compatible() -> None:

@@ -561,7 +561,7 @@ fn manifest_list_schema(version: FormatVersion) -> Result<Value> {
 fn partition_record(partition: &Field, name: &str) -> Result<Value> {
     let mut fields = Vec::with_capacity(partition.field_len());
     for child in partition.fields() {
-        let id = child.id()?.ok_or_else(|| {
+        let id = child.parquet_field_id()?.ok_or_else(|| {
             invalid(format_smolstr!(
                 "expected a field id on the partition column {:?}",
                 child.name()

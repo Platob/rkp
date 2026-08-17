@@ -25,7 +25,7 @@ field.setAlias('identifier')
 field.setCatalogName('analytics')
 field.setSchemaName('public')
 field.setTableName('events')
-field.setId(17)
+field.setParquetFieldId(17)
 field.setLocation('s3://warehouse/events/data.parquet')
 field.setAccept('application/json')
 field.setAcceptEncoding('gzip')
@@ -51,7 +51,7 @@ const alias: string | null = field.alias
 const catalogName: string | null = field.catalogName
 const schemaName: string | null = field.schemaName
 const tableName: string | null = field.tableName
-const id: number | null = field.id
+const id: number | null = field.parquetFieldId
 const location: Url | null = field.location
 const accept: string | null = field.accept
 const contentLength: bigint | null = field.contentLength

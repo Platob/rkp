@@ -25,7 +25,7 @@ pub fn benchmarks(criterion: &mut Criterion) {
         .clone()
         .try_with_property(&Scheme::POSTGRES, "table", "trades")
         .expect("the static protocol property is valid")
-        .with_id(17)
+        .with_parquet_field_id(17)
         .with_location(
             Url::from_str("https://example.com/catalog/trades")
                 .expect("the static location is valid"),
@@ -137,7 +137,7 @@ pub fn benchmarks(criterion: &mut Criterion) {
     group.bench_function("typed_field_id", |bencher| {
         bencher.iter(|| {
             black_box(&property_field)
-                .id()
+                .parquet_field_id()
                 .expect("validated field ID metadata remains valid")
         });
     });

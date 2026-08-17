@@ -64,7 +64,7 @@
 //!
 //! let schema = schema_from_json("row", &document)?;
 //! assert_eq!(schema.field_len(), 2);
-//! assert_eq!(schema.fields()[0].id()?, Some(1));
+//! assert_eq!(schema.fields()[0].parquet_field_id()?, Some(1));
 //! assert!(!schema.fields()[0].is_nullable());
 //!
 //! // And writes back to the same document.

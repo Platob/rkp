@@ -219,8 +219,8 @@ del field["venue"]
 assert "venue" not in field
 ```
 
-Typed identifiers and typed HTTP values (`id`, `alias`, `content_type`, `etag`, and the rest) are
-attributes rather than map keys, because they are validated.
+Typed identifiers and typed HTTP values (`parquet_field_id`, `alias`, `content_type`, `etag`, and
+the rest) are attributes rather than map keys, because they are validated.
 
 One protocol's properties are a mapping of their own, and it is a live view of the same field rather
 than a copy of part of it.

@@ -226,12 +226,12 @@ field stays findable in a `dict` across metadata edits.
 
     let mut field = Field::new("payload", DataType::Binary, false);
 
-    field.set_id(17);
+    field.set_parquet_field_id(17);
     field.set_init(false);
     field.set_content_type("application/json; charset=utf-8")?;
     field.set_property(&Scheme::POSTGRES, "type", "jsonb")?;
 
-    assert_eq!(field.id()?, Some(17));
+    assert_eq!(field.parquet_field_id()?, Some(17));
     assert_eq!(field.get_metadata("PARQUET:field_id"), Some("17"));
     assert!(!field.is_init()?);
     assert_eq!(field.get_metadata("field:init"), Some("false"));
@@ -256,12 +256,12 @@ field stays findable in a `dict` across metadata edits.
 
     field = Field("payload", "binary", nullable=False)
 
-    field.set_id(17)
+    field.set_parquet_field_id(17)
     field["field:init"] = "false"
     field.set_content_type("application/json; charset=utf-8")
     field.set_property("postgres", "type", "jsonb")
 
-    assert field.id == 17
+    assert field.parquet_field_id == 17
     assert field["PARQUET:field_id"] == "17"
     assert field["field:init"] == "false"
 
@@ -279,12 +279,12 @@ field stays findable in a `dict` across metadata edits.
 
     const field = new Field('payload', 'binary', false)
 
-    field.setId(17)
+    field.setParquetFieldId(17)
     field.set('field:init', 'false')
     field.setContentType('application/json; charset=utf-8')
     field.setProperty('postgres', 'type', 'jsonb')
 
-    assert.equal(field.id, 17)
+    assert.equal(field.parquetFieldId, 17)
     assert.equal(field.get('PARQUET:field_id'), '17')
     assert.equal(field.get('field:init'), 'false')
 
@@ -296,7 +296,8 @@ field stays findable in a `dict` across metadata edits.
 
 A handful of keys mean something to the library, and each one has a typed accessor that parses and
 canonicalizes on the way in and out. `PARQUET:field_id` is a signed 32-bit integer and is what
-`id` reads; writing `"+00017"` through the mapping stores `"17"`, and writing `"2147483648"` fails.
+`parquet_field_id` reads; writing `"+00017"` through the mapping stores `"17"`, and writing
+`"2147483648"` fails.
 `field:init` is a reserved boolean: it is absent for an ordinary field, and setting it to `false`
 marks a field a schema still declares but a constructor must not accept. `location` parses as a
 [`Url`](uri.md), and `alias`, `catalog_name`, `schema_name`, and `table_name` carry validated text.

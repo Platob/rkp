@@ -369,7 +369,7 @@ impl TableMetadata {
                 self.last_column_id
             ))
         })?;
-        schema.assign_ids(start)?;
+        schema.assign_parquet_field_ids(start)?;
         let next_id = self
             .schemas
             .iter()
@@ -993,6 +993,274 @@ impl TableMetadata {
         Some(reference)
     }
 
+    /// Return one named reference, when the table has it.
+    pub fn ref_by_name(&self, name: &str) -> Option<&SnapshotRef> {
+        self.refs
+            .iter()
+            .find_map(|(existing, reference)| (existing == name).then_some(reference))
+    }
+
+    /// Create a branch at one retained snapshot.
+    ///
+    /// ```
+    /// use yggdryl::iceberg::{FormatVersion, PartitionSpec, Snapshot, TableMetadata};
+    /// use yggdryl::iceberg::assign_field_ids;
+    /// use yggdryl::DataType;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+    ///     .required_field("row");
+    /// assign_field_ids(&mut schema, 1)?;
+    /// let mut metadata = TableMetadata::new(
+    ///     FormatVersion::V2,
+    ///     "file:///tmp/branches",
+    ///     schema,
+    ///     PartitionSpec::unpartitioned(),
+    /// )?;
+    /// metadata.set_current_snapshot(Snapshot {
+    ///     snapshot_id: 7,
+    ///     parent_snapshot_id: None,
+    ///     sequence_number: Some(1),
+    ///     timestamp_ms: 0,
+    ///     manifest_list: "".into(),
+    ///     summary: Vec::new(),
+    ///     schema_id: Some(0),
+    ///     first_row_id: None,
+    ///     added_rows: None,
+    /// });
+    ///
+    /// metadata.create_branch("dev", 7)?;
+    /// metadata.create_tag("v1", 7)?;
+    /// assert!(metadata.ref_by_name("dev").unwrap().is_branch());
+    /// assert!(metadata.ref_by_name("v1").unwrap().is_tag());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table already has a ref with this name or
+    /// when the snapshot is not retained; the refs are unchanged.
+    pub fn create_branch(&mut self, name: impl Into<SmolStr>, snapshot_id: i64) -> Result<()> {
+        let name = name.into();
+        self.expect_no_ref(&name)?;
+        self.set_snapshot_ref(name, SnapshotRef::branch(snapshot_id))
+    }
+
+    /// Create a tag at one retained snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table already has a ref with this name or
+    /// when the snapshot is not retained; the refs are unchanged.
+    pub fn create_tag(&mut self, name: impl Into<SmolStr>, snapshot_id: i64) -> Result<()> {
+        let name = name.into();
+        self.expect_no_ref(&name)?;
+        self.set_snapshot_ref(name, SnapshotRef::tag(snapshot_id))
+    }
+
+    /// Rename one reference, keeping what it points at and how it is retained.
+    ///
+    /// Renaming a branch *to* `main` goes through the same reserved-name rules
+    /// as pointing `main` anywhere: the branch's snapshot becomes the current
+    /// one, and a tag is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `from` is the reserved `main` branch, names no
+    /// ref, or `to` names one the table already has; the refs are unchanged.
+    pub fn rename_ref(&mut self, from: &str, to: impl Into<SmolStr>) -> Result<()> {
+        let to = to.into();
+        if from == MAIN_BRANCH {
+            return Err(invalid(SmolStr::new_static(
+                "expected a renameable ref, got the reserved \"main\" branch",
+            )));
+        }
+        let Some(reference) = self.ref_by_name(from) else {
+            return Err(invalid(format_smolstr!(
+                "expected a ref named {:?}, got {} refs",
+                crate::text::elide_to(from, 64),
+                self.refs.len()
+            )));
+        };
+        self.expect_no_ref(&to)?;
+        let reference = reference.clone();
+        self.set_snapshot_ref(to, reference)?;
+        self.remove_snapshot_ref(from);
+        Ok(())
+    }
+
+    /// Move a branch forward to a descendant of its current head.
+    ///
+    /// Fast-forwarding is the one branch move that cannot lose history, which
+    /// is why it is checked: the target must reach the current head by walking
+    /// parent ids. Moving `main` keeps `current-snapshot-id` and the snapshot
+    /// log in step, exactly as [`Self::set_snapshot_ref`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is not a branch, the target is not
+    /// retained, or the target does not descend from the branch's head; the
+    /// refs are unchanged.
+    pub fn fast_forward_branch(&mut self, name: &str, to_snapshot_id: i64) -> Result<()> {
+        let Some(reference) = self.ref_by_name(name) else {
+            return Err(invalid(format_smolstr!(
+                "expected a branch named {:?}, got {} refs",
+                crate::text::elide_to(name, 64),
+                self.refs.len()
+            )));
+        };
+        if !reference.is_branch() {
+            return Err(invalid(format_smolstr!(
+                "expected a branch named {:?}, got a {:?}",
+                crate::text::elide_to(name, 64),
+                crate::text::elide_to(&reference.kind, 64)
+            )));
+        }
+        let mut moved = reference.clone();
+        let head = moved.snapshot_id;
+        if self.snapshot_by_id(to_snapshot_id).is_none() {
+            return Err(invalid(format_smolstr!(
+                "expected a retained snapshot for ref {:?}, got unknown snapshot id \
+                 {to_snapshot_id}",
+                crate::text::elide_to(name, 64)
+            )));
+        }
+        if !self.descends_from(to_snapshot_id, head) {
+            return Err(invalid(format_smolstr!(
+                "expected {to_snapshot_id} to descend from {head}"
+            )));
+        }
+        moved.snapshot_id = to_snapshot_id;
+        self.set_snapshot_ref(SmolStr::new(name), moved)
+    }
+
+    /// Expire snapshots, honoring what every reference says to retain.
+    ///
+    /// `older_than_ms` is the default age cutoff: a snapshot committed before
+    /// it is old. What survives is exactly what the Iceberg retention rules
+    /// name - every ref target; for each branch, its head's ancestors younger
+    /// than the branch's own `max-snapshot-age-ms` when it has one (younger
+    /// than `older_than_ms` otherwise) and at least `min-snapshots-to-keep`
+    /// most recent ones; and the current snapshot, always. A tag keeps only
+    /// its target. Before any of that, a reference older than its own
+    /// `max-ref-age-ms` - measured from its snapshot's commit time - is
+    /// removed, except `main`, which never expires. The snapshot log is
+    /// trimmed with the removed snapshots, as [`Self::remove_snapshots`]
+    /// trims it.
+    ///
+    /// Returns the removed snapshot ids, sorted; a table with nothing old
+    /// returns an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the removal machinery refuses an id, which
+    /// the retained set rules out; nothing is removed on error.
+    pub fn expire_snapshots_older_than(&mut self, older_than_ms: i64) -> Result<Vec<i64>> {
+        let now = now_ms();
+
+        // Refs expire first, so a snapshot a dead ref pointed at is no longer
+        // anchored when retention is computed.
+        let expired: Vec<SmolStr> = self
+            .refs
+            .iter()
+            .filter(|(name, reference)| {
+                if name == MAIN_BRANCH {
+                    return false;
+                }
+                let Some(limit) = reference.max_ref_age_ms else {
+                    return false;
+                };
+                self.snapshot_by_id(reference.snapshot_id)
+                    .is_some_and(|snapshot| now.saturating_sub(snapshot.timestamp_ms) > limit)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &expired {
+            self.remove_snapshot_ref(name);
+        }
+
+        let mut retained: Vec<i64> = self.current_snapshot_id.into_iter().collect();
+        for (_, reference) in &self.refs {
+            retained.push(reference.snapshot_id);
+            if !reference.is_branch() {
+                continue;
+            }
+            let cutoff = match reference.max_snapshot_age_ms {
+                Some(age_ms) => now.saturating_sub(age_ms),
+                None => older_than_ms,
+            };
+            let keep_at_least = reference
+                .min_snapshots_to_keep
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(1);
+            let mut position = 1_usize;
+            let mut cursor = self
+                .snapshot_by_id(reference.snapshot_id)
+                .and_then(|head| head.parent_snapshot_id);
+            while let Some(id) = cursor {
+                position += 1;
+                // A corrupt parent chain could cycle; the walk is bounded by
+                // the ancestors a table can actually hold.
+                let Some(snapshot) = self
+                    .snapshot_by_id(id)
+                    .filter(|_| position <= self.snapshots.len())
+                else {
+                    break;
+                };
+                if position <= keep_at_least || snapshot.timestamp_ms >= cutoff {
+                    retained.push(id);
+                }
+                cursor = snapshot.parent_snapshot_id;
+            }
+        }
+
+        let mut removed: Vec<i64> = self
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id)
+            .filter(|id| !retained.contains(id))
+            .collect();
+        removed.sort_unstable();
+        if !removed.is_empty() {
+            self.remove_snapshots(&removed)?;
+        }
+        Ok(removed)
+    }
+
+    /// Refuse a name the table already has a reference under.
+    fn expect_no_ref(&self, name: &str) -> Result<()> {
+        let Some(existing) = self.ref_by_name(name) else {
+            return Ok(());
+        };
+        Err(invalid(format_smolstr!(
+            "expected no ref named {:?}, got a {:?}",
+            crate::text::elide_to(name, 64),
+            crate::text::elide_to(&existing.kind, 64)
+        )))
+    }
+
+    /// Return whether one snapshot reaches another by walking parent ids.
+    fn descends_from(&self, descendant: i64, ancestor: i64) -> bool {
+        let mut cursor = Some(descendant);
+        let mut steps = 0_usize;
+        while let Some(id) = cursor {
+            if id == ancestor {
+                return true;
+            }
+            // A corrupt parent chain could cycle; the walk is bounded by the
+            // ancestors a table can actually hold.
+            steps += 1;
+            if steps > self.snapshots.len() {
+                return false;
+            }
+            cursor = self
+                .snapshot_by_id(id)
+                .and_then(|snapshot| snapshot.parent_snapshot_id);
+        }
+        false
+    }
+
     /// Expire snapshots by id, trimming the snapshot log with them.
     ///
     /// An id the table does not hold is ignored, so a caller can expire a set
@@ -1105,6 +1373,24 @@ impl TableMetadata {
                     reference.snapshot_id
                 )));
             }
+            // The two branch retention limits describe ancestors, which only
+            // a branch has, so anything else carrying one is malformed.
+            if !reference.is_branch() {
+                let branch_only = if reference.min_snapshots_to_keep.is_some() {
+                    Some("min-snapshots-to-keep")
+                } else if reference.max_snapshot_age_ms.is_some() {
+                    Some("max-snapshot-age-ms")
+                } else {
+                    None
+                };
+                if let Some(key) = branch_only {
+                    return Err(invalid(format_smolstr!(
+                        "expected a branch for {key} on ref {:?}, got a {:?}",
+                        crate::text::elide_to(name, 64),
+                        crate::text::elide_to(&reference.kind, 64)
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -1116,7 +1402,7 @@ fn collect_field_ids(node: &Field, ids: &mut Vec<i32>) -> Result<()> {
         let Some(child) = node.data_type().get_field(index) else {
             continue;
         };
-        if let Some(id) = child.id()? {
+        if let Some(id) = child.parquet_field_id()? {
             ids.push(id);
         }
         collect_field_ids(child, ids)?;

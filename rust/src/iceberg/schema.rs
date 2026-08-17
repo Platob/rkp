@@ -136,7 +136,7 @@ pub fn schema_to_json(root: &Field) -> Result<Value> {
 /// identifier would overflow.
 pub fn assign_field_ids(root: &mut Field, start: i32) -> Result<i32> {
     root.require_struct()?;
-    root.assign_ids(start)
+    root.assign_parquet_field_ids(start)
 }
 
 /// Return the highest field identifier anywhere in a schema tree.
@@ -148,7 +148,7 @@ pub fn assign_field_ids(root: &mut Field, start: i32) -> Result<i32> {
 ///
 /// Returns an error when a stored identifier is not a canonical integer.
 pub fn last_field_id(root: &Field) -> Result<i32> {
-    Ok(root.max_id()?.unwrap_or_default())
+    Ok(root.max_parquet_field_id()?.unwrap_or_default())
 }
 
 /// Build a struct field from an Iceberg `fields` array.
@@ -207,7 +207,7 @@ fn field_from_json(entry: &Value) -> Result<Field> {
     })?;
 
     let mut field = typed_field_from_json(name, type_json, !required)?;
-    field.set_id(field_id(id, name)?);
+    field.set_parquet_field_id(field_id(id, name)?);
     if let Some(doc) = entry.get_key_str("doc").and_then(Value::as_str) {
         field.iceberg_mut().insert(DOC, doc)?;
     }
@@ -255,7 +255,7 @@ fn typed_field_from_json(name: &str, type_json: &Value, nullable: bool) -> Resul
                 .unwrap_or(true);
             let mut item = typed_field_from_json("element", element, !required)?;
             if let Some(id) = type_json.get_key_str("element-id").and_then(Value::as_i64) {
-                item.set_id(field_id(id, name)?);
+                item.set_parquet_field_id(field_id(id, name)?);
             }
             Ok(Field::new(name, DataType::list(item), nullable))
         }
@@ -274,10 +274,10 @@ fn typed_field_from_json(name: &str, type_json: &Value, nullable: bool) -> Resul
                 .unwrap_or(true);
             let mut value = typed_field_from_json("value", value_json, !value_required)?;
             if let Some(id) = type_json.get_key_str("key-id").and_then(Value::as_i64) {
-                key.set_id(field_id(id, name)?);
+                key.set_parquet_field_id(field_id(id, name)?);
             }
             if let Some(id) = type_json.get_key_str("value-id").and_then(Value::as_i64) {
-                value.set_id(field_id(id, name)?);
+                value.set_parquet_field_id(field_id(id, name)?);
             }
             let entries = Field::new("entries", DataType::from_fields([key, value])?, false);
             Ok(Field::new(name, DataType::map(entries, false)?, nullable))
@@ -294,7 +294,7 @@ fn fields_to_json(root: &Field) -> Result<Vec<Value>> {
     let fields = root.fields();
     let mut entries = Vec::with_capacity(fields.len());
     for field in fields {
-        let id = field.id()?.ok_or_else(|| {
+        let id = field.parquet_field_id()?.ok_or_else(|| {
             invalid(format_smolstr!(
                 "expected a PARQUET:field_id on {:?}; call assign_field_ids first",
                 field.name()
@@ -331,7 +331,7 @@ fn type_to_json(field: &Field) -> Result<Value> {
         ]),
         DataType::List(item) | DataType::LargeList(item) | DataType::ListView(item) => {
             let mut object = vec![(Value::from("type"), Value::from("list"))];
-            if let Some(id) = item.id()? {
+            if let Some(id) = item.parquet_field_id()? {
                 object.push((Value::from("element-id"), Value::from(i64::from(id))));
             }
             object.push((Value::from("element"), type_to_json(item)?));
@@ -356,11 +356,11 @@ fn type_to_json(field: &Field) -> Result<Value> {
                 ))
             })?;
             let mut object = vec![(Value::from("type"), Value::from("map"))];
-            if let Some(id) = key.id()? {
+            if let Some(id) = key.parquet_field_id()? {
                 object.push((Value::from("key-id"), Value::from(i64::from(id))));
             }
             object.push((Value::from("key"), type_to_json(key)?));
-            if let Some(id) = value.id()? {
+            if let Some(id) = value.parquet_field_id()? {
                 object.push((Value::from("value-id"), Value::from(i64::from(id))));
             }
             object.push((Value::from("value"), type_to_json(value)?));

@@ -107,10 +107,10 @@ Metadata belongs to the field, and it behaves like the mapping type of each lang
 
     let mut field = Field::new("symbol", DataType::Utf8, true);
     field.insert_metadata("source", "book")?;
-    field.set_id(7);
+    field.set_parquet_field_id(7);
 
     assert_eq!(field.get_metadata("source"), Some("book"));
-    assert_eq!(field.id()?, Some(7));
+    assert_eq!(field.parquet_field_id()?, Some(7));
     ```
 
 === "Python"
@@ -120,12 +120,12 @@ Metadata belongs to the field, and it behaves like the mapping type of each lang
 
     field = Field("symbol", "utf8", metadata={"source": "book"})
     field["venue"] = "XPAR"
-    field.set_id(7)
+    field.set_parquet_field_id(7)
 
     assert field["source"] == "book"
     assert "venue" in field
     assert len(field) == 3
-    assert field.id == 7
+    assert field.parquet_field_id == 7
     ```
 
 === "JavaScript"

@@ -367,8 +367,8 @@ impl PyField {
     }
 
     #[getter]
-    fn id(&self) -> PyResult<Option<i32>> {
-        self.inner.id().map_err(value_error)
+    fn parquet_field_id(&self) -> PyResult<Option<i32>> {
+        self.inner.parquet_field_id().map_err(value_error)
     }
 
     #[getter]
@@ -525,15 +525,15 @@ impl PyField {
             .map_err(value_error)
     }
 
-    fn set_id(&mut self, id: FieldId) -> PyResult<()> {
+    fn set_parquet_field_id(&mut self, id: FieldId) -> PyResult<()> {
         self.require_mutable()?;
-        self.inner.set_id(id.0);
+        self.inner.set_parquet_field_id(id.0);
         Ok(())
     }
 
-    fn remove_id(&mut self) -> PyResult<Option<i32>> {
+    fn remove_parquet_field_id(&mut self) -> PyResult<Option<i32>> {
         self.require_mutable()?;
-        self.inner.remove_id().map_err(value_error)
+        self.inner.remove_parquet_field_id().map_err(value_error)
     }
 
     fn set_alias(&mut self, value: String) -> PyResult<()> {

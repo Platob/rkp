@@ -158,12 +158,25 @@ impl Snapshot {
 }
 
 /// A named pointer at one snapshot: a branch or a tag.
+///
+/// A branch moves on every commit and a tag never moves, which is the whole
+/// difference between them. The optional retention fields tune snapshot
+/// expiration: the two `*snapshot*` limits describe how much of a branch's
+/// history to keep and so belong to branches alone, while `max_ref_age_ms`
+/// bounds the life of the reference itself and applies to both kinds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotRef {
     /// The snapshot this reference names.
     pub snapshot_id: i64,
     /// Either `branch` or `tag`; a branch moves and a tag does not.
     pub kind: SmolStr,
+    /// Fewest snapshots expiration keeps on this branch, head included.
+    pub min_snapshots_to_keep: Option<i32>,
+    /// Oldest ancestor age expiration keeps on this branch, in milliseconds.
+    pub max_snapshot_age_ms: Option<i64>,
+    /// Age at which the reference itself expires, measured in milliseconds
+    /// from its snapshot's commit time.
+    pub max_ref_age_ms: Option<i64>,
 }
 
 impl SnapshotRef {
@@ -172,7 +185,92 @@ impl SnapshotRef {
         Self {
             snapshot_id,
             kind: SmolStr::new_static("branch"),
+            min_snapshots_to_keep: None,
+            max_snapshot_age_ms: None,
+            max_ref_age_ms: None,
         }
+    }
+
+    /// Point a tag at one snapshot.
+    pub fn tag(snapshot_id: i64) -> Self {
+        Self {
+            snapshot_id,
+            kind: SmolStr::new_static("tag"),
+            min_snapshots_to_keep: None,
+            max_snapshot_age_ms: None,
+            max_ref_age_ms: None,
+        }
+    }
+
+    /// Return whether this reference is a branch, the kind that moves.
+    pub fn is_branch(&self) -> bool {
+        self.kind == "branch"
+    }
+
+    /// Return whether this reference is a tag, the kind that never moves.
+    pub fn is_tag(&self) -> bool {
+        self.kind == "tag"
+    }
+
+    /// Keep at least this many snapshots on the branch, head included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `count` is not positive or when this reference is
+    /// not a branch, because only a branch has ancestors to retain.
+    pub fn with_min_snapshots_to_keep(mut self, count: i32) -> Result<Self> {
+        self.expect_branch("min-snapshots-to-keep")?;
+        if count <= 0 {
+            return Err(invalid(format_smolstr!(
+                "expected a positive min-snapshots-to-keep, got {count}"
+            )));
+        }
+        self.min_snapshots_to_keep = Some(count);
+        Ok(self)
+    }
+
+    /// Keep the branch's ancestors younger than this many milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `age_ms` is not positive or when this reference
+    /// is not a branch, because only a branch has ancestors to retain.
+    pub fn with_max_snapshot_age_ms(mut self, age_ms: i64) -> Result<Self> {
+        self.expect_branch("max-snapshot-age-ms")?;
+        if age_ms <= 0 {
+            return Err(invalid(format_smolstr!(
+                "expected a positive max-snapshot-age-ms, got {age_ms}"
+            )));
+        }
+        self.max_snapshot_age_ms = Some(age_ms);
+        Ok(self)
+    }
+
+    /// Let the reference itself expire this many milliseconds after its
+    /// snapshot was committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `age_ms` is not positive.
+    pub fn with_max_ref_age_ms(mut self, age_ms: i64) -> Result<Self> {
+        if age_ms <= 0 {
+            return Err(invalid(format_smolstr!(
+                "expected a positive max-ref-age-ms, got {age_ms}"
+            )));
+        }
+        self.max_ref_age_ms = Some(age_ms);
+        Ok(self)
+    }
+
+    /// Refuse a branch-only retention field on anything but a branch.
+    fn expect_branch(&self, key: &str) -> Result<()> {
+        if self.is_branch() {
+            return Ok(());
+        }
+        Err(invalid(format_smolstr!(
+            "expected a branch for {key}, got a {:?}",
+            crate::text::elide_to(&self.kind, 64)
+        )))
     }
 
     /// Read one reference object.
@@ -196,19 +294,43 @@ impl SnapshotRef {
                     .and_then(Value::as_str)
                     .unwrap_or("branch"),
             ),
+            min_snapshots_to_keep: document
+                .get_key_str("min-snapshots-to-keep")
+                .and_then(Value::as_i64)
+                .and_then(|count| i32::try_from(count).ok()),
+            max_snapshot_age_ms: document
+                .get_key_str("max-snapshot-age-ms")
+                .and_then(Value::as_i64),
+            max_ref_age_ms: document
+                .get_key_str("max-ref-age-ms")
+                .and_then(Value::as_i64),
         })
     }
 
-    /// Write one reference object.
+    /// Write one reference object, omitting the retention fields it does not
+    /// carry.
     ///
     /// # Errors
     ///
     /// Returns an error only when the mapping cannot be built.
     pub fn to_json(&self) -> Result<Value> {
-        Value::from_mapping([
+        let mut entries = vec![
             (Value::from("snapshot-id"), Value::from(self.snapshot_id)),
             (Value::from("type"), Value::from(self.kind.clone())),
-        ])
+        ];
+        if let Some(count) = self.min_snapshots_to_keep {
+            entries.push((
+                Value::from("min-snapshots-to-keep"),
+                Value::from(i64::from(count)),
+            ));
+        }
+        if let Some(age_ms) = self.max_snapshot_age_ms {
+            entries.push((Value::from("max-snapshot-age-ms"), Value::from(age_ms)));
+        }
+        if let Some(age_ms) = self.max_ref_age_ms {
+            entries.push((Value::from("max-ref-age-ms"), Value::from(age_ms)));
+        }
+        Value::from_mapping(entries)
     }
 }
 
@@ -220,3 +342,6 @@ fn invalid(reason: SmolStr) -> Error {
         reason,
     }
 }
+
+#[cfg(test)]
+mod tests;
