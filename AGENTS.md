@@ -317,6 +317,18 @@ that compiles annotations into native values.
   statistic bytes *are* the Iceberg single-value encoding, and emit counts alone
   for the rest. A missing statistic costs a planner one file read; a wrong one
   costs correctness.
+- **A column change is a new schema, built by `SchemaUpdate` and gated by
+  `can_promote`.** The legal promotions are exactly Int32→Int64,
+  Float32→Float64, and decimal(P,S)→decimal(P′,S) with P′≥P at the same scale;
+  everything else is refused naming both sides. Added columns are numbered
+  above `last-column-id` by the core walk, a dropped column's identifier is
+  never reused, and a renamed column keeps its identifier. `TableMetadata`
+  owns the update vocabulary (`set_property`, `set_location`, `assign_uuid`,
+  `upgrade_format_version`, `set_current_schema`, `add_spec`,
+  `set_default_spec`, `add_sort_order`, `set_default_sort_order`,
+  `set_snapshot_ref`, `remove_snapshot_ref`, `remove_snapshots`) and
+  `TableMetadata::validate` runs on load and before every commit, so a broken
+  document can be read but never written.
 - **Every retained snapshot is a complete table, and reading one is an
   ordinary scan.** Time travel is `scan_at`/`plan_at` with a snapshot id and
   `snapshot_by_ref` for a branch or tag; the snapshot is read as the schema it

@@ -26,7 +26,7 @@ use crate::{DataType, Error, Field, Result, Value};
 pub(super) const SCHEMA_ID: &str = "schema-id";
 
 /// The Iceberg property holding a column's documentation string.
-const DOC: &str = "doc";
+pub(super) const DOC: &str = "doc";
 
 /// The Iceberg property holding a v3 `initial-default`, as encoded JSON.
 const INITIAL_DEFAULT: &str = "initial-default";

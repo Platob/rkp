@@ -826,6 +826,34 @@
   pub fn inspect_snapshots(&self) -> Result<BatchReader>
   pub fn inspect_files(&self) -> Result<BatchReader>
 
+### yggdryl::iceberg::evolve  [rust\src\iceberg\evolve.rs]
+  pub fn can_promote(from: &DataType, to: &DataType) -> Result<()>
+  pub struct SchemaUpdate
+  pub fn for_metadata(metadata: &TableMetadata) -> Result<Self>
+  pub fn add_column(&mut self, parent: &str, field: Field)
+  pub fn drop_column(&mut self, path: &str)
+  pub fn rename_column(&mut self, path: &str, name: &str)
+  pub fn update_doc(&mut self, path: &str, doc: &str)
+  pub fn make_nullable(&mut self, path: &str)
+  pub fn update_type(&mut self, path: &str, data_type: DataType)
+  pub fn apply(self) -> Result<Field>
+
+### yggdryl::iceberg::metadata (additions)
+  pub fn set_property(&mut self, key: impl Into<SmolStr>, value: impl Into<SmolStr>) -> Result<Option<SmolStr>>
+  pub fn remove_property(&mut self, key: &str) -> Option<SmolStr>
+  pub fn set_location(&mut self, location: impl Into<SmolStr>)
+  pub fn assign_uuid(&mut self, uuid: impl Into<SmolStr>) -> Result<()>
+  pub fn upgrade_format_version(&mut self, version: FormatVersion) -> Result<()>
+  pub fn set_current_schema(&mut self, schema_id: i32) -> Result<()>
+  pub fn add_spec(&mut self, spec: PartitionSpec) -> Result<i32>
+  pub fn set_default_spec(&mut self, spec_id: i32) -> Result<()>
+  pub fn add_sort_order(&mut self, order: SortOrder) -> Result<i32>
+  pub fn set_default_sort_order(&mut self, order_id: i32) -> Result<()>
+  pub fn set_snapshot_ref(&mut self, name: impl Into<SmolStr>, reference: SnapshotRef) -> Result<()>
+  pub fn remove_snapshot_ref(&mut self, name: &str) -> Option<SnapshotRef>
+  pub fn remove_snapshots(&mut self, ids: &[i64]) -> Result<()>
+  pub fn validate(&self) -> Result<()>
+
 ### yggdryl::iceberg::schema  [rust\src\iceberg\schema.rs]
   pub fn schema_from_json(name: &str, schema: &Value) -> Result<Field>
   pub fn schema_to_json(root: &Field) -> Result<Value>

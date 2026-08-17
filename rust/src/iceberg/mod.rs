@@ -90,6 +90,7 @@
 //! file belongs to.
 
 mod avro;
+mod evolve;
 mod inspect;
 mod manifest;
 mod metadata;
@@ -102,6 +103,7 @@ mod table;
 mod types;
 mod value;
 
+pub use evolve::{SchemaUpdate, can_promote};
 pub use manifest::{
     DataFile, EntryStatus, FieldSummary, FileFormat, ManifestContent, ManifestEntry, ManifestFile,
     read_manifest, read_manifest_list, read_manifest_spec, write_manifest, write_manifest_list,

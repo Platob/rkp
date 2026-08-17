@@ -741,6 +741,9 @@ impl<H: IOBase> Table<H> {
 
     /// Write the current metadata as the next numbered document.
     fn commit_metadata(&mut self) -> Result<()> {
+        // A bad in-memory state is refused before a document exists, so a
+        // broken table can only be read, never written.
+        self.metadata.validate()?;
         let previous = (self.version > 0)
             .then(|| self.metadata_location())
             .transpose()?;

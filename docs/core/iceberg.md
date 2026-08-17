@@ -1324,15 +1324,13 @@ assert_eq!(
 );
 
 // ALTER TABLE nyc.taxis ADD COLUMN fare_per_distance float
-let mut evolved = schema.fields().to_vec();
-evolved.push(DataType::Float32.nullable_field("fare_per_distance"));
+let mut update = yggdryl::iceberg::SchemaUpdate::for_metadata(table.metadata())?;
+update.add_column("", DataType::Float32.nullable_field("fare_per_distance"));
+let evolved = update.apply()?;
 table.commit_changes(|metadata| {
-    let mut evolved = DataType::from_fields(evolved.clone())?.required_field("row");
-    // The new column gets the next unused id; the retired ones are never reused.
-    evolved.assign_ids(metadata.last_column_id + 1)?;
-    let schema_id = metadata.add_schema(evolved)?;
-    metadata.current_schema_id = schema_id;
-    Ok(())
+    // The new column got the next unused id; a retired id is never reused.
+    let schema_id = metadata.add_schema(evolved.clone())?;
+    metadata.set_current_schema(schema_id)
 })?;
 let widened = table.scan(None)?.next().expect("one batch")?;
 assert_eq!(widened.schema().fields().len(), 6);
@@ -1621,6 +1619,69 @@ Writing a schema whose columns were never numbered fails, and says so:
 
     fs.rmSync(path.dirname(root), { recursive: true, force: true })
     ```
+
+## Evolving a schema
+
+!!! note "Rust only"
+    Column-level evolution is a core surface the bindings do not project yet.
+
+A column change is a new schema, and `SchemaUpdate` is how one is built from the current one:
+record the operations, apply, and commit the result. Only the promotions Iceberg allows are
+accepted, so a change that would reinterpret stored values is refused naming both sides.
+
+```rust
+use yggdryl::iceberg::{can_promote, FormatVersion, PartitionSpec, SchemaUpdate, Table, assign_field_ids};
+use yggdryl::local::Folder;
+use yggdryl::DataType;
+
+let root = std::env::temp_dir().join("yggdryl-doc-evolution");
+let _ = std::fs::remove_dir_all(&root);
+let mut schema = DataType::from_fields([
+    DataType::Int32.required_field("id"),
+    DataType::Utf8.nullable_field("symbol"),
+])?
+.required_field("row");
+assign_field_ids(&mut schema, 1)?;
+let mut table = Table::create(
+    Folder::new(&root)?,
+    FormatVersion::V2,
+    schema,
+    PartitionSpec::unpartitioned(),
+)?;
+
+// Legal promotions pass; anything else is refused naming both sides.
+assert!(can_promote(&DataType::Int32, &DataType::Int64).is_ok());
+assert!(can_promote(&DataType::decimal(10, 2)?, &DataType::decimal(18, 2)?).is_ok());
+let message = can_promote(&DataType::Int64, &DataType::Int32).unwrap_err().to_string();
+assert!(message.contains("int64") && message.contains("int32"));
+
+// Widen id, rename symbol, add venue - one evolved schema, one commit.
+let mut update = SchemaUpdate::for_metadata(table.metadata())?;
+update.update_type("id", DataType::Int64);
+update.rename_column("symbol", "ticker");
+update.add_column("", DataType::Utf8.nullable_field("venue"));
+let evolved = update.apply()?;
+
+table.commit_changes(|metadata| {
+    let schema_id = metadata.add_schema(evolved.clone())?;
+    metadata.set_current_schema(schema_id)
+})?;
+
+let current = table.schema()?;
+assert_eq!(current.get_field_by_name("id").expect("the column").data_type(), &DataType::Int64);
+// A renamed column keeps its identifier: the name is a label, the id is the column.
+assert_eq!(current.get_field_by_name("ticker").expect("the column").id()?, Some(2));
+assert_eq!(current.get_field_by_name("venue").expect("the column").id()?, Some(3));
+
+let _ = std::fs::remove_dir_all(&root);
+```
+
+`TableMetadata` carries the rest of the update vocabulary - `set_property`/`remove_property`,
+`set_location`, `assign_uuid`, `upgrade_format_version`, `set_snapshot_ref`/`remove_snapshot_ref`,
+`remove_snapshots`, `add_spec`/`set_default_spec`, `add_sort_order`/`set_default_sort_order` - and
+every one of them commits through the same `commit_changes`, which validates the whole document
+before a byte of it is written. Dropping a column never frees its identifier: `last-column-id` only
+grows, so a reader of an old file can never mistake a retired column for a new one.
 
 ## Schemas as documents
 

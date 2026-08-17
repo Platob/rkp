@@ -1813,6 +1813,31 @@ fn the_inspection_tables_report_history_snapshots_and_files() {
 }
 
 #[test]
+fn a_commit_refuses_metadata_that_does_not_hold_together() {
+    let path = root("invalid-commit");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    let version = table.version();
+
+    // A change that leaves the metadata inconsistent never becomes a document.
+    let failed = table.commit_changes(|metadata| {
+        metadata.current_schema_id = 999;
+        Ok(())
+    });
+    let message = failed.unwrap_err().to_string();
+    assert!(message.contains("999"), "{message}");
+    assert_eq!(table.version(), version);
+    assert!(table.schema().is_ok());
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
 fn a_zero_row_append_commits_a_snapshot_that_reads_as_nothing() {
     let path = root("zero-row");
     let mut table = Table::create(
@@ -1911,7 +1936,10 @@ fn a_truncated_manifest_is_a_typed_error_and_not_a_panic() {
     // Truncate every Avro manifest under metadata/ to a torn prefix.
     for entry in std::fs::read_dir(path.join("metadata")).unwrap() {
         let file = entry.unwrap().path();
-        if file.extension().is_some_and(|extension| extension == "avro") {
+        if file
+            .extension()
+            .is_some_and(|extension| extension == "avro")
+        {
             let bytes = std::fs::read(&file).unwrap();
             std::fs::write(&file, &bytes[..bytes.len().min(16)]).unwrap();
         }
