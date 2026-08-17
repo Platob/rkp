@@ -38,6 +38,91 @@ assert Value.into_arrow_schema().names == ["number"]
     assert completed.returncode == 0, completed.stderr
 
 
+def test_avro_and_its_record_adapter_need_no_optional_dependency() -> None:
+    script = r"""
+import builtins
+real_import = builtins.__import__
+BLOCKED = {"boto3", "botocore", "pyiceberg", "pyspark", "yaml", "avro", "fastavro"}
+def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+    root = name.split(".", 1)[0]
+    # Only absolute imports are blocked; rkp's own relative imports resolve
+    # inside the package and must keep working.
+    if level == 0 and root in BLOCKED:
+        raise ModuleNotFoundError(f"blocked {name}", name=root)
+    return real_import(name, globals, locals, fromlist, level)
+builtins.__import__ = guarded
+
+import datetime as dt
+import rkp.avro as avro
+from rkp import Record, record, into_avro_schema, records_into_avro, avro_into_records
+
+@record
+class Value(Record):
+    number: int
+    when: dt.datetime
+
+rows = [Value(3, dt.datetime(2026, 8, 17, tzinfo=dt.UTC))]
+schema = into_avro_schema(Value)
+assert [item.name for item in schema.fields] == ["number", "when"]
+payload = records_into_avro(rows, record_type=Value, codec="deflate")
+assert payload.startswith(b"Obj\x01")
+assert list(avro_into_records(Value, payload)) == rows
+assert avro.decode(schema, avro.encode(schema, {"number": 1, "when": rows[0].when}))
+assert isinstance(avro.fingerprint(schema), int)
+"""
+    environment = dict(os.environ)
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    environment["PYTHONPATH"] = source
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_iceberg_catalog_helpers_report_the_optional_extra() -> None:
+    script = r"""
+import builtins
+real_import = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name.split(".", 1)[0] == "pyiceberg":
+        raise ModuleNotFoundError("blocked pyiceberg", name="pyiceberg")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = guarded
+
+from rkp import Record, create_iceberg_table, record, into_iceberg_partition_spec
+
+@record
+class Value(Record):
+    number: int
+
+for operation in (
+    lambda: create_iceberg_table(object(), Value),
+    lambda: into_iceberg_partition_spec(Value),
+):
+    try:
+        operation()
+    except ImportError as error:
+        assert "rkp[iceberg]" in str(error)
+    else:
+        raise AssertionError("catalog call accepted a missing PyIceberg dependency")
+"""
+    environment = dict(os.environ)
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    environment["PYTHONPATH"] = source
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_pyarrow_is_required_and_pyiceberg_remains_optional() -> None:
     project_root = Path(__file__).resolve().parents[1]
     config = tomllib.loads(

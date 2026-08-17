@@ -61,6 +61,7 @@ __all__ = [
     "into_arrow_type",
     "record_into_arrow_field",
     "record_into_arrow_schema",
+    "record_into_native_mapping",
     "records_into_arrow_batch",
     "records_into_arrow_batches",
     "records_into_arrow_reader",
@@ -822,6 +823,20 @@ def _validate_mapping_row(
         f"Arrow mapping row at index {index} does not match schema: "
         + "; ".join(details)
     )
+
+
+def record_into_native_mapping(value: Any) -> dict[str, Any]:
+    """Project one record or dataclass into an alias-keyed native mapping.
+
+    Unlike :func:`rkp.to_dict`, values keep their Python types: timestamps stay
+    ``datetime`` objects and decimals stay :class:`~decimal.Decimal`.  Protocol
+    adapters that own their own scalar encoding, such as Avro, need exactly
+    this projection.
+    """
+
+    if not dataclasses.is_dataclass(value) or isinstance(value, type):
+        raise TypeError("record_into_native_mapping expects a dataclass instance")
+    return _arrow_native_dataclass(value)
 
 
 def _arrow_native_dataclass(value: Any) -> dict[str, Any]:

@@ -11,6 +11,12 @@ Run the Iceberg suite from the `python` directory:
 uv run --extra iceberg python benchmarks/records_iceberg.py
 ```
 
+Run the Avro suite. It needs no optional dependency:
+
+```console
+uv run python benchmarks/records_avro.py
+```
+
 Run the Arrow batch runtime suite (PyArrow is a required dependency):
 
 ```console
@@ -45,10 +51,28 @@ artifact. For a quicker local probe, lower the calibration target:
 
 ```console
 uv run --extra iceberg python benchmarks/records_iceberg.py --min-time 0.05 --repeat 3
+uv run python benchmarks/records_avro.py --min-time 0.05 --repeat 3
 uv run python benchmarks/records_arrow.py --min-time 0.05 --repeat 3
 uv run --extra spark python benchmarks/records_spark.py --min-time 0.05 --repeat 3
 uv run python benchmarks/records_awsglue.py --min-time 0.05 --repeat 3
 ```
+
+The Iceberg suite covers cold and cached record conversion, global field-ID
+allocation, format versions 1, 2, and 3, the Iceberg-flavored Avro
+representation and its fingerprint, reverse Arrow conversion, protocol-projected
+batches, and a live SQL catalog. The catalog cases (namespace and table
+creation, table loading, appends, and scans back to Arrow and to records) run
+only when PyIceberg's SQL catalog dependencies are installed; pass
+`--no-catalog` to skip them, and note that repeated appends accumulate
+snapshots by design. PyIceberg 0.11.x cannot write v3 table metadata, so
+catalog table creation is measured at format versions 1 and 2 while schema
+conversion is measured at all three.
+
+The Avro suite covers schema parsing, cold and cached record schema
+construction, canonical form, Rabin fingerprints, compiled binary encoding and
+decoding, the Avro JSON encoding, container files with the `null` and `deflate`
+codecs, and the record round trip. RKP's JSON codec runs on the same rows as a
+text-encoding reference point.
 
 The Arrow runtime cases compare one-shot and bounded streaming batch creation,
 streaming reader materialization, validated and relaxed record reconstruction,

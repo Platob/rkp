@@ -1,5 +1,10 @@
 """Microbenchmarks for RKP's Arrow and Iceberg record interoperability.
 
+Cases cover schema conversion in both directions, Iceberg format versions 1,
+2, and 3, the Iceberg-flavored Avro representation, Arrow runtime batches, and
+a live catalog (namespace creation, table creation, appends, and scans) when
+PyIceberg's SQL catalog dependencies are installed.
+
 The runner calibrates every case independently, prints median per-operation
 times, and can emit JSON without requiring pytest-benchmark or pyperf.
 """
@@ -7,12 +12,15 @@ times, and can emit JSON without requiring pytest-benchmark or pyperf.
 from __future__ import annotations
 
 import argparse
+import atexit
 import gc
 import json
 import logging
 import platform
+import shutil
 import statistics
 import sys
+import tempfile
 import timeit
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,6 +34,7 @@ import rkp
 from pyiceberg.io.pyarrow import pyarrow_to_schema, schema_to_pyarrow
 from rkp import Record, field, record
 from rkp.records import iceberg as iceberg_adapter
+from rkp.records import iceberg_catalog as catalog_adapter
 
 arrow_into_iceberg_schema = iceberg_adapter.arrow_into_iceberg_schema
 
@@ -69,7 +78,15 @@ class RuntimeMetric(Record):
     value: float | None
 
 
-@record(table_name="iceberg_runtime_events")
+@record(schema_name="benchmark", table_name="partitioned_events")
+class PartitionedEvent(Record):
+    event_id: int = field(seq=1, primary_key=True)
+    occurred_at: datetime = field(partition_key="day")
+    shard: str = field(partition_key="bucket[16]")
+    label: str = field(index_key=True)
+
+
+@record(schema_name="benchmark", table_name="iceberg_runtime_events")
 class RuntimeEvent(Record):
     event_id: int
     occurred_at: datetime
@@ -147,6 +164,136 @@ RUNTIME_ICEBERG_BATCH = rkp.records_into_arrow_batch(
     RUNTIME_ROWS,
     schema=RUNTIME_ICEBERG_ARROW_SCHEMA,
 )
+
+
+ICEBERG_V1_SCHEMA = arrow_into_iceberg_schema(NESTED_ARROW_SCHEMA, format_version=1)
+ICEBERG_V3_SCHEMA = arrow_into_iceberg_schema(NESTED_ARROW_SCHEMA, format_version=3)
+AVRO_ICEBERG_SCHEMA = iceberg_adapter.iceberg_into_avro_schema(
+    NESTED_ICEBERG_SCHEMA,
+    name="benchmark",
+)
+
+
+def _catalog_fixture() -> Any:
+    """Build a disposable SQL catalog, or report why it is unavailable."""
+
+    try:
+        from pyiceberg.catalog.sql import SqlCatalog
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        return None, f"{exc}"
+    warehouse = tempfile.mkdtemp(prefix="rkp-iceberg-benchmark-")
+    atexit.register(shutil.rmtree, warehouse, True)
+    catalog = SqlCatalog(
+        "rkp_benchmark",
+        uri="sqlite:///:memory:",
+        warehouse=f"file://{warehouse}",
+    )
+    catalog.create_namespace_if_not_exists(("benchmark",))
+    return catalog, None
+
+
+CATALOG, CATALOG_UNAVAILABLE = _catalog_fixture()
+CATALOG_ROWS = RUNTIME_ROWS[:64]
+_CREATED_TABLES = 0
+
+if CATALOG is not None:
+    APPEND_TABLE = catalog_adapter.create_iceberg_table(
+        CATALOG,
+        RuntimeEvent,
+        identifier=("benchmark", "append_target"),
+    )
+    SCAN_TABLE = catalog_adapter.create_iceberg_table(
+        CATALOG,
+        RuntimeEvent,
+        identifier=("benchmark", "scan_source"),
+    )
+    catalog_adapter.records_into_iceberg_table(
+        SCAN_TABLE, CATALOG_ROWS, record_type=RuntimeEvent
+    )
+
+
+def _catalog_create_table(format_version: int) -> Any:
+    global _CREATED_TABLES
+    _CREATED_TABLES += 1
+    return catalog_adapter.create_iceberg_table(
+        CATALOG,
+        RuntimeEvent,
+        identifier=("benchmark", f"created_v{format_version}_{_CREATED_TABLES}"),
+        format_version=format_version,
+    )
+
+
+def _catalog_create_table_v1() -> Any:
+    return _catalog_create_table(1)
+
+
+def _catalog_create_table_v2() -> Any:
+    return _catalog_create_table(2)
+
+
+def _catalog_load_table() -> Any:
+    return catalog_adapter.load_iceberg_table(
+        CATALOG, RuntimeEvent, identifier=("benchmark", "scan_source")
+    )
+
+
+def _catalog_append_records() -> Any:
+    return catalog_adapter.records_into_iceberg_table(
+        APPEND_TABLE, CATALOG_ROWS, record_type=RuntimeEvent
+    )
+
+
+def _catalog_scan_into_arrow() -> Any:
+    return catalog_adapter.iceberg_table_into_arrow(SCAN_TABLE)
+
+
+def _catalog_scan_into_records() -> Any:
+    return tuple(catalog_adapter.iceberg_table_into_records(RuntimeEvent, SCAN_TABLE))
+
+
+def _catalog_partition_spec() -> Any:
+    return catalog_adapter.into_iceberg_partition_spec(PartitionedEvent)
+
+
+def _record_schema_v1() -> Any:
+    _clear_record_schema_cache()
+    return BenchmarkEvent.into_iceberg_schema(format_version=1)
+
+
+def _record_schema_v2() -> Any:
+    _clear_record_schema_cache()
+    return BenchmarkEvent.into_iceberg_schema(format_version=2)
+
+
+def _record_schema_v3() -> Any:
+    _clear_record_schema_cache()
+    return BenchmarkEvent.into_iceberg_schema(format_version=3)
+
+
+def _nested_allocate_ids_v1() -> Any:
+    return arrow_into_iceberg_schema(NESTED_ARROW_SCHEMA, format_version=1)
+
+
+def _nested_allocate_ids_v3() -> Any:
+    return arrow_into_iceberg_schema(NESTED_ARROW_SCHEMA, format_version=3)
+
+
+def _iceberg_into_avro_schema() -> Any:
+    return iceberg_adapter.iceberg_into_avro_schema(
+        NESTED_ICEBERG_SCHEMA, name="benchmark"
+    )
+
+
+def _avro_into_iceberg_schema() -> Any:
+    return iceberg_adapter.avro_into_iceberg_schema(AVRO_ICEBERG_SCHEMA)
+
+
+def _avro_schema_fingerprint() -> Any:
+    from rkp.avro import fingerprint
+
+    return fingerprint(
+        iceberg_adapter.iceberg_into_avro_schema(NESTED_ICEBERG_SCHEMA, name="bench")
+    )
 
 
 def _clear_record_field_cache() -> None:
@@ -252,9 +399,17 @@ BENCHMARKS = (
     Benchmark("record_field_cached", _record_field_cached),
     Benchmark("record_schema_cold", _record_schema_cold),
     Benchmark("record_schema_cached", _record_schema_cached),
+    Benchmark("record_schema_v1", _record_schema_v1),
+    Benchmark("record_schema_v2", _record_schema_v2),
+    Benchmark("record_schema_v3", _record_schema_v3),
     Benchmark("nested_allocate_ids", _nested_allocate_ids),
+    Benchmark("nested_allocate_ids_v1", _nested_allocate_ids_v1),
+    Benchmark("nested_allocate_ids_v3", _nested_allocate_ids_v3),
     Benchmark("nested_explicit_ids", _nested_explicit_ids),
     Benchmark("nested_pyiceberg_bulk", _nested_pyiceberg_bulk),
+    Benchmark("iceberg_into_avro_schema", _iceberg_into_avro_schema),
+    Benchmark("avro_into_iceberg_schema", _avro_into_iceberg_schema),
+    Benchmark("avro_schema_fingerprint", _avro_schema_fingerprint),
     Benchmark("nanoseconds_v2_adaptive", _nanoseconds_v2_adaptive),
     Benchmark("nanoseconds_v3_adaptive", _nanoseconds_v3_adaptive),
     Benchmark("nanoseconds_v3_forced_downcast", _nanoseconds_v3_forced_downcast),
@@ -269,6 +424,16 @@ BENCHMARKS = (
         "runtime_canonical_batch_to_records", _runtime_canonical_batch_to_records
     ),
     Benchmark("runtime_iceberg_batch_to_records", _runtime_iceberg_batch_to_records),
+)
+
+CATALOG_BENCHMARKS = (
+    Benchmark("catalog_partition_spec", _catalog_partition_spec),
+    Benchmark("catalog_create_table_v1", _catalog_create_table_v1),
+    Benchmark("catalog_create_table_v2", _catalog_create_table_v2),
+    Benchmark("catalog_load_table", _catalog_load_table),
+    Benchmark("catalog_append_records", _catalog_append_records),
+    Benchmark("catalog_scan_into_arrow", _catalog_scan_into_arrow),
+    Benchmark("catalog_scan_into_records", _catalog_scan_into_records),
 )
 
 
@@ -319,6 +484,10 @@ def _environment() -> dict[str, Any]:
         "nested_top_level_fields": len(NESTED_ARROW_SCHEMA),
         "nested_total_fields": len(NESTED_ICEBERG_SCHEMA.column_names),
         "runtime_rows": RUNTIME_ROW_COUNT,
+        "catalog_rows": len(CATALOG_ROWS),
+        "catalog": "sql" if CATALOG is not None else "unavailable",
+        "catalog_unavailable_reason": CATALOG_UNAVAILABLE,
+        "catalog_write_format_versions": [1, 2],
     }
 
 
@@ -340,6 +509,13 @@ def _print_report(environment: dict[str, Any], results: list[dict[str, Any]]) ->
         f"Nested fixture: {environment['nested_top_level_fields']} roots, "
         f"{environment['nested_total_fields']} total fields"
     )
+    if environment["catalog"] == "sql":
+        print(
+            f"Catalog fixture: SQL catalog, {environment['catalog_rows']} rows, "
+            "table writes at format versions 1 and 2"
+        )
+    else:
+        print(f"Catalog cases skipped: {environment['catalog_unavailable_reason']}")
     print()
     print(f"{'benchmark':38} {'median':>12} {'best':>12} {'iterations':>12}")
     print("-" * 78)
@@ -371,6 +547,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="write machine-readable JSON instead of a table",
     )
+    parser.add_argument(
+        "--no-catalog",
+        action="store_true",
+        help="skip the live catalog cases even when a SQL catalog is available",
+    )
     arguments = parser.parse_args(argv)
     if arguments.min_time <= 0:
         parser.error("--min-time must be greater than zero")
@@ -381,13 +562,16 @@ def main(argv: list[str] | None = None) -> int:
     # their execution order is changed later.
     BenchmarkEvent.into_iceberg_field()
     BenchmarkEvent.into_iceberg_schema()
+    selected = BENCHMARKS
+    if CATALOG is not None and not arguments.no_catalog:
+        selected += CATALOG_BENCHMARKS
     results = [
         _measure(
             benchmark,
             minimum_seconds=arguments.min_time,
             repeat=arguments.repeat,
         )
-        for benchmark in BENCHMARKS
+        for benchmark in selected
     ]
     environment = _environment()
     if arguments.json:

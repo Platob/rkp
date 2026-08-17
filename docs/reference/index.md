@@ -247,11 +247,99 @@ iceberg_fields_into_schema(*fields, schema_id=0, identifier_field_ids=None)
 iceberg_into_arrow_field(field, *, include_field_id=True, primary_key=False,
                          identifier_field_ids=None)
 iceberg_into_arrow_schema(schema, *, metadata=None, include_field_ids=True)
+
+iceberg_into_avro_schema(schema, *, name=None, namespace=None, doc=None)
+avro_into_iceberg_schema(schema, *, schema_id=0, field_id_start=1,
+                         identifier_field_ids=None, format_version=2)
 ```
 
 Generated records expose `into_iceberg_field(...)` and
 `into_iceberg_schema(...)`. An attached RKP `Field` also exposes both methods
 with an optional `owner=` for annotation resolution.
+
+Catalog operations against a live PyIceberg catalog:
+
+```python
+create_iceberg_table(catalog, value, *, identifier=None, format_version=2,
+                     location=None, properties=None, partition_spec=None,
+                     partition_keys=None, sort_order=None, schema_id=0,
+                     field_id_start=1, identifier_field_ids=None,
+                     downcast_ns_timestamp_to_us=..., create_namespace=True,
+                     exists_ok=True)
+load_iceberg_table(catalog, value, *, identifier=None)
+sync_iceberg_table_schema(table, value, *, format_version=None,
+                          downcast_ns_timestamp_to_us=...)
+records_into_iceberg_table(table, records, *, record_type=None,
+                           batch_size=65536, mode="append",
+                           snapshot_properties=None)
+iceberg_table_into_arrow(table, *, row_filter=None, selected_fields=("*",),
+                         limit=None, case_sensitive=True)
+iceberg_table_into_records(record_type, table, *, row_filter=None, limit=None,
+                           case_sensitive=True, safe=True, on_error="raise")
+into_iceberg_partition_spec(value, *, schema=None, partition_keys=None,
+                            spec_id=0)
+into_iceberg_sort_order(value, *, schema=None, sort_keys=None, order_id=1)
+```
+
+## Avro
+
+The `rkp.avro` package needs no optional dependency:
+
+```python
+parse_schema(value, *, namespace=None)
+schema_into_json(schema)
+dumps_schema(schema, *, indent=None)
+loads_schema(data)
+canonical_form(schema)
+fingerprint(schema)
+fingerprint_bytes(schema)
+
+encode(schema, value)
+encode_into(schema, value, out)
+decode(schema, data)
+encode_single_object(schema, value)
+decode_single_object(schema, data)
+compile_encoder(schema)
+compile_decoder(schema)
+
+dumps(schema, value, **kwargs)
+loads(schema, data, **kwargs)
+into_json(schema, value)
+out_of_json(schema, value)
+
+AvroWriter(schema, *, stream=None, codec="null", metadata=None,
+           sync_marker=None, sync_interval=65536)
+AvroReader(source, *, schema=None)
+write_container(destination, schema, values, *, codec="null", metadata=None,
+                sync_marker=None, sync_interval=65536)
+read_container(source, *, schema=None)
+dump(destination, schema, values, *, codec="null", metadata=None,
+     sync_marker=None)
+load(source, *, schema=None)
+```
+
+Record and Arrow adapters are exported from `rkp`:
+
+```python
+into_avro_schema(value, *, name=None, namespace=None, doc=None,
+                 flavor="standard", include_field_ids=True, localns=None)
+arrow_into_avro_schema(schema, *, name=None, namespace=None, doc=None,
+                       flavor="standard", include_field_ids=True)
+arrow_into_avro_field(field, *, namespace=None, flavor="standard",
+                      include_field_ids=True)
+dataclass_into_avro_schema(dataclass_type, *, name=None, namespace=None,
+                           flavor="standard", include_field_ids=True,
+                           localns=None)
+avro_into_arrow_schema(schema, *, metadata=None, large_types=False)
+avro_into_arrow_field(field, *, large_types=False)
+records_into_avro(records, *, record_type=None, schema=None, codec="null",
+                  metadata=None, sync_marker=None)
+avro_into_records(record_type, source, *, schema=None, safe=True,
+                  on_error="raise")
+```
+
+Generated records expose `into_avro_schema(...)`, `into_avro(records, ...)`,
+and `from_avro(source, ...)`.
 
 ## AWS Glue
 
@@ -298,5 +386,6 @@ Generated record methods also expose `into_glue_partition_values()`,
   and `create_partition_from`.
 
 See the focused guides for behavior and limitations: [Arrow](../arrow.md),
+[Avro](../avro.md),
 [Spark](../spark.md), [Iceberg](../iceberg.md), and
 [AWS Glue](../aws-glue.md).

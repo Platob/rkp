@@ -1,8 +1,14 @@
 # rkp
 
-`rkp` adds a small record layer to Python dataclasses, with built-in JSON/YAML
-serialization, Apache Arrow interoperability, and optional Apache Iceberg,
-Apache Spark, and AWS Glue Data Catalog interoperability.
+`rkp` adds a small record layer to Python dataclasses, with built-in JSON,
+YAML, and Apache Avro serialization, Apache Arrow interoperability, and
+optional Apache Iceberg, Apache Spark, and AWS Glue Data Catalog
+interoperability.
+
+Protocol conversion runs through one neutral field model in
+`rkp.records.datatypes`, so Arrow, Avro, Iceberg, and Glue agree on names,
+nullability, stable identities, and precision instead of each adapter owning
+its own mapping table.
 
 The dependency-free `rkp.fix` package generates those same records and Arrow
 metadata from selected OnixS FIX fields, components, repeating groups, and
@@ -140,6 +146,19 @@ reader = User.into_arrow_reader(users, batch_size=8192)
 restored = User.from_arrow(reader)
 ```
 
+Apache Avro is built in and dependency-free. `rkp.avro` implements schemas,
+the binary encoding, the JSON encoding, object container files, canonical form,
+and Rabin fingerprints; codecs are compiled once per schema into cached closure
+trees. `rkp.records.avro` bridges that implementation to records and Arrow, and
+`flavor="iceberg"` emits Iceberg's own Avro representation (fixed-backed
+decimals and UUIDs, `field-id` attributes, explicit `adjust-to-utc`):
+
+```python
+avro_schema = User.into_avro_schema()
+payload = User.into_avro(users, codec="deflate")
+restored = list(User.from_avro(payload))
+```
+
 Apache Spark 4 interop uses that Arrow boundary directly and does not require
 pandas. Arrow field and schema metadata are carried in Spark field metadata,
 validated against the live Spark schema, then restored on the reverse path.
@@ -193,6 +212,23 @@ a microsecond schema still require their
 `downcast-ns-timestamp-to-us-on-write` setting. With the currently supported
 PyIceberg 0.11.x line, v3 nano schema types are available even though a full v3
 table-metadata lifecycle is not yet supported.
+
+Arrow and Iceberg types meet in RKP's own neutral field model rather than in
+PyIceberg's converters, which keeps one traversal and accepts every Arrow type
+that converts losslessly. Format versions 1, 2, and 3 are supported for schema
+conversion, including v3 `unknown` columns, nanosecond timestamps, and
+`initial-default`/`write-default` values carried as Arrow metadata.
+`iceberg_into_avro_schema()` and `avro_into_iceberg_schema()` expose Iceberg's
+Avro representation of a schema.
+
+`rkp.records.iceberg_catalog` drives a live PyIceberg catalog from the same
+record contract: `create_iceberg_table()`, `records_into_iceberg_table()`,
+`iceberg_table_into_records()`, `iceberg_table_into_arrow()`, and
+`sync_iceberg_table_schema()` for union-by-name evolution. Partition specs and
+sort orders are projected from field roles, where a string `partition_key`
+names an Iceberg transform such as `"day"` or `"bucket[16]"`. PyIceberg 0.11.x
+cannot write v3 table metadata, so creating a v3 table raises a clear
+`NotImplementedError` while v3 schema conversion keeps working.
 
 `primary_key` maps to Iceberg identifier fields. Iceberg keeps partitioning
 and sorting in separate `PartitionSpec` and `SortOrder` objects, so
@@ -353,7 +389,7 @@ uv run --extra iceberg python benchmarks/records_iceberg.py
 
 Use `--json` for machine-readable results. Benchmarks are kept separate from
 correctness tests so performance trends never become timing-sensitive CI
-assertions. See `benchmarks/README.md` for the Arrow, Spark, Iceberg, Glue, and
+assertions. See `benchmarks/README.md` for the Arrow, Avro, Spark, Iceberg, Glue, and
 PostgreSQL runners.
 
 The project uses uv's native `uv_build` backend for editable installs, source

@@ -33,6 +33,7 @@ tests. Run each protocol from the same machine/runtime when comparing a change:
 
 ```console
 uv run --project python python python/benchmarks/records_arrow.py
+uv run --project python python python/benchmarks/records_avro.py
 uv run --project python --extra iceberg python python/benchmarks/records_iceberg.py
 uv run --project python --extra spark python python/benchmarks/records_spark.py
 uv run --project python python python/benchmarks/records_awsglue.py
@@ -60,8 +61,11 @@ The suites cover:
   decoding, and raw PyArrow lower bounds;
 - Spark schema conversion, direct Arrow ingestion, DataFrame collection, and
   record reconstruction, excluding session startup;
-- Iceberg cold/cached schema work, global ID allocation, timestamp policy,
-  reverse Arrow conversion, and protocol-projected batches;
+- Avro schema parsing/fingerprinting, compiled binary and JSON encoding,
+  container files, and the record round trip;
+- Iceberg cold/cached schema work, global ID allocation, format versions 1-3,
+  the Avro representation, timestamp policy, reverse Arrow conversion,
+  protocol-projected batches, and live catalog operations;
 - Glue schema/column/table/DDL conversion without AWS requests;
 - PostgreSQL ADBC reader ingestion and result decoding, including network and
   transaction cost but excluding connection startup.
@@ -86,6 +90,7 @@ Run the local examples before publishing:
 uv run --project python python docs/examples/basic.py
 uv run --project python python docs/examples/codecs.py
 uv run --project python python docs/examples/arrow_batches.py
+uv run --project python python docs/examples/avro.py
 uv run --project python python docs/examples/glue.py
 ```
 

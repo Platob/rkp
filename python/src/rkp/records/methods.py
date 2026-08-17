@@ -30,6 +30,9 @@ def install_record_methods(cls: type[Any]) -> None:
         "into_arrow_schema": classmethod(_into_arrow_schema),
         "into_iceberg_field": classmethod(_into_iceberg_field),
         "into_iceberg_schema": classmethod(_into_iceberg_schema),
+        "into_avro_schema": classmethod(_into_avro_schema),
+        "into_avro": classmethod(_into_avro),
+        "from_avro": classmethod(_from_avro),
         "into_spark_schema": classmethod(_into_spark_schema),
         "into_spark_dataframe": classmethod(_into_spark_dataframe),
         "from_spark": classmethod(_from_spark),
@@ -293,6 +296,62 @@ def _into_iceberg_field(
         field_id_start=field_id_start,
         format_version=format_version,
         downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+    )
+
+
+def _into_avro_schema(
+    cls: type[Any],
+    *,
+    flavor: str = "standard",
+    include_field_ids: bool = True,
+) -> Any:
+    """Return a cached Avro record schema for the record."""
+
+    avro = importlib.import_module("rkp.records.avro")
+    return avro.record_into_avro_schema(
+        cls,
+        flavor=flavor,
+        include_field_ids=include_field_ids,
+    )
+
+
+def _into_avro(
+    cls: type[Any],
+    records: Any,
+    *,
+    codec: str = "null",
+    metadata: Any = None,
+    sync_marker: bytes | None = None,
+) -> bytes:
+    """Encode records of this type as an Avro object container file."""
+
+    avro = importlib.import_module("rkp.records.avro")
+    return avro.records_into_avro(
+        records,
+        record_type=cls,
+        codec=codec,
+        metadata=metadata,
+        sync_marker=sync_marker,
+    )
+
+
+def _from_avro(
+    cls: type[Any],
+    source: Any,
+    *,
+    schema: Any = None,
+    safe: bool = True,
+    on_error: str = "raise",
+) -> Any:
+    """Lazily construct records from an Avro object container file."""
+
+    avro = importlib.import_module("rkp.records.avro")
+    return avro.avro_into_records(
+        cls,
+        source,
+        schema=schema,
+        safe=safe,
+        on_error=on_error,
     )
 
 

@@ -12,17 +12,38 @@ import typing
 from collections.abc import Hashable, Iterable, Mapping, Sequence
 from functools import cache
 from types import EllipsisType
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import pyarrow as pa
-from pyiceberg.io.pyarrow import pyarrow_to_schema, schema_to_pyarrow
 from pyiceberg.schema import Schema
-from pyiceberg.types import ListType, MapType, NestedField, StructType
+from pyiceberg.types import (
+    BinaryType,
+    BooleanType,
+    DateType,
+    DecimalType,
+    DoubleType,
+    FixedType,
+    FloatType,
+    IcebergType,
+    IntegerType,
+    ListType,
+    LongType,
+    MapType,
+    NestedField,
+    StringType,
+    StructType,
+    TimestampNanoType,
+    TimestampType,
+    TimestamptzNanoType,
+    TimestamptzType,
+    TimeType,
+    UnknownType,
+    UUIDType,
+)
 
 from ._metadata import (
     IDENTIFIER_FIELD_IDS,
     MAX_FIELD_SEQ,
-    ORC_FIELD_ID,
     PARQUET_FIELD_ID,
     PRIMARY_KEY,
     SCHEMA_ID,
@@ -35,21 +56,106 @@ from .arrow import (
     into_arrow_field,
     record_into_arrow_field,
 )
+from .datatypes import (
+    DataType,
+    FieldSpec,
+    TypeKind,
+    arrow_into_field_spec,
+    field_spec_into_arrow,
+    join_path,
+)
 from .interop import is_record_type
+
+if typing.TYPE_CHECKING:  # pragma: no cover - import cycle only for annotations
+    from ..avro import RecordSchema
 
 __all__ = [
     "arrow_into_iceberg_field",
     "arrow_into_iceberg_schema",
+    "avro_into_iceberg_schema",
     "dataclass_into_iceberg_field",
     "dataclass_into_iceberg_schema",
     "iceberg_fields_into_schema",
     "iceberg_into_arrow_field",
     "iceberg_into_arrow_schema",
+    "iceberg_into_avro_schema",
     "into_iceberg_field",
     "into_iceberg_schema",
     "record_into_iceberg_field",
     "record_into_iceberg_schema",
 ]
+
+
+def iceberg_into_avro_schema(
+    schema: Schema | NestedField,
+    *,
+    name: str | None = None,
+    namespace: str | None = None,
+    doc: str | None = None,
+) -> RecordSchema:
+    """Return the Avro representation Iceberg uses for a schema.
+
+    Field IDs become ``field-id``/``element-id``/``key-id``/``value-id``
+    attributes, decimals and UUIDs use fixed storage, and timestamps carry an
+    explicit ``adjust-to-utc`` flag.  The result is an :mod:`rkp.avro` schema,
+    so it can be fingerprinted, canonicalized, or used to encode data.
+    """
+
+    from .avro import field_specs_into_avro_schema
+
+    specs: tuple[FieldSpec, ...]
+    if isinstance(schema, NestedField):
+        _validate_iceberg_fields((schema,))
+        specs = (_iceberg_field_into_spec(schema, frozenset()),)
+        default_name = schema.name
+    elif isinstance(schema, Schema):
+        _validate_iceberg_fields(schema.fields)
+        identifiers = frozenset(schema.identifier_field_ids)
+        specs = tuple(
+            _iceberg_field_into_spec(field, identifiers) for field in schema.fields
+        )
+        default_name = "table"
+    else:
+        raise TypeError(
+            "iceberg_into_avro_schema expects an Iceberg Schema or NestedField"
+        )
+    return field_specs_into_avro_schema(
+        specs,
+        name=name if name is not None else default_name,
+        namespace=namespace,
+        doc=doc,
+        flavor="iceberg",
+        include_field_ids=True,
+    )
+
+
+def avro_into_iceberg_schema(
+    schema: Any,
+    *,
+    schema_id: int = 0,
+    field_id_start: int = 1,
+    identifier_field_ids: Iterable[int] | None = None,
+    format_version: int = 2,
+) -> Schema:
+    """Convert an Avro record schema into an Iceberg schema.
+
+    Missing ``field-id`` attributes are allocated deterministically through the
+    same Arrow projection used by every other Iceberg entry point, so an Avro
+    declaration written by another engine converts without manual IDs.
+    """
+
+    from .avro import avro_into_arrow_schema
+
+    _validate_schema_id(schema_id)
+    _validate_field_id_start(field_id_start)
+    _validate_format_version(format_version)
+    return arrow_into_iceberg_schema(
+        avro_into_arrow_schema(schema),
+        schema_id=schema_id,
+        field_id_start=field_id_start,
+        identifier_field_ids=identifier_field_ids,
+        format_version=format_version,
+    )
 
 
 def into_iceberg_field(
@@ -486,24 +592,18 @@ def iceberg_into_arrow_schema(
         schema_metadata[IDENTIFIER_FIELD_IDS] = b",".join(
             str(field_id).encode("ascii") for field_id in schema.identifier_field_ids
         )
-    converted = schema_to_pyarrow(
-        schema,
+    identifiers = frozenset(schema.identifier_field_ids)
+    return pa.schema(
+        [
+            field_spec_into_arrow(
+                _iceberg_field_into_spec(field, identifiers),
+                large_types=True,
+                include_field_ids=include_field_ids,
+            )
+            for field in schema.fields
+        ],
         metadata=schema_metadata,
-        include_field_ids=True,
     )
-    if not isinstance(converted, pa.Schema):
-        raise TypeError("PyIceberg returned a non-schema Arrow value")
-    if schema.identifier_field_ids:
-        converted = pa.schema(
-            _mark_identifier_fields(list(converted), set(schema.identifier_field_ids)),
-            metadata=converted.metadata,
-        )
-    if not include_field_ids:
-        converted = pa.schema(
-            _strip_field_ids(list(converted)),
-            metadata=converted.metadata,
-        )
-    return converted
 
 
 def iceberg_into_arrow_field(
@@ -533,21 +633,13 @@ def iceberg_into_arrow_field(
             "identifier_field_ids are not contained in the Iceberg field: "
             + ", ".join(map(str, sorted(unknown_identifiers)))
         )
-    schema = iceberg_fields_into_schema(
-        field,
-        identifier_field_ids=identifiers,
+    # Identifier membership is resolved before conversion so nested primary
+    # keys survive even when the caller does not want Arrow field IDs.
+    return field_spec_into_arrow(
+        _iceberg_field_into_spec(field, frozenset(identifiers)),
+        large_types=True,
+        include_field_ids=include_field_id,
     )
-    # Convert with IDs internally even when the caller does not want them so
-    # nested identifier membership can still be projected to primary metadata.
-    converted = schema_to_pyarrow(schema, include_field_ids=True)
-    if not isinstance(converted, pa.Schema) or len(converted) != 1:
-        raise TypeError("PyIceberg returned an invalid Arrow field wrapper")
-    result = converted.field(0)
-    if identifiers:
-        result = _mark_identifier_fields([result], set(identifiers))[0]
-    if not include_field_id:
-        result = _strip_field_ids([result])[0]
-    return result
 
 
 def _iceberg_field_ids(field: NestedField) -> set[int]:
@@ -736,15 +828,203 @@ def _convert_arrow_fields(
     identified, identifiers = _FieldSeqAllocator(
         tuple(fields), start=field_id_start
     ).apply()
-    try:
-        converted = pyarrow_to_schema(
-            pa.schema(identified),
+    converted = tuple(
+        _spec_into_iceberg_field(
+            arrow_into_field_spec(field),
+            format_version=format_version,
             downcast_ns_timestamp_to_us=effective_downcast,
-            format_version=cast(Literal[1, 2, 3], format_version),
         )
-    except Exception as exc:
-        raise TypeError(f"cannot convert Arrow field to Iceberg: {exc}") from exc
-    return _IcebergFields(tuple(converted.fields), identifiers)
+        for field in identified
+    )
+    return _IcebergFields(converted, identifiers)
+
+
+def _spec_into_iceberg_field(
+    spec: FieldSpec,
+    *,
+    format_version: int,
+    downcast_ns_timestamp_to_us: bool,
+    path: str = "",
+) -> NestedField:
+    """Convert one neutral field spec into an Iceberg ``NestedField``."""
+
+    field_path = join_path(path, spec.name)
+    if spec.field_id is None:
+        raise ValueError(f"Iceberg field at {field_path!r} requires a field ID")
+    field_type = _data_type_into_iceberg(
+        spec.data_type,
+        format_version=format_version,
+        downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+        path=field_path,
+    )
+    # Iceberg requires unknown columns to be optional because they can only
+    # ever read as null, whatever the Arrow field declared.
+    required = spec.required and not isinstance(field_type, UnknownType)
+    initial_default = _validated_default(
+        spec.default, field_path, format_version, "initial_default"
+    )
+    write_default = _validated_default(
+        spec.write_default, field_path, format_version, "write_default"
+    )
+    return NestedField(
+        field_id=spec.field_id,
+        name=spec.name,
+        field_type=field_type,
+        required=required,
+        doc=spec.doc,
+        initial_default=initial_default,
+        write_default=write_default,
+    )
+
+
+def _validated_default(
+    value: Any,
+    path: str,
+    format_version: int,
+    name: str,
+) -> Any:
+    if value is ...:
+        return None
+    if format_version < 3:
+        raise TypeError(
+            f"Iceberg {name} at {path!r} requires format version 3; "
+            f"got format version {format_version}"
+        )
+    return value
+
+
+def _data_type_into_iceberg(
+    data_type: DataType,
+    *,
+    format_version: int,
+    downcast_ns_timestamp_to_us: bool,
+    path: str,
+) -> IcebergType:
+    kind = data_type.kind
+    simple = _SIMPLE_ICEBERG_TYPES.get(kind)
+    if simple is not None:
+        return simple
+    if kind is TypeKind.DECIMAL:
+        return DecimalType(int(data_type.precision or 0), int(data_type.scale or 0))
+    if kind is TypeKind.FIXED:
+        return FixedType(int(data_type.length or 0))
+    if kind is TypeKind.TIME:
+        if data_type.unit == "ns":
+            raise TypeError(f"Column {path!r} has an unsupported type: time64[ns]")
+        return TimeType()
+    if kind is TypeKind.TIMESTAMP:
+        return _timestamp_into_iceberg(
+            data_type,
+            format_version=format_version,
+            downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+            path=path,
+        )
+    if kind is TypeKind.UNKNOWN:
+        if format_version < 3:
+            raise ValueError(
+                "Null type (pa.null()) is not supported in Iceberg format version "
+                f"{format_version}. Field: {path}. Requires format-version=3+ or "
+                "use a concrete type (string, int, boolean, etc.)."
+            )
+        return UnknownType()
+
+    def nested(spec: FieldSpec) -> NestedField:
+        return _spec_into_iceberg_field(
+            spec,
+            format_version=format_version,
+            downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+            path=path,
+        )
+
+    if kind is TypeKind.STRUCT:
+        return StructType(*(nested(child) for child in data_type.fields))
+    if kind is TypeKind.LIST:
+        element = nested(cast(FieldSpec, data_type.element))
+        return ListType(
+            element_id=element.field_id,
+            element_type=element.field_type,
+            element_required=element.required,
+        )
+    key = nested(cast(FieldSpec, data_type.key))
+    value = nested(cast(FieldSpec, data_type.value))
+    return MapType(
+        key_id=key.field_id,
+        key_type=key.field_type,
+        value_id=value.field_id,
+        value_type=value.field_type,
+        value_required=value.required,
+    )
+
+
+def _timestamp_into_iceberg(
+    data_type: DataType,
+    *,
+    format_version: int,
+    downcast_ns_timestamp_to_us: bool,
+    path: str,
+) -> IcebergType:
+    adjusted = data_type.adjusted_to_utc
+    if data_type.unit != "ns" or downcast_ns_timestamp_to_us:
+        return TimestamptzType() if adjusted else TimestampType()
+    if format_version < 3:
+        rendered = "timestamp[ns, tz=UTC]" if adjusted else "timestamp[ns]"
+        raise TypeError(f"Column {path!r} has an unsupported type: {rendered}")
+    return TimestamptzNanoType() if adjusted else TimestampNanoType()
+
+
+def _iceberg_field_into_spec(
+    field: NestedField,
+    identifiers: frozenset[int],
+) -> FieldSpec:
+    """Convert one Iceberg field into the neutral model."""
+
+    return FieldSpec(
+        name=field.name,
+        data_type=_iceberg_type_into_data_type(field.field_type, identifiers),
+        required=field.required,
+        field_id=field.field_id,
+        doc=field.doc,
+        primary_key=field.field_id in identifiers,
+        default=... if field.initial_default is None else field.initial_default,
+        write_default=... if field.write_default is None else field.write_default,
+    )
+
+
+def _iceberg_type_into_data_type(
+    field_type: IcebergType,
+    identifiers: frozenset[int],
+) -> DataType:
+    simple = _SIMPLE_DATA_TYPES.get(type(field_type))
+    if simple is not None:
+        return simple
+    if isinstance(field_type, DecimalType):
+        return DataType(
+            TypeKind.DECIMAL,
+            precision=field_type.precision,
+            scale=field_type.scale,
+        )
+    if isinstance(field_type, FixedType):
+        return DataType(TypeKind.FIXED, length=len(field_type))
+    if isinstance(field_type, StructType):
+        return DataType(
+            TypeKind.STRUCT,
+            fields=tuple(
+                _iceberg_field_into_spec(child, identifiers)
+                for child in field_type.fields
+            ),
+        )
+    if isinstance(field_type, ListType):
+        return DataType(
+            TypeKind.LIST,
+            element=_iceberg_field_into_spec(field_type.element_field, identifiers),
+        )
+    if isinstance(field_type, MapType):
+        return DataType(
+            TypeKind.MAP,
+            key=_iceberg_field_into_spec(field_type.key_field, identifiers),
+            value=_iceberg_field_into_spec(field_type.value_field, identifiers),
+        )
+    raise TypeError(f"unsupported Iceberg type {field_type}")
 
 
 def _validate_arrow_timestamp_zones(fields: Sequence[pa.Field]) -> None:
@@ -940,83 +1220,6 @@ class _FieldSeqAllocator:
         return value
 
 
-def _mark_identifier_fields(
-    fields: Sequence[pa.Field], identifiers: set[int]
-) -> list[pa.Field]:
-    result: list[pa.Field] = []
-    for field in fields:
-        metadata = dict(field.metadata or {})
-        field_id = _field_seq(field, field.name, metadata=metadata)
-        if field_id in identifiers:
-            metadata[PRIMARY_KEY] = b"true"
-        result.append(
-            pa.field(
-                field.name,
-                _mark_identifier_type(field.type, identifiers),
-                nullable=field.nullable,
-                metadata=metadata or None,
-            )
-        )
-    return result
-
-
-def _mark_identifier_type(
-    arrow_type: pa.DataType, identifiers: set[int]
-) -> pa.DataType:
-    if pa.types.is_struct(arrow_type):
-        return pa.struct(_mark_identifier_fields(list(arrow_type), identifiers))
-    if pa.types.is_list(arrow_type):
-        return pa.list_(
-            _mark_identifier_fields([arrow_type.value_field], identifiers)[0]
-        )
-    if pa.types.is_large_list(arrow_type):
-        return pa.large_list(
-            _mark_identifier_fields([arrow_type.value_field], identifiers)[0]
-        )
-    if pa.types.is_fixed_size_list(arrow_type):
-        child = _mark_identifier_fields([arrow_type.value_field], identifiers)[0]
-        return pa.list_(child, arrow_type.list_size)
-    if pa.types.is_map(arrow_type):
-        key, value = _mark_identifier_fields(
-            [arrow_type.key_field, arrow_type.item_field], identifiers
-        )
-        return pa.map_(key, value, keys_sorted=arrow_type.keys_sorted)
-    return arrow_type
-
-
-def _strip_field_ids(fields: Sequence[pa.Field]) -> list[pa.Field]:
-    result: list[pa.Field] = []
-    for field in fields:
-        metadata = dict(field.metadata or {})
-        metadata.pop(PARQUET_FIELD_ID, None)
-        metadata.pop(ORC_FIELD_ID, None)
-        result.append(
-            pa.field(
-                field.name,
-                _strip_field_id_type(field.type),
-                nullable=field.nullable,
-                metadata=metadata or None,
-            )
-        )
-    return result
-
-
-def _strip_field_id_type(arrow_type: pa.DataType) -> pa.DataType:
-    if pa.types.is_struct(arrow_type):
-        return pa.struct(_strip_field_ids(list(arrow_type)))
-    if pa.types.is_list(arrow_type):
-        return pa.list_(_strip_field_ids([arrow_type.value_field])[0])
-    if pa.types.is_large_list(arrow_type):
-        return pa.large_list(_strip_field_ids([arrow_type.value_field])[0])
-    if pa.types.is_fixed_size_list(arrow_type):
-        child = _strip_field_ids([arrow_type.value_field])[0]
-        return pa.list_(child, arrow_type.list_size)
-    if pa.types.is_map(arrow_type):
-        key, value = _strip_field_ids([arrow_type.key_field, arrow_type.item_field])
-        return pa.map_(key, value, keys_sorted=arrow_type.keys_sorted)
-    return arrow_type
-
-
 def _field_seq(
     field: pa.Field,
     path: str,
@@ -1144,3 +1347,34 @@ def _is_list_like(arrow_type: pa.DataType) -> bool:
 
 def _join_path(parent: str, child: str) -> str:
     return f"{parent}.{child}" if parent else child
+
+
+_SIMPLE_ICEBERG_TYPES: Mapping[TypeKind, IcebergType] = {
+    TypeKind.BOOLEAN: BooleanType(),
+    TypeKind.INT32: IntegerType(),
+    TypeKind.INT64: LongType(),
+    TypeKind.FLOAT32: FloatType(),
+    TypeKind.FLOAT64: DoubleType(),
+    TypeKind.DATE: DateType(),
+    TypeKind.STRING: StringType(),
+    TypeKind.BINARY: BinaryType(),
+    TypeKind.UUID: UUIDType(),
+}
+
+_SIMPLE_DATA_TYPES: Mapping[type[IcebergType], DataType] = {
+    BooleanType: DataType(TypeKind.BOOLEAN),
+    IntegerType: DataType(TypeKind.INT32),
+    LongType: DataType(TypeKind.INT64),
+    FloatType: DataType(TypeKind.FLOAT32),
+    DoubleType: DataType(TypeKind.FLOAT64),
+    DateType: DataType(TypeKind.DATE),
+    StringType: DataType(TypeKind.STRING),
+    BinaryType: DataType(TypeKind.BINARY),
+    UUIDType: DataType(TypeKind.UUID),
+    UnknownType: DataType(TypeKind.UNKNOWN),
+    TimeType: DataType(TypeKind.TIME, unit="us"),
+    TimestampType: DataType(TypeKind.TIMESTAMP, unit="us"),
+    TimestamptzType: DataType(TypeKind.TIMESTAMP, unit="us", adjusted_to_utc=True),
+    TimestampNanoType: DataType(TypeKind.TIMESTAMP, unit="ns"),
+    TimestamptzNanoType: DataType(TypeKind.TIMESTAMP, unit="ns", adjusted_to_utc=True),
+}

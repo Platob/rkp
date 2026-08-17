@@ -1,8 +1,9 @@
 # rkp
 
 `rkp` turns typed Python dataclasses into portable records. One record contract
-can drive JSON and YAML codecs, Apache Arrow schemas and streams, and optional
-Spark, Iceberg, and AWS Glue integrations.
+can drive JSON and YAML codecs, Apache Arrow schemas and streams, a
+dependency-free Apache Avro implementation, and optional Spark, Iceberg, and
+AWS Glue integrations.
 
 ```python
 from rkp import Record, field, record
@@ -34,6 +35,8 @@ reuse the same schema and row representation.
 - [JSON and YAML](codecs.md) covers strings, paths, streams, and generated
   record methods.
 - [Arrow](arrow.md) moves from schema inference to lazy batch readers.
+- [Avro](avro.md) covers schemas, binary and JSON encodings, container files,
+  and the Iceberg representation.
 - [Spark](spark.md), [Iceberg](iceberg.md), and [AWS Glue](aws-glue.md) build on
   that Arrow contract.
 - [PostgreSQL ADBC](integrations.md) demonstrates a live Arrow protocol

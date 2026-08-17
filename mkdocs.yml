@@ -42,6 +42,7 @@ nav:
   - Records: records.md
   - FIX fields: fix.md
   - Arrow: arrow.md
+  - Avro: avro.md
   - Spark: spark.md
   - Iceberg: iceberg.md
   - AWS Glue: aws-glue.md

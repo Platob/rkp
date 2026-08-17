@@ -19,6 +19,8 @@ from .records.interop import (
 
 __all__ = [
     "arrow_batch_into_records",
+    "arrow_into_avro_field",
+    "arrow_into_avro_schema",
     "arrow_into_glue_column",
     "arrow_into_glue_columns",
     "arrow_into_iceberg_field",
@@ -28,10 +30,16 @@ __all__ = [
     "arrow_into_spark_field",
     "arrow_type_into_glue_type",
     "arrow_type_into_spark_type",
+    "avro_into_arrow_field",
+    "avro_into_arrow_schema",
+    "avro_into_iceberg_schema",
+    "avro_into_records",
     "catalog_name",
+    "create_iceberg_table",
     "dataclass_from_dict",
     "dataclass_into_arrow_field",
     "dataclass_into_arrow_schema",
+    "dataclass_into_avro_schema",
     "dataclass_into_iceberg_field",
     "dataclass_into_iceberg_schema",
     "glue_into_arrow_field",
@@ -39,9 +47,13 @@ __all__ = [
     "iceberg_fields_into_schema",
     "iceberg_into_arrow_field",
     "iceberg_into_arrow_schema",
+    "iceberg_into_avro_schema",
+    "iceberg_table_into_arrow",
+    "iceberg_table_into_records",
     "into_arrow_field",
     "into_arrow_schema",
     "into_arrow_type",
+    "into_avro_schema",
     "into_glue_columns",
     "into_glue_database_ddl",
     "into_glue_ddl",
@@ -51,14 +63,19 @@ __all__ = [
     "into_glue_partition_values",
     "into_glue_table_input",
     "into_iceberg_field",
+    "into_iceberg_partition_spec",
     "into_iceberg_schema",
+    "into_iceberg_sort_order",
     "into_spark_schema",
     "is_record",
     "is_record_type",
+    "load_iceberg_table",
     "record_from_dict",
     "records_into_arrow_batch",
     "records_into_arrow_batches",
     "records_into_arrow_reader",
+    "records_into_avro",
+    "records_into_iceberg_table",
     "records_into_spark_dataframe",
     "resolved_type_hints",
     "schema_metadata",
@@ -69,6 +86,7 @@ __all__ = [
     "spark_into_arrow_field",
     "spark_into_arrow_schema",
     "spark_type_into_arrow_type",
+    "sync_iceberg_table_schema",
     "table_name",
     "to_dict",
 ]
@@ -584,6 +602,344 @@ def iceberg_fields_into_schema(
     )
 
 
+def create_iceberg_table(
+    catalog: Any,
+    value: Any,
+    *,
+    identifier: Any = None,
+    format_version: int = 2,
+    location: str | None = None,
+    properties: Mapping[str, str] | None = None,
+    partition_spec: Any = None,
+    partition_keys: Iterable[str] | None = None,
+    sort_order: Any = None,
+    schema_id: int = 0,
+    field_id_start: int = 1,
+    identifier_field_ids: Iterable[int] | None = None,
+    downcast_ns_timestamp_to_us: bool | None | EllipsisType = ...,
+    create_namespace: bool = True,
+    exists_ok: bool = True,
+) -> Any:
+    """Create or load the catalog table described by a record or schema."""
+
+    return _iceberg_catalog().create_iceberg_table(
+        catalog,
+        value,
+        identifier=identifier,
+        format_version=format_version,
+        location=location,
+        properties=properties,
+        partition_spec=partition_spec,
+        partition_keys=partition_keys,
+        sort_order=sort_order,
+        schema_id=schema_id,
+        field_id_start=field_id_start,
+        identifier_field_ids=identifier_field_ids,
+        downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+        create_namespace=create_namespace,
+        exists_ok=exists_ok,
+    )
+
+
+def load_iceberg_table(catalog: Any, value: Any, *, identifier: Any = None) -> Any:
+    """Load one catalog table for a record type, dataclass, or identifier."""
+
+    return _iceberg_catalog().load_iceberg_table(catalog, value, identifier=identifier)
+
+
+def sync_iceberg_table_schema(
+    table: Any,
+    value: Any,
+    *,
+    format_version: int | None = None,
+    downcast_ns_timestamp_to_us: bool | None | EllipsisType = ...,
+) -> Any:
+    """Evolve a live Iceberg table so it contains every column of a record."""
+
+    return _iceberg_catalog().sync_iceberg_table_schema(
+        table,
+        value,
+        format_version=format_version,
+        downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us,
+    )
+
+
+def records_into_iceberg_table(
+    table: Any,
+    records: Iterable[Any],
+    *,
+    record_type: type[Any] | None = None,
+    batch_size: int = 65_536,
+    mode: str = "append",
+    snapshot_properties: Mapping[str, str] | None = None,
+) -> Any:
+    """Write records into a live Iceberg table through Arrow."""
+
+    return _iceberg_catalog().records_into_iceberg_table(
+        table,
+        records,
+        record_type=record_type,
+        batch_size=batch_size,
+        mode=mode,
+        snapshot_properties=snapshot_properties,
+    )
+
+
+def iceberg_table_into_arrow(
+    table: Any,
+    *,
+    row_filter: Any = None,
+    selected_fields: tuple[str, ...] = ("*",),
+    limit: int | None = None,
+    case_sensitive: bool = True,
+) -> Any:
+    """Scan a live Iceberg table into one Arrow table."""
+
+    return _iceberg_catalog().iceberg_table_into_arrow(
+        table,
+        row_filter=row_filter,
+        selected_fields=selected_fields,
+        limit=limit,
+        case_sensitive=case_sensitive,
+    )
+
+
+def iceberg_table_into_records(
+    record_type: type[Any],
+    table: Any,
+    *,
+    row_filter: Any = None,
+    limit: int | None = None,
+    case_sensitive: bool = True,
+    safe: bool = True,
+    on_error: str = "raise",
+) -> Any:
+    """Scan a live Iceberg table and construct records from its rows."""
+
+    return _iceberg_catalog().iceberg_table_into_records(
+        record_type,
+        table,
+        row_filter=row_filter,
+        limit=limit,
+        case_sensitive=case_sensitive,
+        safe=safe,
+        on_error=on_error,
+    )
+
+
+def into_iceberg_partition_spec(
+    value: Any,
+    *,
+    schema: Any = None,
+    partition_keys: Iterable[str] | None = None,
+    spec_id: int = 0,
+) -> Any:
+    """Project an Iceberg partition spec from ``partition_key`` field roles."""
+
+    return _iceberg_catalog().into_iceberg_partition_spec(
+        value,
+        schema=schema,
+        partition_keys=partition_keys,
+        spec_id=spec_id,
+    )
+
+
+def into_iceberg_sort_order(
+    value: Any,
+    *,
+    schema: Any = None,
+    sort_keys: Iterable[str] | None = None,
+    order_id: int = 1,
+) -> Any:
+    """Project an Iceberg sort order from ``index_key`` field roles."""
+
+    return _iceberg_catalog().into_iceberg_sort_order(
+        value,
+        schema=schema,
+        sort_keys=sort_keys,
+        order_id=order_id,
+    )
+
+
+def into_avro_schema(
+    value: Any,
+    *,
+    name: str | None = None,
+    namespace: str | None = None,
+    doc: str | None = None,
+    flavor: str = "standard",
+    include_field_ids: bool = True,
+    localns: Mapping[str, Any] | None = None,
+) -> Any:
+    """Build an Avro record schema from a record, dataclass, or Arrow schema."""
+
+    return _records_avro().into_avro_schema(
+        value,
+        name=name,
+        namespace=namespace,
+        doc=doc,
+        flavor=flavor,
+        include_field_ids=include_field_ids,
+        localns=localns,
+    )
+
+
+def arrow_into_avro_schema(
+    schema: Any,
+    *,
+    name: str | None = None,
+    namespace: str | None = None,
+    doc: str | None = None,
+    flavor: str = "standard",
+    include_field_ids: bool = True,
+) -> Any:
+    """Convert an Arrow schema into an Avro record schema."""
+
+    return _records_avro().arrow_into_avro_schema(
+        schema,
+        name=name,
+        namespace=namespace,
+        doc=doc,
+        flavor=flavor,
+        include_field_ids=include_field_ids,
+    )
+
+
+def arrow_into_avro_field(
+    field: Any,
+    *,
+    namespace: str | None = None,
+    flavor: str = "standard",
+    include_field_ids: bool = True,
+) -> Any:
+    """Convert one Arrow field into an Avro record field."""
+
+    return _records_avro().arrow_into_avro_field(
+        field,
+        namespace=namespace,
+        flavor=flavor,
+        include_field_ids=include_field_ids,
+    )
+
+
+def dataclass_into_avro_schema(
+    dataclass_type: type[Any],
+    *,
+    name: str | None = None,
+    namespace: str | None = None,
+    flavor: str = "standard",
+    include_field_ids: bool = True,
+    localns: Mapping[str, Any] | None = None,
+) -> Any:
+    """Infer an Avro record schema from an ordinary dataclass."""
+
+    return _records_avro().dataclass_into_avro_schema(
+        dataclass_type,
+        name=name,
+        namespace=namespace,
+        flavor=flavor,
+        include_field_ids=include_field_ids,
+        localns=localns,
+    )
+
+
+def avro_into_arrow_schema(
+    schema: Any,
+    *,
+    metadata: Mapping[str | bytes, Any] | None = None,
+    large_types: bool = False,
+) -> Any:
+    """Convert an Avro record schema into an Arrow schema."""
+
+    return _records_avro().avro_into_arrow_schema(
+        schema,
+        metadata=metadata,
+        large_types=large_types,
+    )
+
+
+def avro_into_arrow_field(field: Any, *, large_types: bool = False) -> Any:
+    """Convert one Avro record field into an Arrow field."""
+
+    return _records_avro().avro_into_arrow_field(field, large_types=large_types)
+
+
+def records_into_avro(
+    records: Iterable[Any],
+    *,
+    record_type: type[Any] | None = None,
+    schema: Any = None,
+    codec: str = "null",
+    metadata: Mapping[str, Any] | None = None,
+    sync_marker: bytes | None = None,
+) -> bytes:
+    """Encode records as an Avro object container file."""
+
+    return _records_avro().records_into_avro(
+        records,
+        record_type=record_type,
+        schema=schema,
+        codec=codec,
+        metadata=metadata,
+        sync_marker=sync_marker,
+    )
+
+
+def avro_into_records(
+    record_type: type[Any],
+    source: Any,
+    *,
+    schema: Any = None,
+    safe: bool = True,
+    on_error: str = "raise",
+) -> Any:
+    """Lazily construct records from an Avro object container file."""
+
+    return _records_avro().avro_into_records(
+        record_type,
+        source,
+        schema=schema,
+        safe=safe,
+        on_error=on_error,
+    )
+
+
+def iceberg_into_avro_schema(
+    schema: Any,
+    *,
+    name: str | None = None,
+    namespace: str | None = None,
+    doc: str | None = None,
+) -> Any:
+    """Return Iceberg's own Avro representation of a schema or field."""
+
+    return _iceberg().iceberg_into_avro_schema(
+        schema,
+        name=name,
+        namespace=namespace,
+        doc=doc,
+    )
+
+
+def avro_into_iceberg_schema(
+    schema: Any,
+    *,
+    schema_id: int = 0,
+    field_id_start: int = 1,
+    identifier_field_ids: Iterable[int] | None = None,
+    format_version: int = 2,
+) -> Any:
+    """Convert an Avro record schema into an Iceberg schema."""
+
+    return _iceberg().avro_into_iceberg_schema(
+        schema,
+        schema_id=schema_id,
+        field_id_start=field_id_start,
+        identifier_field_ids=identifier_field_ids,
+        format_version=format_version,
+    )
+
+
 def arrow_type_into_glue_type(value: Any, *, path: str = "value") -> str:
     """Convert one Arrow data type to Glue/Hive type syntax."""
 
@@ -769,9 +1125,25 @@ def _arrow() -> Any:
     return importlib.import_module("rkp.records.arrow")
 
 
+def _records_avro() -> Any:
+    return importlib.import_module("rkp.records.avro")
+
+
 def _iceberg() -> Any:
     try:
         return importlib.import_module("rkp.records.iceberg")
+    except ModuleNotFoundError as exc:
+        if exc.name == "pyiceberg" or (exc.name and exc.name.startswith("pyiceberg.")):
+            raise ImportError(
+                "Iceberg support requires PyIceberg; install it with "
+                "'pip install rkp[iceberg]'"
+            ) from exc
+        raise
+
+
+def _iceberg_catalog() -> Any:
+    try:
+        return importlib.import_module("rkp.records.iceberg_catalog")
     except ModuleNotFoundError as exc:
         if exc.name == "pyiceberg" or (exc.name and exc.name.startswith("pyiceberg.")):
             raise ImportError(
