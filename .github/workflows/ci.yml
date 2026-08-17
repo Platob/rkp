@@ -30,6 +30,23 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # The rkp wheel is built by maturin from rust/crates/rkp-avro-python, so a
+      # Rust toolchain has to exist before any uv step that builds the project.
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          if command -v rustup >/dev/null 2>&1; then
+            rustup toolchain install stable --profile minimal --no-self-update
+            rustup default stable
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+          fi
+          echo "$cargo_bin" >> "$GITHUB_PATH"
+          "$cargo_bin/rustc" --version
+          "$cargo_bin/cargo" --version
+
       - name: Install uv
         uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
@@ -66,3 +83,76 @@ jobs:
         run: |
           uv build --project python --no-sources
           uv run --project python --group dev twine check python/dist/*
+
+  core:
+    name: Rust core
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update \
+            --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # `cargo test` covers the workspace's default members, which is the core
+      # crate alone: the two binding crates are `cdylib`s that resolve their
+      # host's symbols only once CPython or Node loads them, so a standalone
+      # test binary linked against either has nothing to bind to.  Building
+      # them is still worth doing, and the jobs above and below run them where
+      # they can actually execute.
+      - name: Test the core
+        run: cargo test
+
+      - name: Build the bindings
+        run: cargo build -p rkp-avro-python -p rkp-avro-node
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- --deny warnings
+
+  node:
+    name: Node.js addon
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Install Node
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: js/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the addon
+        run: npm run build
+
+      - name: Run tests
+        run: npm test

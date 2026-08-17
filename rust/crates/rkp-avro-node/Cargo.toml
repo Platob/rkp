@@ -1,0 +1,21 @@
+[package]
+name = "rkp-avro-node"
+description = "Node.js addon for the rkp Avro core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rkp-avro.workspace = true
+serde_json.workspace = true
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"

@@ -146,18 +146,45 @@ reader = User.into_arrow_reader(users, batch_size=8192)
 restored = User.from_arrow(reader)
 ```
 
-Apache Avro is built in and dependency-free. `rkp.avro` implements schemas,
-the binary encoding, the JSON encoding, object container files, canonical form,
-and Rabin fingerprints; codecs are compiled once per schema into cached closure
-trees. `rkp.records.avro` bridges that implementation to records and Arrow, and
-`flavor="iceberg"` emits Iceberg's own Avro representation (fixed-backed
-decimals and UUIDs, `field-id` attributes, explicit `adjust-to-utc`):
+Apache Avro is built in and needs no optional dependency. The implementation is
+the Rust crate `rkp-avro`, loaded through the bundled `rkp._avro` extension
+module: schemas, the binary and JSON encodings, canonical form, Rabin
+fingerprints, and object container files addressable by record index. `rkp.avro`
+owns the Python surface — the immutable schema model, the `Avro` container
+class, and the codec facade — while `rkp.records.avro` bridges to records and
+Arrow, where `flavor="iceberg"` emits Iceberg's own Avro representation
+(fixed-backed decimals and UUIDs, `field-id` attributes, explicit
+`adjust-to-utc`):
 
 ```python
 avro_schema = User.into_avro_schema()
 payload = User.into_avro(users, codec="deflate")
 restored = list(User.from_avro(payload))
 ```
+
+One `Avro` class reads and writes the same container file and addresses records
+by position, so a single record can be read or rewritten without scanning the
+file. Rows are mappings, dataclasses, or positional sequences matching the
+schema:
+
+```python
+from pathlib import Path
+
+from rkp.avro import Avro
+
+Path("users.avro").write_bytes(payload)
+
+with Avro(Path("users.avro"), mode="r+") as container:
+    first = container[0]          # decodes one block, not the whole file
+    container[0] = {**first, "name": "Ada Lovelace"}
+    container.append(first)
+    del container[-1]
+```
+
+Modes are `"r"`, `"r+"`, `"a"`, and `"w"`; edits stage per block and are
+applied in one pass, appends extend the file in place, and any other write-out
+replaces it atomically. `blocks()`, `block_of()`, and `read_block()` expose the
+block layout, and `compact()` re-frames it.
 
 Apache Spark 4 interop uses that Arrow boundary directly and does not require
 pandas. Arrow field and schema metadata are carried in Spark field metadata,
@@ -264,8 +291,9 @@ destination methods. These encode once and write directly to a binary stream
 or a binary-mode path. The existing load methods accept bytes-like documents,
 `BytesIO` streams, and paths, so no separate byte-loading API is necessary.
 
-The core package includes PyArrow and its own optimized YAML codec. Apache
-Iceberg, PySpark, and the AWS SDK remain optional integrations:
+The core package includes PyArrow, its own optimized YAML codec, and the
+compiled Avro extension module. Apache Iceberg, PySpark, and the AWS SDK remain
+optional integrations:
 
 ```shell
 uv add "rkp[iceberg]"
@@ -366,12 +394,15 @@ Iceberg table creation also creates and manages Iceberg metadata in S3; use
 PyIceberg's Glue catalog for that lifecycle rather than treating a schema-only
 conversion as a complete Iceberg table creation.
 
-Development:
+Development, from the repository root. Building the package compiles the Avro
+extension, so a [Rust toolchain](https://rustup.rs) (edition 2024, Rust >= 1.85)
+must be installed first:
 
 ```shell
 uv sync --project python --extra test --group dev
 uv run --project python --extra test --group dev pytest -q
 uv build --project python --no-sources
+cargo test --manifest-path rust/Cargo.toml
 ```
 
 Preview or validate the GitHub Pages site from the repository root:
@@ -392,8 +423,9 @@ correctness tests so performance trends never become timing-sensitive CI
 assertions. See `benchmarks/README.md` for the Arrow, Avro, Spark, Iceberg, Glue, and
 PostgreSQL runners.
 
-The project uses uv's native `uv_build` backend for editable installs, source
-distributions, and wheels. Run `uv build --no-sources` before publishing to
+The project is built with [maturin](https://www.maturin.rs): the wheel is the
+Python sources from `src/` plus the `rkp._avro` extension module compiled from
+`rust/crates/rkp-avro-python`. Run `uv build --no-sources` before publishing to
 verify the package without any local source overrides.
 
 Supported Python versions are 3.11 and 3.12.

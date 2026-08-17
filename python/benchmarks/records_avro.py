@@ -1,17 +1,25 @@
-"""Microbenchmarks for RKP's dependency-free Avro implementation.
+"""Microbenchmarks for RKP's Avro implementation.
 
-The cases cover schema handling (parsing, canonical form, fingerprints),
-compiled binary encoding and decoding, the JSON encoding, object container
-files with every stdlib codec, and the record round trip.  RKP's JSON codec is
-measured on the same rows as a reference point for text encoding cost.
+The format itself lives in the Rust crate ``rkp-avro`` and reaches Python
+through the ``rkp._avro`` extension module, so these cases measure that core
+plus the conversion of Python values across the boundary.  They cover schema
+handling (parsing, canonical form, fingerprints), compiled binary encoding and
+decoding, the JSON encoding, object container files with the stdlib codecs, the
+record round trip, and the random-access container operations the Rust core
+exists for: reading one record by index from a cold and from a warm container,
+building a container's block index, replacing one record, and appending one.
+RKP's JSON codec is measured on the same rows as a reference point for text
+encoding cost.
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import itertools
 import json
 import platform
+import random
 import statistics
 import sys
 import timeit
@@ -47,8 +55,12 @@ class BenchmarkEvent(Record):
 
 
 ROW_COUNT = 1_024
-ROWS = tuple(
-    BenchmarkEvent(
+SYNC_MARKER = b"rkp-benchmark--16"[:16]
+SEED = 20_260_817
+
+
+def _event(index: int) -> BenchmarkEvent:
+    return BenchmarkEvent(
         index,
         None if index % 7 == 0 else f"event-{index}",
         datetime(2026, 8, 14, index % 24, index % 60, tzinfo=UTC),
@@ -58,8 +70,9 @@ ROWS = tuple(
         {"shard": index % 16, "optional": None},
         index.to_bytes(4, "little"),
     )
-    for index in range(ROW_COUNT)
-)
+
+
+ROWS = tuple(_event(index) for index in range(ROW_COUNT))
 
 SCHEMA = avro_records.into_avro_schema(BenchmarkEvent)
 ICEBERG_SCHEMA = avro_records.into_avro_schema(BenchmarkEvent, flavor="iceberg")
@@ -67,17 +80,52 @@ SCHEMA_JSON = avro.dumps_schema(SCHEMA)
 NATIVE_ROWS = tuple(record_into_native_mapping(row) for row in ROWS)
 ENCODE = avro.compile_encoder(SCHEMA)
 DECODE = avro.compile_decoder(SCHEMA)
-BINARY_ROWS = tuple(avro.encode(SCHEMA, row) for row in NATIVE_ROWS)
+BINARY_ROWS = tuple(ENCODE(row) for row in NATIVE_ROWS)
 JSON_ROWS = tuple(avro.dumps(SCHEMA, row) for row in NATIVE_ROWS)
+
+# The row written by the random-write case: one whole record of comparable
+# size, so replacing a record neither grows nor shrinks its block materially.
+UPDATE_ROW = record_into_native_mapping(_event(7_777))
+APPEND_ROW = record_into_native_mapping(_event(9_999))
+
 CONTAINER_NULL = avro_records.records_into_avro(
-    ROWS, record_type=BenchmarkEvent, sync_marker=b"rkp-benchmark--16"[:16]
+    ROWS, record_type=BenchmarkEvent, sync_marker=SYNC_MARKER
 )
 CONTAINER_DEFLATE = avro_records.records_into_avro(
     ROWS,
     record_type=BenchmarkEvent,
     codec="deflate",
-    sync_marker=b"rkp-benchmark--16"[:16],
+    sync_marker=SYNC_MARKER,
 )
+
+
+def _random_access_container() -> bytes:
+    """Write the same rows framed for indexed reads rather than bulk writes."""
+
+    container = avro.Avro.create(
+        SCHEMA,
+        codec="null",
+        sync_marker=SYNC_MARKER,
+        sync_interval=avro.RANDOM_SYNC_INTERVAL,
+    )
+    container.extend(NATIVE_ROWS)
+    return container.into_bytes()
+
+
+CONTAINER_RANDOM = _random_access_container()
+
+# One deterministic scan order, so cold and warm reads touch the same records
+# in the same sequence and the numbers stay comparable across runs.
+INDEX_ORDER = tuple(random.Random(SEED).sample(range(ROW_COUNT), ROW_COUNT))
+READ_COLD_INDICES = itertools.cycle(INDEX_ORDER)
+READ_WARM_INDICES = itertools.cycle(INDEX_ORDER)
+WRITE_INDICES = itertools.cycle(INDEX_ORDER)
+
+WARM_CONTAINER = avro.read_container(CONTAINER_RANDOM)
+RANDOM_BLOCKS = len(WARM_CONTAINER.blocks())
+for _block in WARM_CONTAINER.blocks():
+    # Decoding one record per block leaves every payload in the block cache.
+    WARM_CONTAINER[_block.first]
 
 
 def _schema_parse_cold() -> Any:
@@ -109,7 +157,7 @@ def _binary_encode_rows() -> Any:
 
 
 def _binary_decode_rows() -> Any:
-    return [DECODE(avro.Reader(payload)) for payload in BINARY_ROWS]
+    return [DECODE(payload) for payload in BINARY_ROWS]
 
 
 def _json_encode_rows() -> Any:
@@ -140,6 +188,41 @@ def _container_read_null() -> Any:
 
 def _container_read_deflate() -> Any:
     return list(avro.read_container(CONTAINER_DEFLATE))
+
+
+def _container_open_index() -> Any:
+    """Open a container image and build the block index behind ``len()``."""
+
+    return len(avro.read_container(CONTAINER_RANDOM))
+
+
+def _container_read_one_cold() -> Any:
+    """Open a container and decode one record, with nothing yet cached."""
+
+    container = avro.read_container(CONTAINER_RANDOM)
+    return container[next(READ_COLD_INDICES)]
+
+
+def _container_read_one_warm() -> Any:
+    """Decode one record from a container whose blocks are already cached."""
+
+    return WARM_CONTAINER[next(READ_WARM_INDICES)]
+
+
+def _container_write_one() -> Any:
+    """Replace one record by index and materialize the container image."""
+
+    container = avro.Avro(CONTAINER_RANDOM, mode="r+")
+    container[next(WRITE_INDICES)] = UPDATE_ROW
+    return container.into_bytes()
+
+
+def _container_append_one() -> Any:
+    """Append one record to an existing container and materialize its image."""
+
+    container = avro.Avro(CONTAINER_RANDOM, mode="a")
+    container.append(APPEND_ROW)
+    return container.into_bytes()
 
 
 def _records_into_avro() -> Any:
@@ -182,6 +265,11 @@ BENCHMARKS = (
     Benchmark("container_write_deflate", _container_write_deflate),
     Benchmark("container_read_null", _container_read_null),
     Benchmark("container_read_deflate", _container_read_deflate),
+    Benchmark("container_open_index", _container_open_index),
+    Benchmark("container_read_one_cold", _container_read_one_cold),
+    Benchmark("container_read_one_warm", _container_read_one_warm),
+    Benchmark("container_write_one", _container_write_one),
+    Benchmark("container_append_one", _container_append_one),
     Benchmark("records_into_avro", _records_into_avro),
     Benchmark("avro_into_records", _avro_into_records),
 )
@@ -222,11 +310,15 @@ def _environment() -> dict[str, Any]:
         "implementation": platform.python_implementation(),
         "platform": platform.platform(),
         "rkp": rkp_version,
+        "rkp_avro_core": avro.core_version(),
         "rows_per_operation": ROW_COUNT,
         "record_fields": len(SCHEMA.fields),
         "binary_bytes": sum(len(payload) for payload in BINARY_ROWS),
         "container_null_bytes": len(CONTAINER_NULL),
         "container_deflate_bytes": len(CONTAINER_DEFLATE),
+        "container_random_bytes": len(CONTAINER_RANDOM),
+        "container_random_blocks": RANDOM_BLOCKS,
+        "container_random_sync_interval": avro.RANDOM_SYNC_INTERVAL,
         "schema_fingerprint": f"{avro.fingerprint(SCHEMA):016x}",
     }
 
@@ -266,7 +358,10 @@ def main(argv: list[str] | None = None) -> int:
         print()
         return 0
 
-    print(f"Python {environment['python']}, RKP {environment['rkp']}")
+    print(
+        f"Python {environment['python']}, RKP {environment['rkp']}, "
+        f"rkp-avro core {environment['rkp_avro_core']}"
+    )
     print(
         f"Fixture: {environment['rows_per_operation']} rows, "
         f"{environment['record_fields']} fields, "
@@ -275,7 +370,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"Container sizes: null {environment['container_null_bytes']} B, "
-        f"deflate {environment['container_deflate_bytes']} B"
+        f"deflate {environment['container_deflate_bytes']} B, "
+        f"random-access {environment['container_random_bytes']} B in "
+        f"{environment['container_random_blocks']} blocks of "
+        f"{environment['container_random_sync_interval']} B"
     )
     print()
     print(f"{'benchmark':32} {'median':>12} {'best':>12} {'iterations':>12}")

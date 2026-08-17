@@ -19,10 +19,10 @@ import pyarrow as pa
 
 from ..avro import (
     ArraySchema,
+    Avro,
     AvroField,
     AvroSchema,
     AvroSchemaError,
-    AvroWriter,
     EnumSchema,
     FixedSchema,
     MapSchema,
@@ -404,17 +404,19 @@ def records_into_avro(
         if schema is not None
         else into_avro_schema(cast(type[Any], selected_type))
     )
-    writer = AvroWriter(
+    container = Avro.create(
         avro_schema,
         codec=codec,
         metadata=metadata,
         sync_marker=sync_marker,
     )
     if has_first:
-        writer.append(_avro_row(first, selected_type))
+        container.append(_avro_row(first, selected_type))
     for item in iterator:
-        writer.append(_avro_row(item, selected_type))
-    return writer.close()
+        container.append(_avro_row(item, selected_type))
+    image = container.into_bytes()
+    container.close()
+    return image
 
 
 def avro_into_records(
@@ -424,14 +426,26 @@ def avro_into_records(
     schema: Any = None,
     safe: bool = True,
     on_error: Literal["raise", "default"] = "raise",
+    start: int = 0,
+    stop: int | None = None,
 ) -> Iterator[T]:
-    """Lazily construct records from an Avro object container file."""
+    """Lazily construct records from an Avro object container file.
+
+    ``start`` and ``stop`` select a record range without decoding the blocks
+    before it, which is what makes a partial read of a large container cheap.
+    """
 
     if not isinstance(record_type, type) or not is_record_type(record_type):
         raise TypeError("record_type must be a decorated record type")
 
     def converted() -> Iterator[T]:
-        for index, row in enumerate(read_container(source, schema=schema)):
+        container = read_container(source, schema=schema)
+        rows = (
+            container.iter_from(start, stop)
+            if start or stop is not None
+            else iter(container)
+        )
+        for index, row in enumerate(rows, start=start):
             try:
                 yield dataclass_from_dict(
                     record_type,

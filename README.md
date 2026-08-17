@@ -4,6 +4,10 @@
 drive JSON, YAML, and Apache Avro serialization, Apache Arrow schemas and
 batches, and optional Spark, Iceberg, and AWS Glue integrations.
 
+Avro is implemented in Rust (`rust/crates/rkp-avro`) and exposed through a
+Python extension module and a Node addon, so `rkp.avro` and `@rkp/avro` share
+one implementation of schemas, encodings, fingerprints, and container files.
+
 ```python
 from rkp import Record, field, record
 
@@ -34,8 +38,15 @@ integrations are available as `rkp[spark]`, `rkp[iceberg]`,
 
 ## Repository layout
 
+- `rust/` is a Cargo workspace: `rkp-avro` implements Avro (schemas, the binary
+  and JSON encodings, fingerprints, and random-access container files), and two
+  binding crates wrap it for Python and Node. See [`rust/README.md`](rust/README.md).
 - `python/` contains the distributable Python project, tests, lockfile, and
-  protocol benchmarks.
+  protocol benchmarks. Its wheel is built by maturin and bundles the
+  `rkp._avro` extension module, so a local checkout needs a
+  [Rust toolchain](https://rustup.rs).
+- `js/` is the `@rkp/avro` npm package, the Node addon over the same core
+  (pre-alpha, no prebuilt binaries yet). See [`js/README.md`](js/README.md).
 - `docs/` contains the MkDocs source and runnable examples.
 - `.github/workflows/` validates the project and publishes the documentation.
 
@@ -45,6 +56,8 @@ For a local checkout:
 uv sync --project python --extra test
 uv run --project python pytest -q
 uv run --project python --only-group docs mkdocs serve -f mkdocs.yml
+cargo test --manifest-path rust/Cargo.toml
+cd js && npm install && npm run build && npm test
 ```
 
 See [the development guide](docs/benchmarks-development.md) for the complete

@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/rkp-avro", "crates/rkp-avro-python", "crates/rkp-avro-node"]
+# The two binding crates are `cdylib`s that resolve their host's symbols only
+# once loaded by CPython or Node, so a test binary linked against them has
+# nothing to bind to.  `cargo test` therefore covers the core, and the bindings
+# are covered by `pytest` and `node --test`, where they actually run.
+default-members = ["crates/rkp-avro"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Platob/rkp"
+
+[workspace.dependencies]
+rkp-avro = { path = "crates/rkp-avro" }
+serde_json = "1.0"
+flate2 = "1.1"
+bzip2 = "0.6"
+liblzma = { version = "0.4", features = ["static"] }

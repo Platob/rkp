@@ -216,3 +216,35 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Node / npm — the js/ package (@rkp/avro) and the napi addon it builds
+# ---------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.yarn/cache/
+.yarn/install-state.gz
+
+# Compiled napi addons, e.g. js/rkp-avro.linux-x64-gnu.node.
+# Built from rust/crates/rkp-avro-node by `npm run build` in js/.
+# The generated loader (js/binding.js) and its types (js/binding.d.ts) ARE
+# tracked — napi-rs expects them in the published tarball.
+*.node
+
+# ---------------------------------------------------------------------------
+# Rust
+# ---------------------------------------------------------------------------
+# The bare `target/` above (from the Python-era template) already matches this,
+# but name it explicitly so the Cargo workspace output stays ignored even if
+# that line is ever removed.
+/rust/target/
+
+# ---------------------------------------------------------------------------
+# maturin
+# ---------------------------------------------------------------------------
+# `uv sync` installs python/ in editable mode, which drops the compiled
+# rkp._avro module straight into the source tree (python/src/rkp/_avro*).
+# `*.so` above covers Linux and macOS; this covers Windows.
+*.pyd

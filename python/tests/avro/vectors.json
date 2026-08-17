@@ -1,0 +1,121 @@
+[
+  {
+    "name": "null-primitive",
+    "schema": "\"null\"",
+    "canonical_form": "\"null\"",
+    "fingerprint": "63dd24e7cc258f8a",
+    "binary": ""
+  },
+  {
+    "name": "long-negative",
+    "schema": "\"long\"",
+    "canonical_form": "\"long\"",
+    "fingerprint": "d054e14493f41db7",
+    "binary": "0d"
+  },
+  {
+    "name": "long-beyond-double",
+    "schema": "\"long\"",
+    "canonical_form": "\"long\"",
+    "fingerprint": "d054e14493f41db7",
+    "binary": "8280808080808020"
+  },
+  {
+    "name": "double",
+    "schema": "\"double\"",
+    "canonical_form": "\"double\"",
+    "fingerprint": "8e7535c032ab957e",
+    "binary": "000000000000e03f"
+  },
+  {
+    "name": "bytes",
+    "schema": "\"bytes\"",
+    "canonical_form": "\"bytes\"",
+    "fingerprint": "4fc016dac3201965",
+    "binary": "060001ff"
+  },
+  {
+    "name": "string-unicode",
+    "schema": "\"string\"",
+    "canonical_form": "\"string\"",
+    "fingerprint": "8f014872634503c7",
+    "binary": "1261646120c3a9e4b8ad"
+  },
+  {
+    "name": "enum",
+    "schema": "{\"name\": \"Kind\", \"symbols\": [\"A\", \"B\"], \"type\": \"enum\"}",
+    "canonical_form": "{\"name\":\"Kind\",\"type\":\"enum\",\"symbols\":[\"A\",\"B\"]}",
+    "fingerprint": "daf649707416e4ea",
+    "binary": "02"
+  },
+  {
+    "name": "fixed",
+    "schema": "{\"name\": \"Digest\", \"size\": 4, \"type\": \"fixed\"}",
+    "canonical_form": "{\"name\":\"Digest\",\"type\":\"fixed\",\"size\":4}",
+    "fingerprint": "0aa14746c6c96967",
+    "binary": "61626364"
+  },
+  {
+    "name": "array",
+    "schema": "{\"items\": \"long\", \"type\": \"array\"}",
+    "canonical_form": "{\"type\":\"array\",\"items\":\"long\"}",
+    "fingerprint": "5416c98ba22e5e71",
+    "binary": "0602040600"
+  },
+  {
+    "name": "map",
+    "schema": "{\"type\": \"map\", \"values\": \"string\"}",
+    "canonical_form": "{\"type\":\"map\",\"values\":\"string\"}",
+    "fingerprint": "86ce965d92864572",
+    "binary": "04026102780262027900"
+  },
+  {
+    "name": "optional-union-present",
+    "schema": "[\"null\", \"string\"]",
+    "canonical_form": "[\"null\",\"string\"]",
+    "fingerprint": "9845f21eb77ec49d",
+    "binary": "020868657265"
+  },
+  {
+    "name": "optional-union-absent",
+    "schema": "[\"null\", \"string\"]",
+    "canonical_form": "[\"null\",\"string\"]",
+    "fingerprint": "9845f21eb77ec49d",
+    "binary": "00"
+  },
+  {
+    "name": "record",
+    "schema": "{\"fields\": [{\"name\": \"identifier\", \"type\": \"long\"}, {\"default\": null, \"name\": \"label\", \"type\": [\"null\", \"string\"]}, {\"name\": \"tags\", \"type\": {\"items\": \"string\", \"type\": \"array\"}}], \"name\": \"Cross\", \"namespace\": \"rkp.test\", \"type\": \"record\"}",
+    "canonical_form": "{\"name\":\"rkp.test.Cross\",\"type\":\"record\",\"fields\":[{\"name\":\"identifier\",\"type\":\"long\"},{\"name\":\"label\",\"type\":[\"null\",\"string\"]},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"items\":\"string\"}}]}",
+    "fingerprint": "e11ee8727a150098",
+    "binary": "0d0206616461040278027900"
+  },
+  {
+    "name": "logical-date",
+    "schema": "{\"logicalType\": \"date\", \"type\": \"int\"}",
+    "canonical_form": "\"int\"",
+    "fingerprint": "7275d51a3f395c8f",
+    "binary": "94c302"
+  },
+  {
+    "name": "logical-timestamp-millis",
+    "schema": "{\"logicalType\": \"timestamp-millis\", \"type\": \"long\"}",
+    "canonical_form": "\"long\"",
+    "fingerprint": "d054e14493f41db7",
+    "binary": "80f599fb8168"
+  },
+  {
+    "name": "logical-decimal",
+    "schema": "{\"logicalType\": \"decimal\", \"precision\": 12, \"scale\": 3, \"type\": \"bytes\"}",
+    "canonical_form": "\"bytes\"",
+    "fingerprint": "4fc016dac3201965",
+    "binary": "043039"
+  },
+  {
+    "name": "logical-uuid",
+    "schema": "{\"logicalType\": \"uuid\", \"type\": \"string\"}",
+    "canonical_form": "\"string\"",
+    "fingerprint": "8f014872634503c7",
+    "binary": "4833663235303465302d346638392d313164332d396130632d303330356538326333333031"
+  }
+]

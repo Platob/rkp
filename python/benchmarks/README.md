@@ -68,11 +68,39 @@ snapshots by design. PyIceberg 0.11.x cannot write v3 table metadata, so
 catalog table creation is measured at format versions 1 and 2 while schema
 conversion is measured at all three.
 
-The Avro suite covers schema parsing, cold and cached record schema
+The Avro suite measures the Rust core, the `rkp-avro` crate, through the
+`rkp._avro` extension module. Every case crosses the Python boundary into that
+crate, so a timing covers both the format work in Rust and the conversion of
+Python values on the way in and out — there is no pure-Python Avro path left to
+compare against. The suite covers schema parsing, cold and cached record schema
 construction, canonical form, Rabin fingerprints, compiled binary encoding and
 decoding, the Avro JSON encoding, container files with the `null` and `deflate`
 codecs, and the record round trip. RKP's JSON codec runs on the same rows as a
-text-encoding reference point.
+text-encoding reference point. The header line reports the core's version from
+`rkp.avro.core_version()` next to the Python and RKP versions.
+
+Five cases measure what the random-access container exists for. They share one
+fixture written at `RANDOM_SYNC_INTERVAL` — 8 KiB blocks rather than the 64 KiB
+bulk-write default — because indexed reads are what small blocks buy:
+
+- `container_open_index` opens the image and builds the block index behind
+  `len(container)`;
+- `container_read_one_cold` opens the image and decodes one record by index,
+  paying the index build and one block decode;
+- `container_read_one_warm` decodes one record from a container whose blocks
+  are already in the core's payload cache;
+- `container_write_one` reopens the image as `r+`, replaces one record by
+  index, and materializes the image with `into_bytes()`;
+- `container_append_one` reopens the image, appends one record, and
+  materializes the image.
+
+The write and append cases reopen the fixture on every iteration so each one
+starts from the same container state; subtract `container_open_index` to read
+them as the cost of the edit alone. Cold and warm reads walk the same
+deterministic index order, so they compare directly. A cold read costs one whole
+block decode rather than one record decode: warming a block scans every record
+in it to learn where each record starts, and only then decodes the one that was
+asked for.
 
 The Arrow runtime cases compare one-shot and bounded streaming batch creation,
 streaming reader materialization, validated and relaxed record reconstruction,
@@ -121,7 +149,44 @@ The table fixtures are assembled before measurement for both reverse cases.
 The suite measures only the pure schema adapter: it deliberately excludes Glue
 client creation, AWS requests, and Moto emulation.
 
+## The Rust core
+
+Correctness for the Avro format is enforced in Rust, not here. The crate keeps
+its own suite in the workspace at `../rust`; run it before trusting any Avro
+number:
+
+```console
+cd ../rust && cargo test              # the whole workspace
+cd ../rust && cargo test -p rkp-avro  # the core crate and its doctests
+```
+
+The crate has no `cargo bench` target. When the core itself needs profiling
+rather than the binding, add a bench under `../rust/crates/rkp-avro/benches`
+and run it under `--release`; timing Avro decoding in the `dev` profile
+measures the profile rather than the code.
+
+That caveat applies to this suite too. The Avro cases are only meaningful when
+the loaded extension module was compiled with optimizations. A wheel built by
+the `maturin` PEP 517 backend (`uv sync`, `uv build`, `pip install .`) is a
+release build; `maturin develop` without `--release` leaves a `dev`-profile
+core in place, which measures several times slower — on this fixture roughly
+3x on binary encode and decode, 3x to 4x on the indexed container reads and the
+single-record edits, and 1.5x to 2x on bulk container writes, where Python-side
+row conversion dominates. Cases that never enter the core, such as
+`rkp_json_encode_rows`, do not move at all, so a mixed table is easy to
+misread. Check which core is loaded before reporting numbers:
+
+```console
+uv run python -c "import rkp._avro; print(rkp._avro.__file__)"
+ls -l ../rust/target/debug/lib_avro.so ../rust/target/release/lib_avro.so
+```
+
+The extension is a copy of one of those two objects, so matching sizes name the
+profile. Rebuild in release with `maturin develop --release` from this
+directory's parent, which reads the manifest path from `pyproject.toml`.
+
 Absolute timings depend on the host, Python, PyArrow, and (for the Iceberg
-suite) PyIceberg versions. Compare results on the same machine and focus on
-ratios and changes across commits. Run correctness tests before interpreting a
-faster result.
+suite) PyIceberg versions, and — for the Avro suite — on the Rust profile and
+toolchain the core was built with. Compare results on the same machine and
+focus on ratios and changes across commits. Run correctness tests, in both
+Python and Rust, before interpreting a faster result.

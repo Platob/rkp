@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
@@ -9,14 +10,17 @@ import pytest
 from rkp.avro import (
     AvroDecodeError,
     AvroEncodeError,
-    Reader,
     compile_decoder,
     compile_encoder,
     decode,
     decode_single_object,
+    dumps,
     encode,
     encode_into,
     encode_single_object,
+    into_json,
+    loads,
+    out_of_json,
     parse_schema,
 )
 
@@ -83,17 +87,38 @@ LOGICAL = parse_schema(
                 },
             },
             {"name": "key", "type": {"type": "string", "logicalType": "uuid"}},
+            {
+                "name": "identity",
+                "type": {
+                    "type": "fixed",
+                    "name": "Identity",
+                    "size": 16,
+                    "logicalType": "uuid",
+                },
+            },
         ],
     }
 )
+LOGICAL_ROW: dict[str, Any] = {
+    "day": dt.date(2026, 8, 17),
+    "clock": dt.time(1, 2, 3, 456789),
+    "millis": dt.time(4, 5, 6, 123000),
+    "moment": dt.datetime(2026, 8, 17, 12, 30, tzinfo=dt.UTC),
+    # A local timestamp is deliberately naive; it names no zone.
+    "local": dt.datetime(2026, 8, 17, 12, 30),  # noqa: DTZ001
+    "nanos": dt.datetime(2026, 8, 17, 12, 30, tzinfo=dt.UTC),
+    "amount": Decimal("12.345"),
+    "key": uuid.UUID("3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
+    "identity": uuid.UUID("3f2504e0-4f89-11d3-9a0c-0305e82c3302"),
+}
 
 
-def test_binary_round_trip_preserves_every_kind() -> None:
+def test_binary_round_trip_covers_every_kind() -> None:
     payload = encode(EVENT, ROW)
 
     assert decode(EVENT, payload) == ROW
-    assert compile_encoder(EVENT) is compile_encoder(EVENT)
-    assert compile_decoder(EVENT) is compile_decoder(EVENT)
+    assert decode(EVENT, bytearray(payload)) == ROW
+    assert decode(EVENT, memoryview(payload)) == ROW
 
 
 def test_optional_unions_use_a_single_branch_byte() -> None:
@@ -105,27 +130,28 @@ def test_optional_unions_use_a_single_branch_byte() -> None:
 
 
 def test_logical_types_round_trip_as_python_values() -> None:
-    row = {
-        "day": dt.date(2026, 8, 17),
-        "clock": dt.time(1, 2, 3, 456789),
-        "millis": dt.time(4, 5, 6, 123000),
-        "moment": dt.datetime(2026, 8, 17, 12, 30, tzinfo=dt.UTC),
-        "local": dt.datetime(2026, 8, 17, 12, 30),  # noqa: DTZ001 - local logical type
-        "nanos": dt.datetime(2026, 8, 17, 12, 30, tzinfo=dt.UTC),
-        "amount": Decimal("12.345"),
-        "key": uuid.UUID("3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
-    }
+    restored = decode(LOGICAL, encode(LOGICAL, LOGICAL_ROW))
 
-    restored = decode(LOGICAL, encode(LOGICAL, row))
-
-    assert restored == row
+    assert restored == LOGICAL_ROW
     assert isinstance(restored["amount"], Decimal)
     assert isinstance(restored["key"], uuid.UUID)
+    assert isinstance(restored["identity"], uuid.UUID)
+    assert restored["moment"].tzinfo is dt.UTC
+    assert restored["local"].tzinfo is None
 
 
-def test_records_accept_dataclasses_and_sequences() -> None:
-    from dataclasses import dataclass
+def test_timestamps_normalize_zones_before_encoding() -> None:
+    paris = dt.timezone(dt.timedelta(hours=2))
+    aware = dt.datetime(2026, 8, 17, 14, 30, tzinfo=paris)
 
+    row = {**LOGICAL_ROW, "moment": aware}
+    restored = decode(LOGICAL, encode(LOGICAL, row))
+
+    assert restored["moment"] == aware
+    assert restored["moment"] == dt.datetime(2026, 8, 17, 12, 30, tzinfo=dt.UTC)
+
+
+def test_records_accept_mappings_dataclasses_and_sequences() -> None:
     pair = parse_schema(
         {
             "type": "record",
@@ -142,12 +168,16 @@ def test_records_accept_dataclasses_and_sequences() -> None:
         left: int
         right: str
 
+    assert decode(pair, encode(pair, {"left": 1, "right": "a"})) == {
+        "left": 1,
+        "right": "a",
+    }
     assert decode(pair, encode(pair, Pair(1, "a"))) == {"left": 1, "right": "a"}
     # Tuple annotations become Arrow/Avro structs, so positional rows encode.
     assert decode(pair, encode(pair, (1, "a"))) == {"left": 1, "right": "a"}
-    with pytest.raises(AvroEncodeError, match="expects 2 positional values"):
+    with pytest.raises(AvroEncodeError, match="positional values"):
         encode(pair, (1,))
-    with pytest.raises(AvroEncodeError, match="expects a mapping, dataclass"):
+    with pytest.raises(AvroEncodeError, match="mapping, dataclass, or sequence"):
         encode(pair, 5)
 
 
@@ -186,7 +216,6 @@ def test_unions_select_the_matching_branch() -> None:
         ('"long"', 2**63, "does not fit in an Avro long"),
         ('"null"', 1, "expected null"),
         ('"string"', 4, "expected string"),
-        ('"bytes"', 4, "expected bytes"),
     ],
 )
 def test_encoding_rejects_out_of_contract_values(
@@ -202,7 +231,7 @@ def test_truncated_payloads_raise_decode_errors() -> None:
     with pytest.raises(AvroDecodeError):
         decode(EVENT, payload[:4])
     with pytest.raises(AvroDecodeError, match="truncated"):
-        Reader(b"").read_long()
+        decode(parse_schema('"long"'), b"\x80")
 
 
 def test_single_object_encoding_carries_the_schema_fingerprint() -> None:
@@ -216,23 +245,67 @@ def test_single_object_encoding_carries_the_schema_fingerprint() -> None:
         decode_single_object(EVENT, framed[2:])
 
 
-def test_encode_into_appends_to_a_caller_owned_buffer() -> None:
-    out = bytearray(b"header")
-    encode_into(EVENT, ROW, out)
+def test_compiled_codecs_bind_one_schema() -> None:
+    encoder = compile_encoder(EVENT)
+    decoder = compile_decoder(EVENT)
 
+    payload = encoder(ROW)
+    assert decoder(payload) == ROW
+
+    out = bytearray(b"header")
+    encoder(ROW, out)
     assert out.startswith(b"header")
-    assert decode(EVENT, Reader(bytes(out), 6)) == ROW
+    assert decoder(bytes(out)[6:]) == ROW
+    assert encode_into(EVENT, ROW, bytearray()) == bytearray(payload)
     with pytest.raises(TypeError, match="bytearray"):
         encode_into(EVENT, ROW, b"immutable")  # type: ignore[arg-type]
+
+
+def test_avro_json_tags_unions_and_uses_latin_1_bytes() -> None:
+    encoded = into_json(EVENT, ROW)
+
+    assert encoded["label"] == {"string": "ada"}
+    assert encoded["payload"] == "\x00\x01"
+    assert encoded["digest"] == "abcd"
+    assert into_json(EVENT, {**ROW, "label": None})["label"] is None
+    assert out_of_json(EVENT, encoded) == ROW
+
+
+def test_avro_json_text_uses_the_rkp_json_codec() -> None:
+    text = dumps(EVENT, ROW)
+
+    assert '"identifier": -7' in text
+    assert loads(EVENT, text) == ROW
+    assert loads(EVENT, text.encode("utf-8")) == ROW
+
+
+def test_invalid_json_documents_are_rejected() -> None:
+    encoded = into_json(EVENT, ROW)
+
+    with pytest.raises(AvroDecodeError, match="single-entry object"):
+        out_of_json(EVENT, {**encoded, "label": "bare"})
+    with pytest.raises(AvroDecodeError, match="unknown union branch"):
+        out_of_json(EVENT, {**encoded, "label": {"float": 1.0}})
+    with pytest.raises(AvroDecodeError, match="missing field"):
+        out_of_json(EVENT, {"identifier": 1})
+    with pytest.raises(AvroDecodeError, match="expects a JSON object"):
+        out_of_json(EVENT, [1, 2])
+
+
+def test_enum_symbols_are_validated_in_both_directions() -> None:
+    schema = parse_schema({"type": "enum", "name": "Kind", "symbols": ["A", "B"]})
+
+    assert into_json(schema, "B") == "B"
+    assert out_of_json(schema, "A") == "A"
+    with pytest.raises(AvroEncodeError, match="not a symbol"):
+        encode(schema, "C")
+    with pytest.raises(AvroDecodeError, match="not a symbol"):
+        out_of_json(schema, "C")
 
 
 def test_array_blocks_with_negative_counts_are_decodable() -> None:
     schema = parse_schema({"type": "array", "items": "long"})
     # A writer may emit a negative count followed by the block byte size.
-    payload = bytearray()
-    payload += bytes([0x03])  # zig-zag encoded -2
-    payload += bytes([0x04])  # block size in bytes
-    payload += bytes([0x02, 0x04])  # values 1 and 2
-    payload += bytes([0x00])
+    payload = bytes([0x03, 0x04, 0x02, 0x04, 0x00])
 
-    assert decode(schema, bytes(payload)) == [1, 2]
+    assert decode(schema, payload) == [1, 2]

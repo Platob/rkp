@@ -1,0 +1,18 @@
+[package]
+name = "rkp-avro-python"
+description = "Python extension module for the rkp Avro core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "_avro"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rkp-avro.workspace = true
+pyo3 = "0.29"
+serde_json = { workspace = true }

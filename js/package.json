@@ -1,0 +1,54 @@
+{
+  "name": "@rkp/avro",
+  "version": "0.0.1",
+  "description": "Apache Avro schemas, binary data, and random-access container files — Node.js bindings for the rkp Rust core",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Platob/rkp.git",
+    "directory": "js"
+  },
+  "homepage": "https://github.com/Platob/rkp",
+  "bugs": {
+    "url": "https://github.com/Platob/rkp/issues"
+  },
+  "keywords": [
+    "avro",
+    "napi-rs",
+    "rust",
+    "serialization"
+  ],
+  "type": "commonjs",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "engines": {
+    "node": ">= 20"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "binding.js",
+    "binding.d.ts",
+    "*.node",
+    "README.md"
+  ],
+  "napi": {
+    "binaryName": "rkp-avro",
+    "packageName": "@rkp/avro",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release --manifest-path ../rust/crates/rkp-avro-node/Cargo.toml --output-dir . --js binding.js --dts binding.d.ts",
+    "build:debug": "napi build --platform --manifest-path ../rust/crates/rkp-avro-node/Cargo.toml --output-dir . --js binding.js --dts binding.d.ts",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.8.6"
+  }
+}

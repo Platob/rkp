@@ -103,7 +103,7 @@ batch uses that projection, reconstruct records with
 ## Avro representation
 
 Iceberg describes its own schemas in Avro, and RKP emits exactly that
-representation through its dependency-free [Avro](avro.md) implementation:
+representation through its built-in [Avro](avro.md) implementation:
 
 ```python
 from rkp import avro_into_iceberg_schema, iceberg_into_avro_schema

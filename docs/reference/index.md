@@ -283,9 +283,13 @@ into_iceberg_sort_order(value, *, schema=None, sort_keys=None, order_id=1)
 
 ## Avro
 
-The `rkp.avro` package needs no optional dependency:
+The `rkp.avro` package needs no optional dependency; it is backed by the Rust
+core through the bundled `rkp._avro` extension module.
+
+Schemas, values, and framing:
 
 ```python
+core_version()
 parse_schema(value, *, namespace=None)
 schema_into_json(schema)
 dumps_schema(schema, *, indent=None)
@@ -306,17 +310,79 @@ dumps(schema, value, **kwargs)
 loads(schema, data, **kwargs)
 into_json(schema, value)
 out_of_json(schema, value)
+```
 
-AvroWriter(schema, *, stream=None, codec="null", metadata=None,
-           sync_marker=None, sync_interval=65536)
-AvroReader(source, *, schema=None)
+Container files:
+
+```python
+Avro(source=None, *, mode="r", schema=None, codec="null", metadata=None,
+     sync_marker=None, sync_interval=DEFAULT_SYNC_INTERVAL,
+     cache_bytes=DEFAULT_CACHE_BYTES)
+Avro.create(schema, destination=None, *, codec="null", metadata=None,
+            sync_marker=None, sync_interval=DEFAULT_SYNC_INTERVAL)
+
+read_container(source, *, schema=None, mode="r",
+               cache_bytes=DEFAULT_CACHE_BYTES)
 write_container(destination, schema, values, *, codec="null", metadata=None,
-                sync_marker=None, sync_interval=65536)
-read_container(source, *, schema=None)
+                sync_marker=None, sync_interval=DEFAULT_SYNC_INTERVAL)
 dump(destination, schema, values, *, codec="null", metadata=None,
      sync_marker=None)
 load(source, *, schema=None)
 ```
+
+One `Avro` reads and writes the same container, addressing records by index:
+
+```python
+len(container), container[index], container[start:stop]
+container[index] = value, container[start:stop] = values
+del container[index], del container[start:stop]
+iter(container)
+
+container.get(index, default=None)
+container.iter_from(start=0, stop=None)
+container.blocks()
+container.block_of(index)
+container.read_block(ordinal)
+container.iter_blocks()
+
+container.append(value)
+container.extend(values)
+container.insert(index, value)
+container.pop(index=-1)
+container.clear()
+container.truncate(index=None)
+container.compact()
+
+container.flush()
+container.save(destination)
+container.into_bytes()
+container.close()
+```
+
+Its properties are `schema`, `writer_schema`, `codec`, `metadata`,
+`sync_marker`, `sync_interval`, `mode`, `path`, `closed`, `writable`,
+`appendable`, `dirty`, and `nbytes`. Modes are `"r"`, `"r+"`, `"a"`, and
+`"w"`; slices must be contiguous.
+
+`AvroBlock(ordinal, offset, data_offset, size, count, first)` is a
+`NamedTuple` with the derived `stop` and `end` properties.
+
+Module constants are `CODECS`, `MODES`, `MAGIC`, `SYNC_SIZE`,
+`DEFAULT_SYNC_INTERVAL`, `RANDOM_SYNC_INTERVAL`, `DEFAULT_CACHE_BYTES`, and
+`PRIMITIVE_NAMES`.
+
+The schema model exposes `AvroSchema` (`type_name`, `name`, `fullname`,
+`logical_type`, `attributes`, `into_json()`, `canonical_form()`,
+`fingerprint()`) with `RecordSchema` (`fields`, `field(name)`, `is_error`),
+`EnumSchema` (`symbols`, `default`), `FixedSchema` (`size`, `logical`,
+`precision`, `scale`), `ArraySchema` (`items`), `MapSchema` (`values`),
+`UnionSchema` (`options`, `is_optional`), `PrimitiveSchema` (`primitive`,
+`logical`, `precision`, `scale`), the `NamedSchema` base (`declared_name`,
+`namespace`, `doc`, `aliases`), and `AvroField(name, type, default, doc,
+order, aliases, attributes)` with `has_default` and `into_json()`.
+
+Failures raise `AvroError` or one of its subclasses `AvroSchemaError`,
+`AvroEncodeError`, and `AvroDecodeError`.
 
 Record and Arrow adapters are exported from `rkp`:
 
@@ -339,7 +405,9 @@ avro_into_records(record_type, source, *, schema=None, safe=True,
 ```
 
 Generated records expose `into_avro_schema(...)`, `into_avro(records, ...)`,
-and `from_avro(source, ...)`.
+and `from_avro(source, ...)`. `rkp.records.avro.avro_into_records()` takes two
+further keywords, `start=0` and `stop=None`, which decode a record range
+without reading the blocks before it.
 
 ## AWS Glue
 
