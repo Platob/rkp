@@ -38,6 +38,37 @@
 //! [`Table::target_file_size`] - one manifest, one manifest list, and one
 //! metadata JSON. Nothing is mutated in place, which is what makes the previous
 //! snapshot still readable afterwards.
+//!
+//! # Concurrent writers
+//!
+//! Commits are optimistic. Before publishing version N+1 a commit re-checks
+//! the current version with the same lookup [`Table::open`] uses; a commit
+//! that finds itself beaten *rebases* when that is safe - it reloads the
+//! winner's document and re-applies its own intent on top, with exponential
+//! jittered backoff between attempts, bounded by
+//! [`IcebergOptions::commit_retries`] - and otherwise reports a
+//! [`CommitConflict`] naming both versions. An append and a metadata-only
+//! change rebase; [`Table::overwrite_where`], [`Table::merge_where`], and
+//! [`Table::compact`] cannot, because they planned against files a concurrent
+//! commit may have replaced and their input readers are already consumed, so
+//! they conflict instead. Readers are never blocked, and a failed commit
+//! leaves no visible change - at worst it orphans data files no snapshot
+//! names.
+//!
+//! **The version check is racy on plain storage.** [`IOBase`] has no
+//! compare-and-swap, so two writers can still observe the same version and
+//! publish the same document number, one silently over the other. Retries
+//! shrink that window; they cannot close it. Serialized writers - a catalog,
+//! a lock, one writer per table - are what closes it.
+//!
+//! # Branches and tags
+//!
+//! [`Table::create_branch`], [`Table::create_tag`], [`Table::remove_ref`],
+//! [`Table::fast_forward`], and [`Table::expire_snapshots`] are thin wrappers
+//! over [`TableMetadata`]'s ref vocabulary, each committed through the same
+//! retrying [`Table::commit_changes`]. Writing *to* a branch other than
+//! `main` remains future work, because a commit's parent is currently always
+//! the table's current snapshot.
 
 use std::collections::HashMap;
 
@@ -50,9 +81,10 @@ use super::manifest::{
     read_manifest_list, write_manifest, write_manifest_list,
 };
 use super::metadata::{FormatVersion, TableMetadata, now_ms, uuid};
+use super::options::IcebergOptions;
 use super::partition::PartitionSpec;
 use super::scan::{Filter, ScanPart, ScanPlan, ScanTask};
-use super::snapshot::Snapshot;
+use super::snapshot::{Snapshot, SnapshotRef};
 use super::value::{compare_single, is_portable, single_value};
 use crate::arrow::BatchReader;
 use crate::field::cast::ArrowCast;
@@ -69,18 +101,6 @@ const DATA_DIR: &str = "data";
 /// The file naming the current metadata version, as `HadoopTables` writes it.
 const VERSION_HINT: &str = "version-hint.text";
 
-/// The property naming the size a data file aims for, in bytes.
-///
-/// The table property carries this name exactly; the schema-root fallback is
-/// the same name under the `iceberg:` protocol prefix.
-const TARGET_FILE_SIZE_KEY: &str = "write.target-file-size-bytes";
-
-/// The size a data file aims for when nothing configures one.
-///
-/// This is Iceberg's own documented default for
-/// `write.target-file-size-bytes`: 512 MiB.
-const DEFAULT_TARGET_FILE_SIZE: u64 = 512 * 1024 * 1024;
-
 /// An Iceberg table reached entirely through one container handle.
 ///
 /// The handle is whatever [`IOBase`] implementation addresses the table's
@@ -94,6 +114,8 @@ pub struct Table<H: IOBase> {
     metadata: TableMetadata,
     /// The version number of the metadata document that was last written.
     version: u32,
+    /// An explicit options override the resolvers consult before properties.
+    options: Option<IcebergOptions>,
 }
 
 impl<H: IOBase> Table<H> {
@@ -123,6 +145,7 @@ impl<H: IOBase> Table<H> {
             root,
             metadata,
             version: 0,
+            options: None,
         };
         table.commit_metadata()?;
         Ok(table)
@@ -145,6 +168,7 @@ impl<H: IOBase> Table<H> {
                 root,
                 metadata: TableMetadata::from_json(&document)?,
                 version,
+                options: None,
             }),
             None => Err(missing_metadata(&metadata_dir)),
         }
@@ -172,6 +196,7 @@ impl<H: IOBase> Table<H> {
             root,
             metadata: TableMetadata::from_json(&document)?,
             version,
+            options: None,
         }))
     }
 
@@ -242,10 +267,11 @@ impl<H: IOBase> Table<H> {
 
     /// Return the size a data file aims for, in bytes.
     ///
-    /// The table property `write.target-file-size-bytes` decides. A table that
-    /// does not set it falls back to the schema root's
-    /// `iceberg:write.target-file-size-bytes` protocol property, and a table
-    /// that sets neither uses Iceberg's own default of 512 MiB.
+    /// The one resolver is [`IcebergOptions`]: an explicit option stored with
+    /// [`Self::set_options`] wins, then the table property
+    /// [`IcebergOptions::TARGET_FILE_SIZE_KEY`], then the schema root's
+    /// `iceberg:write.target-file-size-bytes` protocol property, then
+    /// Iceberg's own default of 512 MiB.
     ///
     /// What a write measures against this target is the Arrow in-memory size
     /// of the accumulated batches ([`RecordBatch::get_array_memory_size`]),
@@ -258,14 +284,32 @@ impl<H: IOBase> Table<H> {
     /// is present but does not spell a positive byte count; a configured
     /// target is never silently replaced by the default.
     pub fn target_file_size(&self) -> Result<u64> {
-        if let Some(text) = self.metadata.property(TARGET_FILE_SIZE_KEY) {
-            return parsed_target(SmolStr::new_static(TARGET_FILE_SIZE_KEY), text);
-        }
-        let root = self.schema()?.iceberg();
-        match root.get(TARGET_FILE_SIZE_KEY) {
-            Some(text) => parsed_target(SmolStr::new(root.key(TARGET_FILE_SIZE_KEY)), text),
-            None => Ok(DEFAULT_TARGET_FILE_SIZE),
-        }
+        IcebergOptions::target_size(self.options.as_ref(), &self.metadata)
+    }
+
+    /// Store an explicit options override the resolvers consult first.
+    ///
+    /// A field the override sets shadows the table property of the same name -
+    /// even one that does not parse, which is what lets a caller repair it -
+    /// and a field it leaves unset still resolves property-then-default. The
+    /// override lives on this handle alone; it is never written to the table.
+    pub fn set_options(&mut self, options: IcebergOptions) {
+        self.options = Some(options);
+    }
+
+    /// Resolve this table's effective options, field by field.
+    ///
+    /// Each field takes the nearest of three layers: the explicit override
+    /// stored with [`Self::set_options`], then the table property of the same
+    /// name (falling back to the schema root's `iceberg:` spelling), and the
+    /// getters answer the documented default for whatever remains unset.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error naming the key and the value when a property no
+    /// explicit option shadows is present but does not parse.
+    pub fn options(&self) -> Result<IcebergOptions> {
+        IcebergOptions::resolved(self.options.as_ref(), &self.metadata)
     }
 
     /// Return every manifest the current snapshot points at.
@@ -471,6 +515,15 @@ impl<H: IOBase> Table<H> {
     /// the table's in-memory state exactly as it was: a failed commit is a
     /// commit that never happened.
     ///
+    /// A commit that finds another writer already published the version it
+    /// meant to write *rebases*: it reloads the winner's document and runs
+    /// `change` again on it - which is why the closure is `FnMut` - retrying
+    /// with jittered exponential backoff up to
+    /// [`IcebergOptions::commit_retries`] times, and reporting a
+    /// [`CommitConflict`] when the retries run out. The check is best-effort
+    /// on plain storage - [`IOBase`] has no compare-and-swap, so retries
+    /// shrink the undetected-race window without closing it.
+    ///
     /// ```no_run
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let folder = yggdryl::local::Folder::new(std::env::temp_dir().join("t"))?;
@@ -485,27 +538,96 @@ impl<H: IOBase> Table<H> {
     ///
     /// # Errors
     ///
-    /// Returns the change's own failure, or the write failure of the new
-    /// document.
+    /// Returns the change's own failure, the write failure of the new
+    /// document, or a [`CommitConflict`] when concurrent writers exhausted the
+    /// retries.
     pub fn commit_changes(
         &mut self,
-        change: impl FnOnce(&mut TableMetadata) -> Result<()>,
+        mut change: impl FnMut(&mut TableMetadata) -> Result<()>,
     ) -> Result<()> {
-        // The change runs on a copy, so a rejected change costs nothing.
-        let mut updated = self.metadata.clone();
-        change(&mut updated)?;
-        updated.last_updated_ms = now_ms();
+        self.commit_document(OnConflict::Rebase, move |table| {
+            // The change runs on a copy, so a rejected change costs nothing.
+            let mut updated = table.metadata.clone();
+            change(&mut updated)?;
+            updated.last_updated_ms = now_ms();
+            Ok(updated)
+        })
+    }
 
-        let previous = std::mem::replace(&mut self.metadata, updated);
-        let previous_version = self.version;
-        if let Err(error) = self.commit_metadata() {
-            // A failed write must leave the handle describing the table that
-            // is actually there, which is still the previous version.
-            self.metadata = previous;
-            self.version = previous_version;
-            return Err(error);
+    /// Write one prepared document as the next version, retrying when beaten.
+    ///
+    /// This is the one gate every commit goes through. Each attempt re-checks
+    /// the current version with [`find_metadata`]; a newer version than this
+    /// handle's counts as being beaten once. What happens next is
+    /// `on_conflict`'s: [`OnConflict::Rebase`] adopts the winner's document so
+    /// `apply` re-runs on it, while [`OnConflict::Fail`] only waits and looks
+    /// again, because version numbers never move backwards and the caller said
+    /// re-applying is unsafe - its attempts exist to bound the wait and to
+    /// count an honest report. Being beaten more than
+    /// [`IcebergOptions::commit_retries`] times restores the in-memory state
+    /// and returns a [`CommitConflict`].
+    ///
+    /// The check-then-write pair is not atomic - [`IOBase`] has no
+    /// compare-and-swap - so a writer landing between the two still goes
+    /// undetected; the module docs say so plainly.
+    fn commit_document(
+        &mut self,
+        on_conflict: OnConflict,
+        mut apply: impl FnMut(&Self) -> Result<TableMetadata>,
+    ) -> Result<()> {
+        let settings = IcebergOptions::commit_settings(self.options.as_ref(), &self.metadata)?;
+        let saved_metadata = self.metadata.clone();
+        let saved_version = self.version;
+        let restore = |table: &mut Self, error: Error| {
+            table.metadata = saved_metadata.clone();
+            table.version = saved_version;
+            Err(error)
+        };
+
+        let metadata_dir = self.root.child_by(METADATA_DIR)?;
+        let mut beaten: u32 = 0;
+        loop {
+            match find_metadata(&metadata_dir) {
+                Ok(Some((version, document))) if version > self.version => {
+                    beaten += 1;
+                    if beaten > settings.retries {
+                        let conflict = CommitConflict {
+                            expected_version: saved_version + 1,
+                            beaten,
+                            last_seen_version: version,
+                        };
+                        return restore(self, conflict.into());
+                    }
+                    if on_conflict == OnConflict::Rebase {
+                        match TableMetadata::from_json(&document) {
+                            Ok(fresh) => {
+                                self.metadata = fresh;
+                                self.version = version;
+                            }
+                            Err(error) => return restore(self, error),
+                        }
+                    }
+                    let wait =
+                        backoff_ms(beaten - 1, settings.min_backoff_ms, settings.max_backoff_ms);
+                    if wait > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(wait));
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => return restore(self, error),
+            }
+
+            let updated = match apply(self) {
+                Ok(updated) => updated,
+                Err(error) => return restore(self, error),
+            };
+            self.metadata = updated;
+            if let Err(error) = self.commit_metadata() {
+                return restore(self, error);
+            }
+            return Ok(());
         }
-        Ok(())
     }
 
     /// Render when each snapshot became current, oldest first.
@@ -607,6 +729,7 @@ impl<H: IOBase> Table<H> {
             let handle = self.child_at(&task.entry.data_file.file_path)?;
             parts.push(ScanPart {
                 handle,
+                size: task.entry.data_file.file_size_in_bytes,
                 partition: super::scan::partition_columns(
                     &task.spec,
                     stored,
@@ -615,15 +738,25 @@ impl<H: IOBase> Table<H> {
                 residual: task.residual,
             });
         }
-        super::scan::reader(parts, root, read_root, field.cloned(), filters)
+        let parallel = IcebergOptions::read_settings(self.options.as_ref(), &self.metadata)?;
+        super::scan::reader(parts, root, read_root, field.cloned(), filters, &parallel)
     }
 
     /// Append `batches` as a new snapshot, keeping everything already stored.
     ///
+    /// An append beaten by a concurrent commit *rebases*: the data files are
+    /// already written, so only the manifest list and the document are rebuilt
+    /// on the winner's metadata - fresh parent, fresh sequence number - with
+    /// backoff between attempts, up to [`IcebergOptions::commit_retries`]
+    /// times. The version check is best-effort on plain storage: [`IOBase`]
+    /// has no compare-and-swap, so retries shrink the undetected-race window
+    /// without closing it, and serialized writers are what closes it.
+    ///
     /// # Errors
     ///
     /// Returns an error when the partition spec cannot place a row, when a
-    /// batch cannot be cast to the table schema, or when any write fails.
+    /// batch cannot be cast to the table schema, when any write fails, or a
+    /// [`CommitConflict`] when concurrent writers exhausted the retries.
     pub fn append(&mut self, batches: BatchReader) -> Result<()> {
         self.commit(batches, "append", Retained::All)?;
         Ok(())
@@ -650,11 +783,19 @@ impl<H: IOBase> Table<H> {
     /// partition. A manifest the summaries excluded outright is not even
     /// rewritten: it stays in the manifest list as it was.
     ///
+    /// An overwrite beaten by a concurrent commit cannot rebase: what it keeps
+    /// was planned against a snapshot the winner may have replaced, and the
+    /// incoming reader is already consumed, so re-planning could lose the
+    /// winner's rows or double this write's. It reports a [`CommitConflict`]
+    /// naming both versions instead, after the bounded waits of
+    /// [`IcebergOptions::commit_retries`]; the caller re-reads and retries
+    /// with fresh input.
+    ///
     /// # Errors
     ///
     /// Returns an error when a filter names a column the schema does not
-    /// declare, when the partition spec cannot place a row, or when any read or
-    /// write fails.
+    /// declare, when the partition spec cannot place a row, when any read or
+    /// write fails, or a [`CommitConflict`] when a concurrent commit won.
     pub fn overwrite_where(
         &mut self,
         filters: &[(&str, &str)],
@@ -691,10 +832,15 @@ impl<H: IOBase> Table<H> {
     /// rather than the whole table, and it stays correct however coarse the
     /// statistics are, because a file that is not read keeps every row it had.
     ///
+    /// Like [`Self::overwrite_where`], a merge beaten by a concurrent commit
+    /// reports a [`CommitConflict`] rather than rebasing, because the files it
+    /// selected and the reader it consumed cannot be re-planned safely.
+    ///
     /// # Errors
     ///
     /// Returns an error when `merge_by` names a column the schema does not
-    /// declare, and the failure of any read, join, or write otherwise.
+    /// declare, and the failure of any read, join, or write otherwise,
+    /// including a [`CommitConflict`] when a concurrent commit won.
     pub fn merge_where(
         &mut self,
         filters: &[(&str, &str)],
@@ -846,11 +992,137 @@ impl<H: IOBase> Table<H> {
     /// Returns an error when the schema is not a non-null struct root or the
     /// metadata document cannot be written.
     pub fn evolve_schema(&mut self, schema: Field) -> Result<i32> {
-        let schema_id = self.metadata.add_schema(schema)?;
-        self.metadata.current_schema_id = schema_id;
-        self.metadata.last_updated_ms = now_ms();
-        self.commit_metadata()?;
+        // Committing through the one retrying gate means a beaten evolution
+        // renumbers itself against the winner's `last-column-id`.
+        let mut schema_id = 0;
+        self.commit_changes(|metadata| {
+            schema_id = metadata.add_schema(schema.clone())?;
+            metadata.current_schema_id = schema_id;
+            Ok(())
+        })?;
         Ok(schema_id)
+    }
+
+    /// Create a branch at one retained snapshot, as one metadata commit.
+    ///
+    /// This is [`TableMetadata::create_branch`] committed through the
+    /// retrying [`Self::commit_changes`]. Writing *to* a branch other than
+    /// `main` remains future work - a commit's parent is currently always the
+    /// current snapshot - so a branch is read with [`Self::scan_ref`] and
+    /// moved with [`Self::fast_forward`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is taken or reserved, when the snapshot
+    /// is not retained, or when the commit fails.
+    pub fn create_branch(&mut self, name: &str, snapshot_id: i64) -> Result<()> {
+        self.commit_changes(|metadata| metadata.create_branch(SmolStr::new(name), snapshot_id))
+    }
+
+    /// Create a tag at one retained snapshot, as one metadata commit.
+    ///
+    /// This is [`TableMetadata::create_tag`] committed through the retrying
+    /// [`Self::commit_changes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is taken or reserved, when the snapshot
+    /// is not retained, or when the commit fails.
+    pub fn create_tag(&mut self, name: &str, snapshot_id: i64) -> Result<()> {
+        self.commit_changes(|metadata| metadata.create_tag(SmolStr::new(name), snapshot_id))
+    }
+
+    /// Remove one branch or tag, as one metadata commit.
+    ///
+    /// Returns the reference that was removed. This is
+    /// [`TableMetadata::remove_snapshot_ref`] committed through the retrying
+    /// [`Self::commit_changes`]; a name the table does not have is an error
+    /// rather than an empty commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the refs the table does have when `name` is
+    /// not one of them, or when the commit fails.
+    pub fn remove_ref(&mut self, name: &str) -> Result<SnapshotRef> {
+        let mut removed = None;
+        self.commit_changes(|metadata| match metadata.remove_snapshot_ref(name) {
+            Some(reference) => {
+                removed = Some(reference);
+                Ok(())
+            }
+            None => {
+                let known: Vec<&str> = metadata
+                    .refs
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                Err(invalid(format_smolstr!(
+                    "expected a branch or tag this table has, got {name:?}; it has [{}]",
+                    known.join(", ")
+                )))
+            }
+        })?;
+        removed.ok_or_else(|| {
+            invalid(SmolStr::new_static(
+                "expected the committed removal to record the ref, got none",
+            ))
+        })
+    }
+
+    /// Move a branch forward to a descendant snapshot, as one metadata commit.
+    ///
+    /// This is [`TableMetadata::fast_forward_branch`] committed through the
+    /// retrying [`Self::commit_changes`]: the target must be retained and must
+    /// reach the branch's head by walking parent ids, so a fast-forward can
+    /// never lose history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is not a branch, the target is not
+    /// retained or not a descendant, or the commit fails.
+    pub fn fast_forward(&mut self, name: &str, snapshot_id: i64) -> Result<()> {
+        self.commit_changes(|metadata| metadata.fast_forward_branch(name, snapshot_id))
+    }
+
+    /// Expire the snapshots retention no longer keeps, as one metadata commit.
+    ///
+    /// `older_than_ms` is the default age cutoff
+    /// [`TableMetadata::expire_snapshots_older_than`] applies; every ref's own
+    /// retention fields are honored first. Returns the expired snapshot ids,
+    /// sorted. A table with nothing old commits nothing - the check runs on a
+    /// copy first, so an empty expiry costs no version.
+    ///
+    /// # Errors
+    ///
+    /// Returns the expiry's own failure, or the commit failure.
+    pub fn expire_snapshots(&mut self, older_than_ms: i64) -> Result<Vec<i64>> {
+        let mut probe = self.metadata.clone();
+        if probe.expire_snapshots_older_than(older_than_ms)?.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut expired = Vec::new();
+        self.commit_changes(|metadata| {
+            expired = metadata.expire_snapshots_older_than(older_than_ms)?;
+            Ok(())
+        })?;
+        Ok(expired)
+    }
+
+    /// Read the rows a branch or tag names: [`Self::snapshot_by_ref`] plus
+    /// [`Self::scan_at`], with the same `filters` and `field` meanings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the refs the table does have when `name` is
+    /// not one of them, and any [`Self::scan_at`] failure otherwise.
+    pub fn scan_ref(
+        &self,
+        name: &str,
+        filters: &[(&str, &str)],
+        field: Option<&Field>,
+    ) -> Result<BatchReader> {
+        let snapshot_id = self.snapshot_by_ref(name)?.snapshot_id;
+        self.scan_at(snapshot_id, filters, field)
     }
 
     /// Resolve one recorded location into a child of the table's folder.
@@ -898,6 +1170,14 @@ impl<H: IOBase> Table<H> {
     /// Returns how many data files the commit wrote. Each partition group's
     /// rows are rolled into files of roughly [`Self::target_file_size`] bytes,
     /// and one running index numbers every file of the commit.
+    ///
+    /// The expensive half - decoding the consumed reader into data files and
+    /// their one manifest - happens exactly once. Only the manifest list and
+    /// the document are rebuilt per retry attempt, because they are what carry
+    /// the parent snapshot and the sequence number a rebase changes. A commit
+    /// keeping [`Retained::All`] rebases; one keeping [`Retained::Only`]
+    /// conflicts instead, because what it keeps was planned against a snapshot
+    /// a concurrent commit may have replaced.
     fn commit(
         &mut self,
         batches: BatchReader,
@@ -910,7 +1190,6 @@ impl<H: IOBase> Table<H> {
         let target = self.target_file_size()?;
 
         let snapshot_id = snapshot_id();
-        let sequence_number = self.metadata.last_sequence_number + 1;
         let partition = spec.partition_field(&schema)?;
         let sources = spec.source_names(&schema)?;
 
@@ -933,21 +1212,13 @@ impl<H: IOBase> Table<H> {
         let added_size: i64 = written.iter().map(|file| file.file_size_in_bytes).sum();
         let added_files = i32::try_from(written.len()).unwrap_or(i32::MAX);
 
-        let mut manifests = match retained {
-            Retained::All => self.manifests()?,
-            Retained::Only { manifests, entries } => {
-                let mut kept = manifests;
-                kept.extend(self.carried_manifests(
-                    &entries,
-                    &schema,
-                    snapshot_id,
-                    sequence_number,
-                )?);
-                kept
-            }
-        };
-
-        if !written.is_empty() {
+        // The new manifest holds only `added` entries, whose snapshot and
+        // sequence numbers are inherited from the manifest list row, so its
+        // bytes are attempt-invariant and it is written once; the row's
+        // numbers are filled in per attempt below.
+        let new_manifest = if written.is_empty() {
+            None
+        } else {
             let entries: Vec<ManifestEntry> = written
                 .into_iter()
                 .map(|file| ManifestEntry::added(snapshot_id, file))
@@ -958,75 +1229,114 @@ impl<H: IOBase> Table<H> {
                 &spec,
                 &entries,
                 snapshot_id,
-                sequence_number,
+                self.metadata.last_sequence_number + 1,
             )?;
             manifest.added_files_count = added_files;
             manifest.added_rows_count = added_records;
-            manifests.push(manifest);
-        }
-
-        let list_name = format!("snap-{snapshot_id}-1-{}.avro", uuid());
-        let mut list = self.root.child_by(&format!("{METADATA_DIR}/{list_name}"))?;
-        write_manifest_list(
-            &mut list,
-            self.metadata.format_version,
-            snapshot_id,
-            self.metadata.current_snapshot_id,
-            sequence_number,
-            &manifests,
-        )?;
-
-        let total_records: i64 = manifests
-            .iter()
-            .map(|manifest| manifest.added_rows_count + manifest.existing_rows_count)
-            .sum();
-        let total_files: i32 = manifests
-            .iter()
-            .map(|manifest| manifest.added_files_count + manifest.existing_files_count)
-            .sum();
-
-        let snapshot = Snapshot {
-            snapshot_id,
-            parent_snapshot_id: self.metadata.current_snapshot_id,
-            sequence_number: (self.metadata.format_version >= FormatVersion::V2)
-                .then_some(sequence_number),
-            timestamp_ms: now_ms(),
-            manifest_list: SmolStr::new(self.location_of(METADATA_DIR, &list_name)),
-            summary: vec![
-                (SmolStr::new_static("operation"), SmolStr::new(operation)),
-                (
-                    SmolStr::new_static("added-data-files"),
-                    format_smolstr!("{added_files}"),
-                ),
-                (
-                    SmolStr::new_static("added-records"),
-                    format_smolstr!("{added_records}"),
-                ),
-                (
-                    SmolStr::new_static("added-files-size"),
-                    format_smolstr!("{added_size}"),
-                ),
-                (
-                    SmolStr::new_static("total-data-files"),
-                    format_smolstr!("{total_files}"),
-                ),
-                (
-                    SmolStr::new_static("total-records"),
-                    format_smolstr!("{total_records}"),
-                ),
-            ],
-            schema_id: Some(self.metadata.current_schema_id),
-            first_row_id: (self.metadata.format_version >= FormatVersion::V3)
-                .then(|| self.metadata.next_row_id.unwrap_or_default()),
-            added_rows: (self.metadata.format_version >= FormatVersion::V3)
-                .then_some(added_records),
+            Some(manifest)
         };
-        if self.metadata.format_version >= FormatVersion::V3 {
-            self.metadata.next_row_id =
-                Some(self.metadata.next_row_id.unwrap_or_default() + added_records);
-        }
-        self.metadata.set_current_snapshot(snapshot);
-        self.commit_metadata()?;
+
+        // What the commit keeps. `All` re-reads the live manifests per
+        // attempt, because a rebase changes what "all" means; `Only` was
+        // planned against this exact snapshot, so a conflict is final.
+        let (on_conflict, kept) = match retained {
+            Retained::All => (OnConflict::Rebase, None),
+            Retained::Only { manifests, entries } => {
+                let mut kept = manifests;
+                kept.extend(self.carried_manifests(
+                    &entries,
+                    &schema,
+                    snapshot_id,
+                    self.metadata.last_sequence_number + 1,
+                )?);
+                (OnConflict::Fail, Some(kept))
+            }
+        };
+
+        let operation = SmolStr::new(operation);
+        self.commit_document(on_conflict, move |table| {
+            let sequence_number = table.metadata.last_sequence_number + 1;
+            let mut manifests = match &kept {
+                Some(kept) => kept.clone(),
+                None => table.manifests()?,
+            };
+            if let Some(manifest) = &new_manifest {
+                let mut row = manifest.clone();
+                row.sequence_number = sequence_number;
+                // Every entry in it is `added`, so the floor is this commit's.
+                row.min_sequence_number = sequence_number;
+                manifests.push(row);
+            }
+
+            let list_name = format!("snap-{snapshot_id}-1-{}.avro", uuid());
+            let mut list = table
+                .root
+                .child_by(&format!("{METADATA_DIR}/{list_name}"))?;
+            write_manifest_list(
+                &mut list,
+                table.metadata.format_version,
+                snapshot_id,
+                table.metadata.current_snapshot_id,
+                sequence_number,
+                &manifests,
+            )?;
+
+            let total_records: i64 = manifests
+                .iter()
+                .map(|manifest| manifest.added_rows_count + manifest.existing_rows_count)
+                .sum();
+            let total_files: i32 = manifests
+                .iter()
+                .map(|manifest| manifest.added_files_count + manifest.existing_files_count)
+                .sum();
+
+            let snapshot = Snapshot {
+                snapshot_id,
+                parent_snapshot_id: table.metadata.current_snapshot_id,
+                sequence_number: (table.metadata.format_version >= FormatVersion::V2)
+                    .then_some(sequence_number),
+                timestamp_ms: now_ms(),
+                manifest_list: SmolStr::new(table.location_of(METADATA_DIR, &list_name)),
+                summary: vec![
+                    (
+                        SmolStr::new_static("operation"),
+                        SmolStr::new(operation.clone()),
+                    ),
+                    (
+                        SmolStr::new_static("added-data-files"),
+                        format_smolstr!("{added_files}"),
+                    ),
+                    (
+                        SmolStr::new_static("added-records"),
+                        format_smolstr!("{added_records}"),
+                    ),
+                    (
+                        SmolStr::new_static("added-files-size"),
+                        format_smolstr!("{added_size}"),
+                    ),
+                    (
+                        SmolStr::new_static("total-data-files"),
+                        format_smolstr!("{total_files}"),
+                    ),
+                    (
+                        SmolStr::new_static("total-records"),
+                        format_smolstr!("{total_records}"),
+                    ),
+                ],
+                schema_id: Some(table.metadata.current_schema_id),
+                first_row_id: (table.metadata.format_version >= FormatVersion::V3)
+                    .then(|| table.metadata.next_row_id.unwrap_or_default()),
+                added_rows: (table.metadata.format_version >= FormatVersion::V3)
+                    .then_some(added_records),
+            };
+
+            let mut updated = table.metadata.clone();
+            if updated.format_version >= FormatVersion::V3 {
+                updated.next_row_id = Some(updated.next_row_id.unwrap_or_default() + added_records);
+            }
+            updated.set_current_snapshot(snapshot);
+            Ok(updated)
+        })?;
         Ok(files_written)
     }
 
@@ -1191,15 +1501,72 @@ pub struct Compaction {
     pub bytes_rewritten: i64,
 }
 
-/// Parse one configured target file size, or say why the value is not one.
-fn parsed_target(key: SmolStr, text: &str) -> Result<u64> {
-    match text.parse::<u64>() {
-        Ok(bytes) if bytes > 0 => Ok(bytes),
-        _ => Err(Error::InvalidMetadataValue {
-            key,
-            reason: format_smolstr!("expected a positive byte count, got {text:?}"),
-        }),
+/// What a beaten commit may do about the writer that got there first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OnConflict {
+    /// Reload the winner's document and re-apply this commit on top of it.
+    Rebase,
+    /// Only wait and look again; re-applying was declared unsafe, so an
+    /// advanced version can end in nothing but a [`CommitConflict`].
+    Fail,
+}
+
+/// A commit that lost the race to concurrent writers and ran out of retries.
+///
+/// The crate's error enum is closed, so this crosses the [`Result`] boundary
+/// as the module's `iceberg` codec error carrying exactly this value's
+/// [`Display`](std::fmt::Display) - which names both versions, so a caller
+/// can see how far the table moved while this writer was being beaten.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommitConflict {
+    /// The document version this writer expected to publish.
+    pub expected_version: u32,
+    /// How many observations found another writer's version instead.
+    pub beaten: u32,
+    /// The newest version observed before giving up.
+    pub last_seen_version: u32,
+}
+
+impl std::fmt::Display for CommitConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "expected to commit version {}, got beaten {} times; last saw version {}",
+            self.expected_version, self.beaten, self.last_seen_version
+        )
     }
+}
+
+impl std::error::Error for CommitConflict {}
+
+impl From<CommitConflict> for Error {
+    fn from(value: CommitConflict) -> Self {
+        invalid(format_smolstr!("{value}"))
+    }
+}
+
+/// The wait before one retry attempt, exponential with full jitter.
+///
+/// The window doubles from `min` per attempt and is capped at `max` - a floor
+/// configured above the ceiling waits the ceiling - and the wait is drawn
+/// uniformly from floor..=window with the same per-process hashing randomness
+/// [`snapshot_id`] uses, so beaten writers spread out rather than colliding
+/// again in step.
+fn backoff_ms(attempt: u32, min: u64, max: u64) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+
+    let floor = min.min(max);
+    let window = floor
+        .saturating_mul(1_u64.checked_shl(attempt).unwrap_or(u64::MAX))
+        .clamp(floor, max);
+    if window <= floor {
+        return floor;
+    }
+    let state = std::collections::hash_map::RandomState::new();
+    let mut hasher = state.build_hasher();
+    hasher.write_i64(now_ms());
+    hasher.write_u32(attempt);
+    floor + hasher.finish() % (window - floor + 1)
 }
 
 /// Split one partition group's batches into files of roughly `target` bytes.

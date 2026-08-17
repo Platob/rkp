@@ -2272,3 +2272,448 @@ fn a_wide_schema_round_trips_with_every_field_numbered() {
 
     let _ = std::fs::remove_dir_all(&path);
 }
+
+/// Collect every row of a scan as `(id, symbol, venue)` triples, in arrival
+/// order.
+///
+/// [`collect`] sorts, which is right for tests that only care what a table
+/// holds; the parallel-read tests care that two paths yield the same rows in
+/// the same order, so this one never reorders.
+fn ordered(reader: crate::arrow::BatchReader) -> Vec<(i64, Option<String>, Option<String>)> {
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone();
+        let symbols = batch
+            .column_by_name("symbol")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        let venues = batch
+            .column_by_name("venue")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row),
+                (!symbols.is_null(row)).then(|| symbols.value(row).to_owned()),
+                (!venues.is_null(row)).then(|| venues.value(row).to_owned()),
+            ));
+        }
+    }
+    rows
+}
+
+#[test]
+fn options_resolve_explicitly_then_by_property_then_by_default() {
+    use super::IcebergOptions;
+
+    let path = root("options-layers");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+
+    // Nothing configured: every field answers its documented default.
+    let options = table.options().unwrap();
+    assert_eq!(options.commit_retries(), 4);
+    assert_eq!(options.commit_min_backoff_ms(), 100);
+    assert_eq!(options.commit_max_backoff_ms(), 60_000);
+    assert_eq!(options.target_file_size_bytes(), 512 * 1024 * 1024);
+    assert!((1..=8).contains(&options.read_parallelism()));
+    assert_eq!(options.read_parallel_min_files(), 16);
+    assert_eq!(options.read_parallel_min_file_size_bytes(), 4 * 1024 * 1024);
+
+    // A table property overrides the default.
+    table
+        .commit_changes(|metadata| {
+            metadata.set_property(IcebergOptions::COMMIT_RETRIES_KEY, "7")?;
+            metadata.set_property(IcebergOptions::READ_PARALLEL_MIN_FILES_KEY, "3")?;
+            Ok(())
+        })
+        .unwrap();
+    let options = table.options().unwrap();
+    assert_eq!(options.commit_retries(), 7);
+    assert_eq!(options.read_parallel_min_files(), 3);
+    assert_eq!(options.commit_min_backoff_ms(), 100, "untouched: default");
+
+    // An explicit option overrides the property; unset fields still read it.
+    table.set_options(IcebergOptions::new().with_commit_retries(2));
+    let options = table.options().unwrap();
+    assert_eq!(options.commit_retries(), 2, "explicit beats property");
+    assert_eq!(
+        options.read_parallel_min_files(),
+        3,
+        "property still speaks"
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn an_unparseable_option_property_is_typed_and_an_explicit_option_shadows_it() {
+    use super::IcebergOptions;
+
+    let path = root("options-unparseable");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    table
+        .commit_changes(|metadata| {
+            metadata.set_property(IcebergOptions::READ_PARALLELISM_KEY, "many")?;
+            Ok(())
+        })
+        .unwrap();
+
+    // The resolution is a typed error naming the key and the value.
+    let error = table.options().unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::Error::InvalidMetadataValue { ref key, .. } if key == "read.parallelism"
+        ),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("read.parallelism"), "{message}");
+    assert!(message.contains("many"), "{message}");
+    assert!(message.contains("expected"), "{message}");
+
+    // A scan consults the same key, so it refuses too rather than guessing.
+    assert!(table.scan(None).is_err());
+
+    // An explicit option shadows the broken property without ever parsing
+    // it, which is what lets a caller repair the table.
+    table.set_options(IcebergOptions::new().try_with_read_parallelism(2).unwrap());
+    assert_eq!(table.options().unwrap().read_parallelism(), 2);
+    assert_eq!(collect(table.scan(None).unwrap()).len(), 0);
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn a_beaten_append_rebases_and_keeps_both_writers_rows() {
+    use super::IcebergOptions;
+
+    let path = root("append-conflict");
+    let mut first = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    let mut second = Table::open(Folder::new(&path).unwrap()).unwrap();
+    second.set_options(
+        IcebergOptions::new()
+            .with_commit_min_backoff_ms(1)
+            .with_commit_max_backoff_ms(2),
+    );
+    assert_eq!(second.version(), 1);
+
+    let winner = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+    first
+        .append(crate::arrow::batch_reader(winner.schema(), [winner]))
+        .unwrap();
+    // The second handle still describes version 1, so its append is beaten
+    // and must rebase onto the winner's commit rather than clobber it.
+    let beaten = trades(&[2], &[Some("MSFT")], &[Some("XNYS")]);
+    second
+        .append(crate::arrow::batch_reader(beaten.schema(), [beaten]))
+        .unwrap();
+    assert_eq!(
+        second.version(),
+        3,
+        "the rebase adopted the winner's version"
+    );
+
+    // Both rows, two snapshots, and the loser's snapshot parents the winner's.
+    let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+    assert_eq!(reopened.version(), 3);
+    let rows = collect(reopened.scan(None).unwrap());
+    assert_eq!(rows.iter().map(|row| row.0).collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(reopened.metadata().snapshots.len(), 2);
+    let current = reopened.current_snapshot().unwrap();
+    let parent = current.parent_snapshot_id.unwrap();
+    let winner_snapshot = reopened.metadata().snapshot_by_id(parent).unwrap();
+    assert_eq!(winner_snapshot.parent_snapshot_id, None);
+    assert!(
+        current.sequence_number.unwrap() > winner_snapshot.sequence_number.unwrap(),
+        "the rebased commit sequences after the winner"
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn concurrent_metadata_commits_rebase_and_both_changes_survive() {
+    use super::IcebergOptions;
+
+    let path = root("changes-conflict");
+    let mut first = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    let mut second = Table::open(Folder::new(&path).unwrap()).unwrap();
+    second.set_options(
+        IcebergOptions::new()
+            .with_commit_min_backoff_ms(1)
+            .with_commit_max_backoff_ms(2),
+    );
+
+    first
+        .commit_changes(|metadata| {
+            metadata.set_property("owner", "alpha")?;
+            Ok(())
+        })
+        .unwrap();
+    // The second commit is beaten, so its closure re-runs on the winner's
+    // document - which is why both properties survive.
+    second
+        .commit_changes(|metadata| {
+            metadata.set_property("team", "beta")?;
+            Ok(())
+        })
+        .unwrap();
+
+    let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+    assert_eq!(reopened.version(), 3);
+    assert_eq!(reopened.metadata().property("owner"), Some("alpha"));
+    assert_eq!(reopened.metadata().property("team"), Some("beta"));
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn a_beaten_overwrite_exhausts_its_retries_into_a_conflict_naming_versions() {
+    use super::IcebergOptions;
+
+    let path = root("overwrite-conflict");
+    let mut first = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    let stored = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+    first
+        .append(crate::arrow::batch_reader(stored.schema(), [stored]))
+        .unwrap();
+
+    // The second handle plans against version 2; the first then commits twice
+    // more, so the overwrite's plan is two commits stale.
+    let mut second = Table::open(Folder::new(&path).unwrap()).unwrap();
+    second.set_options(
+        IcebergOptions::new()
+            .with_commit_retries(1)
+            .with_commit_min_backoff_ms(1)
+            .with_commit_max_backoff_ms(1),
+    );
+    for id in [2_i64, 3] {
+        let batch = trades(&[id], &[Some("NVDA")], &[Some("XNAS")]);
+        first
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+    }
+
+    let incoming = trades(&[9], &[Some("VOD")], &[Some("XLON")]);
+    let error = second
+        .overwrite(crate::arrow::batch_reader(incoming.schema(), [incoming]))
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("expected to commit version 3"),
+        "{message}"
+    );
+    assert!(message.contains("got beaten 2 times"), "{message}");
+    assert!(message.contains("last saw version 4"), "{message}");
+
+    // The failed overwrite restored its handle and left no visible change.
+    assert_eq!(second.version(), 2);
+    let reopened = Table::open(Folder::new(&path).unwrap()).unwrap();
+    assert_eq!(reopened.version(), 4);
+    assert_eq!(
+        collect(reopened.scan(None).unwrap())
+            .iter()
+            .map(|row| row.0)
+            .collect::<Vec<_>>(),
+        [1, 2, 3],
+        "the winner's rows survive and the loser's were never published"
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn a_parallel_read_yields_the_sequential_rows_in_the_sequential_order() {
+    use super::IcebergOptions;
+
+    let path = root("parallel-read");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    // Twenty commits of three rows each: twenty data files, ids 0..60 laid
+    // down in commit order, which is the order a sequential scan yields.
+    for file in 0..20_i64 {
+        let symbol = if file % 2 == 0 { "AAPL" } else { "MSFT" };
+        let batch = trades(
+            &[3 * file, 3 * file + 1, 3 * file + 2],
+            &[Some(symbol); 3],
+            &[Some("XNAS"); 3],
+        );
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+    }
+
+    let sequential = IcebergOptions::new().try_with_read_parallelism(1).unwrap();
+    let parallel = IcebergOptions::new()
+        .try_with_read_parallelism(3)
+        .unwrap()
+        .with_read_parallel_min_files(1)
+        .with_read_parallel_min_file_size_bytes(0);
+
+    table.set_options(sequential);
+    let baseline = ordered(table.scan(None).unwrap());
+    assert_eq!(baseline.len(), 60);
+    assert_eq!(
+        baseline.iter().map(|row| row.0).collect::<Vec<_>>(),
+        (0..60).collect::<Vec<_>>(),
+        "the sequential scan reads the files in plan order"
+    );
+    let filtered_baseline = ordered(table.scan_where(&[("symbol", "AAPL")], None).unwrap());
+    assert_eq!(filtered_baseline.len(), 30);
+
+    // The parallel path must be indistinguishable, row for row and in order.
+    table.set_options(parallel.clone());
+    assert_eq!(ordered(table.scan(None).unwrap()), baseline);
+    assert_eq!(
+        ordered(table.scan_where(&[("symbol", "AAPL")], None).unwrap()),
+        filtered_baseline
+    );
+
+    // Dropping a parallel reader mid-stream neither hangs nor poisons the
+    // table: the detached workers exit at their next send.
+    let mut abandoned = table.scan(None).unwrap();
+    assert!(abandoned.next().is_some());
+    drop(abandoned);
+    assert_eq!(ordered(table.scan(None).unwrap()), baseline);
+
+    // Below the file threshold the sequential single-open path answers,
+    // behaviorally identical.
+    table.set_options(
+        IcebergOptions::new()
+            .try_with_read_parallelism(3)
+            .unwrap()
+            .with_read_parallel_min_files(1_000),
+    );
+    assert_eq!(ordered(table.scan(None).unwrap()), baseline);
+
+    // The default 4 MiB floor also keeps these tiny files sequential: none
+    // of them counts toward justifying threads.
+    table.set_options(
+        IcebergOptions::new()
+            .try_with_read_parallelism(3)
+            .unwrap()
+            .with_read_parallel_min_files(1),
+    );
+    assert_eq!(ordered(table.scan(None).unwrap()), baseline);
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn branches_and_tags_round_trip_through_table_level_commits() {
+    let path = root("table-refs");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    let first = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+    table
+        .append(crate::arrow::batch_reader(first.schema(), [first]))
+        .unwrap();
+    let past = table.current_snapshot().unwrap().snapshot_id;
+
+    table.create_branch("audit", past).unwrap();
+    table.create_tag("v1", past).unwrap();
+    let version = table.version();
+
+    // A taken name is refused and the refusal commits nothing.
+    assert!(table.create_branch("audit", past).is_err());
+    assert_eq!(table.version(), version);
+
+    let second = trades(&[2], &[Some("MSFT")], &[Some("XNYS")]);
+    table
+        .append(crate::arrow::batch_reader(second.schema(), [second]))
+        .unwrap();
+    let head = table.current_snapshot().unwrap().snapshot_id;
+
+    // The branch and the tag still read the past; main reads the present.
+    assert_eq!(
+        collect(table.scan_ref("audit", &[], None).unwrap()).len(),
+        1
+    );
+    assert_eq!(collect(table.scan_ref("v1", &[], None).unwrap()).len(), 1);
+    assert_eq!(collect(table.scan_ref("main", &[], None).unwrap()).len(), 2);
+
+    // Fast-forwarding moves the branch to a descendant; the tag never moves.
+    table.fast_forward("audit", head).unwrap();
+    assert_eq!(
+        collect(table.scan_ref("audit", &[], None).unwrap()).len(),
+        2
+    );
+    assert_eq!(table.snapshot_by_ref("v1").unwrap().snapshot_id, past);
+
+    // Removing the tag returns it; a second removal names what exists.
+    let removed = table.remove_ref("v1").unwrap();
+    assert!(removed.is_tag());
+    assert_eq!(removed.snapshot_id, past);
+    let message = table.remove_ref("v1").unwrap_err().to_string();
+    assert!(message.contains("audit"), "{message}");
+
+    // With nothing anchoring the first snapshot, expiring everything older
+    // than the near future removes exactly it - and the table still reads.
+    let cutoff = table.metadata().last_updated_ms + 10_000;
+    let expired = table.expire_snapshots(cutoff).unwrap();
+    assert_eq!(expired, vec![past]);
+    assert_eq!(table.metadata().snapshots.len(), 1);
+    assert_eq!(collect(table.scan(None).unwrap()).len(), 2);
+    assert!(table.scan_at(past, &[], None).is_err());
+
+    // Nothing left to expire commits nothing: no new version is written.
+    let version = table.version();
+    assert_eq!(table.expire_snapshots(i64::MAX).unwrap(), Vec::<i64>::new());
+    assert_eq!(table.version(), version);
+
+    let _ = std::fs::remove_dir_all(&path);
+}

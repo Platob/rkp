@@ -821,7 +821,7 @@
   pub fn snapshot_by_ref(&self, name: &str) -> Result<&Snapshot>
   pub fn plan_at(&self, snapshot_id: i64, filters: &[(&str, &str)]) -> Result<ScanPlan>
   pub fn scan_at(&self, snapshot_id: i64, filters: &[(&str, &str)], field: Option<&Field>) -> Result<BatchReader>
-  pub fn commit_changes(&mut self, change: impl FnOnce(&mut TableMetadata) -> Result<()>) -> Result<()>
+  pub fn commit_changes(&mut self, change: impl FnMut(&mut TableMetadata) -> Result<()>) -> Result<()>
   pub fn inspect_history(&self) -> Result<BatchReader>
   pub fn inspect_snapshots(&self) -> Result<BatchReader>
   pub fn inspect_files(&self) -> Result<BatchReader>
@@ -908,6 +908,73 @@
   pub fn append(&mut self, batches: BatchReader) -> Result<()>
   pub fn overwrite(&mut self, batches: BatchReader) -> Result<()>
   pub fn evolve_schema(&mut self, schema: Field) -> Result<i32>
+
+### yggdryl::iceberg::snapshot (refs and retention)
+  pub fn tag(snapshot_id: i64) -> Self
+  pub fn is_branch(&self) -> bool
+  pub fn is_tag(&self) -> bool
+  pub fn with_min_snapshots_to_keep(mut self, count: i32) -> Result<Self>
+  pub fn with_max_snapshot_age_ms(mut self, age_ms: i64) -> Result<Self>
+  pub fn with_max_ref_age_ms(mut self, age_ms: i64) -> Result<Self>
+
+### yggdryl::iceberg::metadata (refs and retention)
+  pub fn ref_by_name(&self, name: &str) -> Option<&SnapshotRef>
+  pub fn create_branch(&mut self, name: impl Into<SmolStr>, snapshot_id: i64) -> Result<()>
+  pub fn create_tag(&mut self, name: impl Into<SmolStr>, snapshot_id: i64) -> Result<()>
+  pub fn rename_ref(&mut self, from: &str, to: impl Into<SmolStr>) -> Result<()>
+  pub fn fast_forward_branch(&mut self, name: &str, to_snapshot_id: i64) -> Result<()>
+  pub fn expire_snapshots_older_than(&mut self, older_than_ms: i64) -> Result<Vec<i64>>
+
+### yggdryl::iceberg::options  [rust\src\iceberg\options.rs]
+  pub struct IcebergOptions
+  pub const COMMIT_RETRIES_KEY: &'static str = "commit.retry.num-retries";
+  pub const COMMIT_MIN_BACKOFF_MS_KEY: &'static str = "commit.retry.min-wait-ms";
+  pub const COMMIT_MAX_BACKOFF_MS_KEY: &'static str = "commit.retry.max-wait-ms";
+  pub const TARGET_FILE_SIZE_KEY: &'static str = "write.target-file-size-bytes";
+  pub const READ_PARALLELISM_KEY: &'static str = "read.parallelism";
+  pub const READ_PARALLEL_MIN_FILES_KEY: &'static str = "read.parallel.min-files";
+  pub const READ_PARALLEL_MIN_FILE_SIZE_KEY: &'static str = "read.parallel.min-file-size-bytes";
+  pub const DEFAULT_COMMIT_RETRIES: u32 = 4;
+  pub const DEFAULT_COMMIT_MIN_BACKOFF_MS: u64 = 100;
+  pub const DEFAULT_COMMIT_MAX_BACKOFF_MS: u64 = 60_000;
+  pub const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+  pub const DEFAULT_READ_PARALLEL_MIN_FILES: usize = 16;
+  pub const DEFAULT_READ_PARALLEL_MIN_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
+  pub fn new() -> Self
+  pub fn default_read_parallelism() -> usize
+  pub fn commit_retries(&self) -> u32
+  pub fn commit_min_backoff_ms(&self) -> u64
+  pub fn commit_max_backoff_ms(&self) -> u64
+  pub fn target_file_size_bytes(&self) -> u64
+  pub fn read_parallelism(&self) -> usize
+  pub fn read_parallel_min_files(&self) -> usize
+  pub fn read_parallel_min_file_size_bytes(&self) -> u64
+  pub fn set_commit_retries(&mut self, retries: u32)
+  pub fn with_commit_retries(mut self, retries: u32) -> Self
+  pub fn set_commit_min_backoff_ms(&mut self, wait_ms: u64)
+  pub fn with_commit_min_backoff_ms(mut self, wait_ms: u64) -> Self
+  pub fn set_commit_max_backoff_ms(&mut self, wait_ms: u64)
+  pub fn with_commit_max_backoff_ms(mut self, wait_ms: u64) -> Self
+  pub fn set_target_file_size_bytes(&mut self, bytes: u64) -> Result<()>
+  pub fn try_with_target_file_size_bytes(mut self, bytes: u64) -> Result<Self>
+  pub fn set_read_parallelism(&mut self, threads: usize) -> Result<()>
+  pub fn try_with_read_parallelism(mut self, threads: usize) -> Result<Self>
+  pub fn set_read_parallel_min_files(&mut self, files: usize)
+  pub fn with_read_parallel_min_files(mut self, files: usize) -> Self
+  pub fn set_read_parallel_min_file_size_bytes(&mut self, bytes: u64)
+  pub fn with_read_parallel_min_file_size_bytes(mut self, bytes: u64) -> Self
+  pub fn for_metadata(metadata: &TableMetadata) -> Result<Self>
+
+### yggdryl::iceberg::table (options, refs, concurrency)
+  pub fn set_options(&mut self, options: IcebergOptions)
+  pub fn options(&self) -> Result<IcebergOptions>
+  pub fn create_branch(&mut self, name: &str, snapshot_id: i64) -> Result<()>
+  pub fn create_tag(&mut self, name: &str, snapshot_id: i64) -> Result<()>
+  pub fn remove_ref(&mut self, name: &str) -> Result<SnapshotRef>
+  pub fn fast_forward(&mut self, name: &str, snapshot_id: i64) -> Result<()>
+  pub fn expire_snapshots(&mut self, older_than_ms: i64) -> Result<Vec<i64>>
+  pub fn scan_ref(&self, name: &str, filters: &[(&str, &str)], field: Option<&Field>) -> Result<BatchReader>
+  pub struct CommitConflict { pub expected_version: u32, pub beaten: u32, pub last_seen_version: u32 }
 
 ### yggdryl::iceberg::types  [rust\src\iceberg\types.rs]
   pub enum PrimitiveType

@@ -950,20 +950,25 @@ impl PySchemaUpdate {
         table
             .inner
             .commit_changes(move |metadata| {
+                // Replayed by reference: a beaten commit rebases and runs this
+                // closure again on the winner's metadata, so the recording
+                // must survive every attempt.
                 let mut update = SchemaUpdate::for_metadata(metadata)?;
-                for op in ops {
+                for op in &ops {
                     match op {
                         RecordedOp::AddColumn { parent, field } => {
-                            update.add_column(&parent, field);
+                            update.add_column(parent, field.clone());
                         }
-                        RecordedOp::DropColumn { path } => update.drop_column(&path),
+                        RecordedOp::DropColumn { path } => update.drop_column(path),
                         RecordedOp::RenameColumn { path, name } => {
-                            update.rename_column(&path, name);
+                            update.rename_column(path, name.clone());
                         }
-                        RecordedOp::UpdateDoc { path, doc } => update.update_doc(&path, doc),
-                        RecordedOp::MakeNullable { path } => update.make_nullable(&path),
+                        RecordedOp::UpdateDoc { path, doc } => {
+                            update.update_doc(path, doc.clone());
+                        }
+                        RecordedOp::MakeNullable { path } => update.make_nullable(path),
                         RecordedOp::UpdateType { path, data_type } => {
-                            update.update_type(&path, data_type);
+                            update.update_type(path, data_type.clone());
                         }
                     }
                 }

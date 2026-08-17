@@ -807,8 +807,10 @@ impl JsTable {
         }
         self.inner
             .commit_changes(|metadata| {
-                for (key, value) in updates {
-                    metadata.set_property(key, value)?;
+                // Applied by reference: a beaten commit rebases and runs this
+                // closure again on the winner's metadata.
+                for (key, value) in &updates {
+                    metadata.set_property(key.as_str(), value.as_str())?;
                 }
                 for key in &removes {
                     metadata.remove_property(key);

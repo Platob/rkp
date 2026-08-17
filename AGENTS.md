@@ -357,6 +357,53 @@ that compiles annotations into native values.
   file, reports what it rewrote, and is a no-op that commits nothing when
   there is nothing to do. A present-but-unparseable size is a typed error
   naming key and value, never a silent default.
+- **Every knob is one field of `iceberg::IcebergOptions`, resolved
+  explicit-then-property-then-default.** The keys are Iceberg's own spellings
+  (`commit.retry.num-retries`, `commit.retry.min-wait-ms`,
+  `commit.retry.max-wait-ms`, `write.target-file-size-bytes`,
+  `read.parallelism`, `read.parallel.min-files`,
+  `read.parallel.min-file-size-bytes`); the property layer falls back to the
+  schema root's `iceberg:` protocol spelling exactly as the target size always
+  has, and each field has exactly one resolver function - never a second
+  resolution path. An explicit option set with `Table::set_options` lives on
+  the handle alone, is never written to the table, and shadows its property
+  without parsing it, so a broken stored value can be shadowed first and
+  repaired after; each operation resolves only the keys it consults, so a
+  broken `read.*` property cannot block the metadata-only commit that fixes
+  it. Do not add a knob outside this value.
+- **Every commit goes through one retrying gate, and what a retry may do is
+  the operation's nature.** The gate re-checks the current version, counts
+  each newer version as being beaten once, and backs off with full jitter up
+  to `commit.retry.num-retries` times. `append`, `commit_changes`, and
+  everything routed through them *rebase*: data files and the added-entries
+  manifest are written once and reused, the intent re-applies on the winner's
+  document. `overwrite`, `merge`, and `compact` never rebase - they planned
+  against files the winner may have replaced and their input is consumed - so
+  they wait, re-observe, and exhaust into a `CommitConflict` naming both
+  versions, with in-memory state restored. Say plainly, wherever this
+  surfaces, that `IOBase` has no compare-and-swap: the check is best-effort on
+  plain storage, retries shrink the undetected-race window and cannot close
+  it, and a failed commit leaves at worst orphan data files no snapshot names.
+- **Branches and tags are metadata, with retention per ref.** `SnapshotRef`
+  carries `min-snapshots-to-keep`, `max-snapshot-age-ms`, and
+  `max-ref-age-ms`; `expire_snapshots` honors every ref's own fields before
+  its age cutoff, `main` itself never expires, and a fast-forward must reach
+  the branch head by walking parent ids so it can never lose history. The
+  `Table` conveniences (`create_branch`, `create_tag`, `remove_ref`,
+  `fast_forward`, `expire_snapshots`, `scan_ref`) commit through the retrying
+  gate; writing *to* a non-`main` branch is future work (a commit's parent is
+  always the current snapshot) - name that limit, do not emulate branch
+  writes.
+- **A scan fans out only when the plan earns it, and in plan order always.**
+  Parallel decode starts when `read.parallelism` is at least 2 and at least
+  `read.parallel.min-files` planned files carry recorded sizes of at least
+  `read.parallel.min-file-size-bytes` (defaults 16 files, 4 MiB, parallelism
+  clamped to the host's 1..=8); below the thresholds the sequential
+  single-open path runs. Workers decode and refine whole files, at most
+  `read.parallelism` in flight, and a reorder buffer releases batches
+  strictly in plan order, so parallel and sequential scans are
+  indistinguishable but for speed - never let an optimization change what a
+  caller observes, and never hammer storage beyond the configured width.
 - **An exchange format is validated against an outside implementation.** Round
   tripping through this crate's own reader proves only that the reader and the
   writer agree with each other. `scripts/check_iceberg_interop.py` and the

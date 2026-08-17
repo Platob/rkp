@@ -95,6 +95,7 @@ mod evolve;
 mod inspect;
 mod manifest;
 mod metadata;
+mod options;
 mod partition;
 mod scan;
 mod schema;
@@ -111,11 +112,12 @@ pub use manifest::{
     read_manifest, read_manifest_list, read_manifest_spec, write_manifest, write_manifest_list,
 };
 pub use metadata::{FormatVersion, SortField, SortOrder, TableMetadata};
+pub use options::IcebergOptions;
 pub use partition::{FIRST_PARTITION_ID, PartitionField, PartitionSpec, Transform};
 pub use scan::{ScanPlan, ScanTask};
 pub use schema::{assign_field_ids, last_field_id, schema_from_json, schema_to_json};
 pub use snapshot::{MAIN_BRANCH, Snapshot, SnapshotRef};
-pub use table::{Compaction, Table};
+pub use table::{CommitConflict, Compaction, Table};
 pub use types::PrimitiveType;
 
 use crate::Result;

@@ -12,12 +12,12 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
-use criterion::{Criterion, Throughput, criterion_group};
+use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group};
 use smol_str::SmolStr;
 use yggdryl::iceberg::{
-    DataFile, FormatVersion, ManifestEntry, PartitionSpec, Snapshot, Table, TableMetadata,
-    assign_field_ids, read_manifest, write_manifest,
+    DataFile, FormatVersion, IcebergOptions, ManifestEntry, PartitionSpec, Snapshot, Table,
+    TableMetadata, assign_field_ids, read_manifest, write_manifest,
 };
 use yggdryl::io::partition::partition_text;
 use yggdryl::io::{Buffer, IOBase};
@@ -31,7 +31,14 @@ const VENUES: usize = 8;
 const PRUNED_FILTER: (&str, &str) = ("venue", "venue-2");
 
 /// The scratch labels the benchmark tables live under, cleaned at exit.
-const SCRATCH_LABELS: [&str; 4] = ["files-10", "files-200", "compact-200", "merge-50"];
+const SCRATCH_LABELS: [&str; 6] = [
+    "files-10",
+    "files-200",
+    "compact-200",
+    "merge-50",
+    "read-parallel-32",
+    "commit-contended",
+];
 
 /// Spell one of the [`VENUES`] partition values.
 fn venue(index: usize) -> String {
@@ -430,6 +437,195 @@ fn merge_benchmarks(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// The four-column trade schema the read benchmark scans.
+fn read_schema() -> Field {
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Float64.nullable_field("price"),
+        DataType::Utf8.nullable_field("venue"),
+        DataType::Int64.required_field("ts"),
+    ])
+    .expect("the static columns are unique")
+    .required_field("row");
+    assign_field_ids(&mut schema, 1).expect("the static schema takes identifiers");
+    schema
+}
+
+/// Build an unpartitioned table of `files` data files, `rows` rows each.
+///
+/// Each append is one commit is one file of (int64 id, float64 price, utf8
+/// venue from the eight-value pool, timestamp-like int64), so the parallel
+/// read gets files large enough that decode dominates the open.
+fn read_table(label: &str, files: usize, rows: usize) -> Table<Folder> {
+    let path = scratch(label);
+    let _ = std::fs::remove_dir_all(&path);
+    let schema = read_schema();
+    let mut table = Table::create(
+        Folder::new(&path).expect("the scratch directory is addressable"),
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )
+    .expect("the scratch table creates");
+    let arrow = schema
+        .to_arrow_schema()
+        .expect("the schema projects to Arrow");
+    for file in 0..files {
+        let base = i64::try_from(file * rows).expect("the row index fits an id");
+        let ids: Vec<i64> = (0..rows)
+            .map(|row| base + i64::try_from(row).expect("the row fits an id"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            arrow.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                #[allow(clippy::cast_precision_loss)]
+                Arc::new(Float64Array::from_iter_values(
+                    ids.iter().map(|id| *id as f64 * 0.01),
+                )),
+                Arc::new(StringArray::from_iter_values(ids.iter().map(|id| {
+                    venue(usize::try_from(*id).unwrap_or_default() % VENUES)
+                }))),
+                Arc::new(Int64Array::from_iter_values(
+                    ids.iter().map(|id| 1_700_000_000_000 + *id),
+                )),
+            ],
+        )
+        .expect("the batch matches the schema");
+        table
+            .append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))
+            .expect("the append commits");
+    }
+    table
+}
+
+/// Drain one full scan, counting the rows it yields.
+fn scan_rows(table: &Table<Folder>) -> usize {
+    table
+        .scan(None)
+        .expect("the scan plans")
+        .map(|batch| batch.expect("the batch decodes").num_rows())
+        .sum()
+}
+
+/// A full-table collect, decoded one file at a time versus four at a time.
+///
+/// The table is built once - 32 files of 100k rows - and only the options
+/// change between the two measurements, so the comparison is exactly the
+/// read path. The parallel side forces the thresholds low because what it
+/// measures is the decode fan-out, not the decision.
+fn read_benchmarks(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("read");
+    group.sample_size(10);
+    let mut table = read_table(SCRATCH_LABELS[4], 32, 100_000);
+
+    let sequential = IcebergOptions::new()
+        .try_with_read_parallelism(1)
+        .expect("one reader thread is valid");
+    let parallel = IcebergOptions::new()
+        .try_with_read_parallelism(4)
+        .expect("four reader threads are valid")
+        .with_read_parallel_min_files(1)
+        .with_read_parallel_min_file_size_bytes(0);
+
+    // Proven once outside the timers: both paths read every row.
+    table.set_options(sequential.clone());
+    assert_eq!(scan_rows(&table), 3_200_000);
+    table.set_options(parallel.clone());
+    assert_eq!(scan_rows(&table), 3_200_000);
+
+    group.throughput(Throughput::Elements(3_200_000));
+    table.set_options(sequential);
+    group.bench_function("parallel_vs_sequential_32x4mb/parallelism-1", |bencher| {
+        bencher.iter(|| scan_rows(black_box(&table)));
+    });
+    table.set_options(parallel);
+    group.bench_function("parallel_vs_sequential_32x4mb/parallelism-4", |bencher| {
+        bencher.iter(|| scan_rows(black_box(&table)));
+    });
+    group.finish();
+}
+
+/// Four writers hammering one table: wall time per successful commit.
+///
+/// Each iteration starts from a fresh one-version table, then four threads
+/// open their own stale handles and append one small batch each, so every
+/// commit after the first observes a newer version, rebases, and pays a
+/// jittered backoff - which is exactly what is being measured.
+///
+/// One mutex serializes the append calls themselves. The local backend is a
+/// memory mapping, and `yggdryl::local` documents the consequence: two
+/// writers truncating one mapped file at the same instant can raise SIGBUS,
+/// which no retry can catch. The gate stands in for the atomic PUT an object
+/// store gives every writer, while the *handles* still race optimistically -
+/// each one commits against a version another writer already advanced.
+fn contended_commit_benchmarks(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("commit");
+    group.sample_size(10);
+    let path = scratch(SCRATCH_LABELS[5]);
+    let schema = plan_schema();
+    let arrow = schema
+        .to_arrow_schema()
+        .expect("the schema projects to Arrow");
+
+    group.throughput(Throughput::Elements(4));
+    group.bench_function("contended_append_x4", |bencher| {
+        bencher.iter_batched(
+            || {
+                let _ = std::fs::remove_dir_all(&path);
+                Table::create(
+                    Folder::new(&path).expect("the scratch directory is addressable"),
+                    FormatVersion::V2,
+                    schema.clone(),
+                    PartitionSpec::unpartitioned(),
+                )
+                .expect("the scratch table creates")
+            },
+            |_created| {
+                let gate = std::sync::Mutex::new(());
+                std::thread::scope(|scope| {
+                    for worker in 0..4_i64 {
+                        let path = &path;
+                        let gate = &gate;
+                        let arrow = arrow.clone();
+                        scope.spawn(move || {
+                            // Opened before the gate, so every handle is
+                            // equally stale and every commit but the first
+                            // has to rebase.
+                            let mut table = Table::open(
+                                Folder::new(path).expect("the table folder is addressable"),
+                            )
+                            .expect("the contended table opens");
+                            table.set_options(
+                                IcebergOptions::new()
+                                    .with_commit_retries(16)
+                                    .with_commit_min_backoff_ms(1)
+                                    .with_commit_max_backoff_ms(20),
+                            );
+                            let batch = RecordBatch::try_new(
+                                arrow.clone(),
+                                vec![
+                                    Arc::new(Int64Array::from(vec![worker])),
+                                    Arc::new(StringArray::from(vec![Some(venue(
+                                        usize::try_from(worker).unwrap_or_default(),
+                                    ))])),
+                                ],
+                            )
+                            .expect("the batch matches the schema");
+                            let _serialized = gate.lock().expect("the gate is not poisoned");
+                            table
+                                .append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))
+                                .expect("the contended append commits");
+                        });
+                    }
+                });
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
 criterion_group!(
     iceberg,
     plan_benchmarks,
@@ -437,7 +633,9 @@ criterion_group!(
     manifest_benchmarks,
     partition_benchmarks,
     compact_benchmarks,
-    merge_benchmarks
+    merge_benchmarks,
+    read_benchmarks,
+    contended_commit_benchmarks
 );
 
 fn main() {

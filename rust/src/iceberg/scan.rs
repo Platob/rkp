@@ -374,6 +374,8 @@ pub(super) fn plan(
 pub(super) struct ScanPart {
     /// The handle addressing the data file.
     pub(super) handle: Holder,
+    /// The file size the manifest recorded, which sizes the parallel decision.
+    pub(super) size: i64,
     /// Partition columns to restore, when the file does not store them.
     pub(super) partition: Vec<(Field, Value)>,
     /// The filters this file's rows still have to be tested against.
@@ -390,98 +392,25 @@ struct Open {
     residual: Vec<usize>,
 }
 
-/// A reader over every data file one plan selected.
-struct Scan {
-    /// The files not yet opened.
-    parts: std::vec::IntoIter<ScanPart>,
-    /// The file currently being read, with what it still has to apply.
-    current: Option<Open>,
+/// Everything a decoded batch still goes through, shared by both read paths.
+///
+/// The sequential reader borrows one of these; each parallel worker holds the
+/// same one behind an [`Arc`], so the two paths cannot drift apart in how a
+/// batch is restored, cast, filtered, and projected.
+struct Refine {
     /// The root each file is read and filtered as.
     read_root: Field,
     /// The root every batch is finally cast to.
     root: Field,
-    /// The Arrow projection of that root.
-    schema: SchemaRef,
-    /// The column pushdown handed to each file, when the caller gave one.
-    target: Option<Field>,
     /// Whether the read root holds columns the scan root does not.
     project: bool,
-    /// The filters, shared by every part that still has one to apply.
-    filters: Arc<Vec<Filter>>,
-}
-
-/// Build the reader over one set of planned files.
-///
-/// `root` is what the reader reports and every batch is cast to; the read root
-/// is that plus whatever the filters need, so a column a filter tests is read
-/// and then dropped rather than left out of the pushdown.
-///
-/// # Errors
-///
-/// Returns an error when either root cannot be projected into Arrow.
-pub(super) fn reader(
-    parts: Vec<ScanPart>,
-    root: Field,
-    read_root: Field,
+    /// The column pushdown handed to each file, when the caller gave one.
     target: Option<Field>,
+    /// The filters, indexed by every part's residual list.
     filters: Vec<Filter>,
-) -> Result<BatchReader> {
-    Ok(Box::new(Scan {
-        project: read_root.field_len() != root.field_len(),
-        schema: crate::arrow::schema_from_field(&root)?,
-        parts: parts.into_iter(),
-        current: None,
-        read_root,
-        root,
-        target,
-        filters: Arc::new(filters),
-    }))
 }
 
-impl Iterator for Scan {
-    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(open) = self.current.as_mut() {
-                match open.reader.next() {
-                    Some(Ok(batch)) => {
-                        let residual = &open.residual;
-                        let produced = restore_partitions(&batch, &open.partition)
-                            .and_then(|batch| Ok(self.read_root.cast_arrow_batch(batch, false)?))
-                            .and_then(|batch| apply_filters(batch, &self.filters, residual))
-                            .and_then(|batch| {
-                                if self.project {
-                                    return Ok(self.root.cast_arrow_batch(batch, false)?);
-                                }
-                                Ok(batch)
-                            });
-                        return Some(produced.map_err(scan_error));
-                    }
-                    Some(Err(error)) => return Some(Err(error)),
-                    None => self.current = None,
-                }
-            }
-            let part = self.parts.next()?;
-            let options = match self.file_options(&part) {
-                Ok(options) => options,
-                Err(error) => return Some(Err(scan_error(error))),
-            };
-            match crate::io::IOBase::read_arrow_batch_reader(&part.handle, &options) {
-                Ok(reader) => {
-                    self.current = Some(Open {
-                        reader,
-                        partition: part.partition,
-                        residual: part.residual,
-                    });
-                }
-                Err(error) => return Some(Err(scan_error(error))),
-            }
-        }
-    }
-}
-
-impl Scan {
+impl Refine {
     /// Resolve the options one data file is read under.
     ///
     /// The read root is handed down as the file's declared schema, which is what
@@ -511,12 +440,312 @@ impl Scan {
             _ => Ok(options),
         }
     }
+
+    /// Open one planned file with its resolved options.
+    fn open(&self, part: &ScanPart) -> Result<BatchReader> {
+        let options = self.file_options(part)?;
+        crate::io::IOBase::read_arrow_batch_reader(&part.handle, &options)
+    }
+
+    /// Restore, cast, filter, and project one decoded batch.
+    fn batch(
+        &self,
+        batch: &RecordBatch,
+        partition: &[(Field, Value)],
+        residual: &[usize],
+    ) -> std::result::Result<RecordBatch, arrow_schema::ArrowError> {
+        restore_partitions(batch, partition)
+            .and_then(|batch| Ok(self.read_root.cast_arrow_batch(batch, false)?))
+            .and_then(|batch| apply_filters(batch, &self.filters, residual))
+            .and_then(|batch| {
+                if self.project {
+                    return Ok(self.root.cast_arrow_batch(batch, false)?);
+                }
+                Ok(batch)
+            })
+            .map_err(scan_error)
+    }
+}
+
+/// A reader over every data file one plan selected, one file at a time.
+struct Scan {
+    /// The files not yet opened.
+    parts: std::vec::IntoIter<ScanPart>,
+    /// The file currently being read, with what it still has to apply.
+    current: Option<Open>,
+    /// The Arrow projection of the scan root.
+    schema: SchemaRef,
+    /// The shared per-batch pipeline.
+    refine: Arc<Refine>,
+}
+
+/// Build the reader over one set of planned files.
+///
+/// `root` is what the reader reports and every batch is cast to; the read root
+/// is that plus whatever the filters need, so a column a filter tests is read
+/// and then dropped rather than left out of the pushdown.
+///
+/// The reader decodes files in parallel when the plan is worth it: at least
+/// [`ReadSettings::min_files`] of the planned files carry a recorded
+/// `file_size_in_bytes` of [`ReadSettings::min_file_size_bytes`] or more -
+/// smaller files do not count toward justifying threads - and
+/// [`ReadSettings::parallelism`] allows at least two. Below any of those the
+/// strictly sequential single-open path answers. Either way the batches come
+/// back in exactly the plan's file order.
+///
+/// # Errors
+///
+/// Returns an error when either root cannot be projected into Arrow.
+pub(super) fn reader(
+    parts: Vec<ScanPart>,
+    root: Field,
+    read_root: Field,
+    target: Option<Field>,
+    filters: Vec<Filter>,
+    parallel: &super::options::ReadSettings,
+) -> Result<BatchReader> {
+    let schema = crate::arrow::schema_from_field(&root)?;
+    let refine = Arc::new(Refine {
+        project: read_root.field_len() != root.field_len(),
+        read_root,
+        root,
+        target,
+        filters,
+    });
+    let qualifying = parts
+        .iter()
+        .filter(|part| {
+            u64::try_from(part.size).is_ok_and(|size| size >= parallel.min_file_size_bytes)
+        })
+        .count();
+    if parallel.parallelism >= 2 && parts.len() > 1 && qualifying >= parallel.min_files {
+        return Ok(Box::new(ParallelScan::new(
+            parts,
+            schema,
+            refine,
+            parallel.parallelism,
+        )));
+    }
+    Ok(Box::new(Scan {
+        parts: parts.into_iter(),
+        current: None,
+        schema,
+        refine,
+    }))
+}
+
+impl Iterator for Scan {
+    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(open) = self.current.as_mut() {
+                match open.reader.next() {
+                    Some(Ok(batch)) => {
+                        return Some(self.refine.batch(&batch, &open.partition, &open.residual));
+                    }
+                    Some(Err(error)) => return Some(Err(error)),
+                    None => self.current = None,
+                }
+            }
+            let part = self.parts.next()?;
+            match self.refine.open(&part) {
+                Ok(reader) => {
+                    self.current = Some(Open {
+                        reader,
+                        partition: part.partition,
+                        residual: part.residual,
+                    });
+                }
+                Err(error) => return Some(Err(scan_error(error))),
+            }
+        }
+    }
 }
 
 impl arrow_array::RecordBatchReader for Scan {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
+}
+
+/// One worker-to-consumer message: a refined batch of one file, or `None` to
+/// say that file has no more.
+type PartMessage = (
+    usize,
+    Option<std::result::Result<RecordBatch, arrow_schema::ArrowError>>,
+);
+
+/// What the consumer holds of one file that is ahead of the release cursor.
+#[derive(Default)]
+struct PartState {
+    /// Refined batches received and not yet released, in decode order.
+    batches: std::collections::VecDeque<std::result::Result<RecordBatch, arrow_schema::ArrowError>>,
+    /// Whether the file's worker has sent everything it will.
+    done: bool,
+}
+
+/// A reader that decodes several planned files at once, releasing their
+/// batches strictly in plan order.
+///
+/// Memory is bounded by a sliding window: at most `window` files - the
+/// resolved read parallelism - are ever in flight, because a new worker is
+/// spawned only when the release cursor finishes a file, so the channel and
+/// the reorder buffer together hold at most that many files' batches.
+///
+/// **Dropping the reader detaches the workers rather than joining them.** A
+/// worker owns everything it touches - its handle, its `Arc` of the shared
+/// pipeline, its sender - so nothing borrowed outlives the drop; the dropped
+/// receiver disconnects the channel, and each worker exits at its next send
+/// instead of decoding a file nobody wants. Joining here would make dropping
+/// a reader block on a decode already in progress, which is worse than
+/// letting one finish its current batch quietly.
+struct ParallelScan {
+    /// The Arrow projection of the scan root.
+    schema: SchemaRef,
+    /// The shared per-batch pipeline every worker applies.
+    refine: Arc<Refine>,
+    /// The files not yet handed to a worker, in plan order.
+    jobs: std::vec::IntoIter<ScanPart>,
+    /// The plan position the next spawned worker will decode.
+    spawned: usize,
+    /// Per-file reorder state, indexed by plan position.
+    states: Vec<PartState>,
+    /// The plan position whose batches are being released.
+    released: usize,
+    /// How many files may be in flight at once.
+    window: usize,
+    /// The senders' origin, kept so late workers can be given one.
+    sender: std::sync::mpsc::Sender<PartMessage>,
+    /// Where every worker's batches arrive.
+    receiver: std::sync::mpsc::Receiver<PartMessage>,
+}
+
+impl ParallelScan {
+    /// Start the first window of workers over the planned files.
+    fn new(parts: Vec<ScanPart>, schema: SchemaRef, refine: Arc<Refine>, window: usize) -> Self {
+        let total = parts.len();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut scan = Self {
+            schema,
+            refine,
+            jobs: parts.into_iter(),
+            spawned: 0,
+            states: (0..total).map(|_| PartState::default()).collect(),
+            released: 0,
+            window: window.max(1),
+            sender,
+            receiver,
+        };
+        for _ in 0..scan.window {
+            scan.spawn_next();
+        }
+        scan
+    }
+
+    /// Hand the next unclaimed file to a fresh worker thread, if any remains.
+    fn spawn_next(&mut self) {
+        let Some(part) = self.jobs.next() else {
+            return;
+        };
+        let index = self.spawned;
+        self.spawned += 1;
+        let refine = Arc::clone(&self.refine);
+        let sender = self.sender.clone();
+        // Deliberately detached: see the type docs for why drop does not join.
+        let _ = std::thread::spawn(move || read_part(index, &part, &refine, &sender));
+    }
+}
+
+impl Iterator for ParallelScan {
+    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.released >= self.states.len() {
+                return None;
+            }
+            if let Some(result) = self.states[self.released].batches.pop_front() {
+                return Some(result);
+            }
+            if self.states[self.released].done {
+                // The cursor file is drained, so the window has room for one
+                // more worker.
+                self.released += 1;
+                self.spawn_next();
+                continue;
+            }
+            match self.receiver.recv() {
+                Ok((index, Some(result))) => {
+                    if let Some(state) = self.states.get_mut(index) {
+                        state.batches.push_back(result);
+                    }
+                }
+                Ok((index, None)) => {
+                    if let Some(state) = self.states.get_mut(index) {
+                        state.done = true;
+                    }
+                }
+                // Unreachable while this reader holds a sender; kept so a bug
+                // reads as an error rather than an infinite wait.
+                Err(_) => {
+                    return Some(Err(scan_error(invalid(SmolStr::new_static(
+                        "expected a decode worker to answer, got a closed channel",
+                    )))));
+                }
+            }
+        }
+    }
+}
+
+impl arrow_array::RecordBatchReader for ParallelScan {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+/// Decode one planned file on a worker thread.
+///
+/// Every batch is refined here, in the worker, so the parallelism covers the
+/// cast-and-filter work and not only the decode; each is sent as
+/// `(file_index, batch)` and a final `(file_index, None)` says the file is
+/// finished. Every send doubles as the liveness check: a dropped reader
+/// disconnects the channel and the worker returns at its next send. The body
+/// is unwind-guarded so a panicking decode reports an error instead of
+/// leaving the consumer waiting for a marker that would never come.
+fn read_part(
+    index: usize,
+    part: &ScanPart,
+    refine: &Refine,
+    sender: &std::sync::mpsc::Sender<PartMessage>,
+) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let reader = match refine.open(part) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = sender.send((index, Some(Err(scan_error(error)))));
+                return;
+            }
+        };
+        for batch in reader {
+            let produced = match batch {
+                Ok(batch) => refine.batch(&batch, &part.partition, &part.residual),
+                Err(error) => Err(error),
+            };
+            if sender.send((index, Some(produced))).is_err() {
+                return;
+            }
+        }
+    }));
+    if outcome.is_err() {
+        let _ = sender.send((
+            index,
+            Some(Err(scan_error(invalid(SmolStr::new_static(
+                "expected the file to decode, got a panicking reader thread",
+            ))))),
+        ));
+    }
+    let _ = sender.send((index, None));
 }
 
 /// Keep only the rows every residual filter accepts.

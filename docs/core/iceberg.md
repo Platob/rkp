@@ -1588,6 +1588,291 @@ under the target, and carries every other file into the new snapshot exactly as 
 files it never read. The snapshot before the compaction still time-travels: rewriting the present
 never rewrites history.
 
+## One options value, three layers
+
+!!! note "Rust first"
+    `IcebergOptions` and the surfaces of this section and the next two are
+    Rust-first for now; the bindings gain them in a follow-up rather than
+    growing an untested spelling here.
+
+Every knob a table honors lives on one value, `IcebergOptions`, and every field of it resolves
+the same way: an explicit option set on the handle, then the table property of the same name
+(falling back to the schema root's `iceberg:`-prefixed protocol property), then the documented
+default. The keys are Iceberg's own spellings - `commit.retry.num-retries`,
+`commit.retry.min-wait-ms`, `commit.retry.max-wait-ms`, `write.target-file-size-bytes`,
+`read.parallelism`, `read.parallel.min-files`, `read.parallel.min-file-size-bytes` - so a property
+another engine wrote configures this reader too:
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{
+        FormatVersion, IcebergOptions, PartitionSpec, Table, assign_field_ids,
+    };
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let root = std::env::temp_dir().join("yggdryl-doc-options");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    let mut table = Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema,
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    // Nothing set: every field answers its documented default.
+    assert_eq!(table.options()?.commit_retries(), 4);
+    assert_eq!(table.options()?.target_file_size_bytes(), 512 * 1024 * 1024);
+
+    // The property layer is the table's own metadata, one commit away.
+    table.commit_changes(|metadata| {
+        metadata.set_property(IcebergOptions::COMMIT_RETRIES_KEY, "9")?;
+        Ok(())
+    })?;
+    assert_eq!(table.options()?.commit_retries(), 9);
+
+    // An explicit override shadows the property on this handle alone;
+    // nothing is written, and an unset field still resolves the other layers.
+    table.set_options(IcebergOptions::new().with_commit_retries(2));
+    assert_eq!(table.options()?.commit_retries(), 2);
+    assert_eq!(table.options()?.commit_min_backoff_ms(), 100);
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+A property that is present but does not parse is a typed error naming the key and the value, never
+a silent default - and because an explicit option never reads the property it shadows, a broken
+stored value can be shadowed first and repaired after, through the same handle. The resolvers are
+also scoped to what each operation consults: a commit resolves only the three `commit.retry.*`
+keys, so an unparseable `read.*` property cannot stop the metadata-only commit that fixes it.
+
+## Concurrent writers and commit retries
+
+Two writers holding the same table race the moment both commit, and what this module can promise
+depends on what [`IOBase`](io.md) offers: positional reads and writes, no compare-and-swap. So the
+one commit gate every write goes through re-checks the current version before writing, counts each
+newer version it finds as being *beaten* once, and retries with jittered exponential backoff up to
+`commit.retry.num-retries` times. What a retry does depends on the operation. An `append` and every
+metadata-only `commit_changes` **rebase**: they reload the winner's document and re-apply their
+intent on it - the data files and the manifest of added entries are written once and reused, only
+the manifest list and the document are rebuilt - so both writers' rows survive in one line of
+history:
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let root = std::env::temp_dir().join("yggdryl-doc-concurrency");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    // Two handles opened at the same version, each unaware of the other.
+    let mut left = Table::open(Folder::new(&root)?)?;
+    let mut right = Table::open(Folder::new(&root)?)?;
+
+    let arrow_schema = schema.to_arrow_schema()?;
+    let one = |id: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![id]))],
+        )
+    };
+
+    let batch = one(1)?;
+    left.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+
+    // The right handle is now stale; its commit observes the winner,
+    // rebases onto it, and lands as the next version.
+    let batch = one(2)?;
+    right.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+
+    // Both rows survive, on one line of history, and the rebased handle
+    // is current: no re-open needed to see the winner's row.
+    let rows: usize = right
+        .scan(None)?
+        .map(|batch| batch.map(|b| b.num_rows()))
+        .sum::<Result<usize, _>>()?;
+    assert_eq!(rows, 2);
+    assert_eq!(right.inspect_history()?.next().expect("one batch")?.num_rows(), 2);
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+`overwrite`, `merge`, and `compact` never rebase: they planned against files the winner may have
+replaced, and their input rows are already consumed, so re-applying could resurrect deleted data.
+Beaten, they only wait, look again, and after exhausting the retries restore the in-memory state
+and return a `CommitConflict` naming what happened - `expected to commit version 4, got beaten 5
+times; last saw version 8` - so the caller re-plans against the table as it now is.
+
+Honesty about the window: the check-then-write pair is not atomic. On plain storage a writer
+landing between the check and the write goes undetected - retries shrink the window, they cannot
+close it. Storage that serializes writers (an object store's atomic PUT, a catalog's swap) closes
+it; `yggdryl::local`'s memory mapping does not, and two processes truncating one mapped file at
+the same instant is the documented SIGBUS hazard of that backend. A failed commit leaves no
+visible change: at worst it leaves orphan data files no snapshot names.
+
+## Branches and tags
+
+Named references are part of the metadata document: a **tag** is a name that never moves, a
+**branch** is a name meant to. Creating one is a metadata-only commit, reading one is an ordinary
+scan, and every ref keeps the snapshot it names retained past any expiry:
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let root = std::env::temp_dir().join("yggdryl-doc-branching");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    let mut table = Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    let arrow_schema = schema.to_arrow_schema()?;
+    let one = |id: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![id]))],
+        )
+    };
+
+    let batch = one(1)?;
+    table.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+    let audited = table.current_snapshot().expect("one commit").snapshot_id;
+
+    // The tag pins the audited state; the table keeps moving.
+    table.create_tag("audit-2026", audited)?;
+    let batch = one(2)?;
+    table.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+    table.create_branch("review", audited)?;
+
+    // Every ref reads as the complete table it names.
+    assert_eq!(table.scan_ref("audit-2026", &[], None)?.count(), 1);
+    assert_eq!(table.scan_ref("review", &[], None)?.count(), 1);
+    assert_eq!(table.scan(None)?.count(), 2);
+
+    // A branch fast-forwards only along its own ancestry: the target must
+    // reach the branch's head by parent ids, so no history can be lost.
+    let head = table.current_snapshot().expect("two commits").snapshot_id;
+    table.fast_forward("review", head)?;
+    assert_eq!(table.snapshot_by_ref("review")?.snapshot_id, head);
+
+    // Removing a ref removes the name; the snapshots stay retained.
+    let removed = table.remove_ref("review")?;
+    assert_eq!(removed.snapshot_id, head);
+
+    // Expiry honors every ref's retention: the tagged snapshot survives
+    // a cutoff that would otherwise expire everything old.
+    assert!(table.expire_snapshots(i64::MAX)?.is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+Each ref carries its own retention - `min-snapshots-to-keep` and `max-snapshot-age-ms` for a
+branch's history, `max-ref-age-ms` for the ref itself - and `expire_snapshots` applies them before
+its own age cutoff; `main` itself never expires. A branch or tag commits through the same retrying
+gate as everything else, so two writers tagging at once behave like two writers appending at once.
+Writing *to* a branch other than `main` remains future work: a commit's parent is always the
+current snapshot, so today a branch is read with `scan_ref` and moved with `fast_forward`.
+
+## Reading many files at once
+
+A scan over many files can decode them in parallel, and the decision is deliberately conservative:
+the fan-out starts only when `read.parallelism` is at least 2 **and** at least
+`read.parallel.min-files` planned files (default 16) carry a recorded size of at least
+`read.parallel.min-file-size-bytes` (default 4 MiB). Small reads never pay for threads they cannot
+use, and storage is never hammered with more than `read.parallelism` files in flight - the default
+is the host's own parallelism, clamped to 1..=8. The order is the plan's order either way:
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use yggdryl::iceberg::{
+        FormatVersion, IcebergOptions, PartitionSpec, Table, assign_field_ids,
+    };
+    use yggdryl::local::Folder;
+    use yggdryl::DataType;
+
+    let root = std::env::temp_dir().join("yggdryl-doc-parallel-read");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+    let mut table = Table::create(
+        Folder::new(&root)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    let arrow_schema = schema.to_arrow_schema()?;
+    for id in 0..3 {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(Int64Array::from(vec![id]))],
+        )?;
+        table.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+    }
+
+    // Three tiny files sit below both thresholds, so this table reads
+    // sequentially by default; forcing the thresholds down demonstrates
+    // that the fan-out changes nothing the caller can observe.
+    let sequential: Vec<RecordBatch> = table.scan(None)?.collect::<Result<_, _>>()?;
+    table.set_options(
+        IcebergOptions::new()
+            .try_with_read_parallelism(2)?
+            .with_read_parallel_min_files(1)
+            .with_read_parallel_min_file_size_bytes(0),
+    );
+    let fanned: Vec<RecordBatch> = table.scan(None)?.collect::<Result<_, _>>()?;
+    assert_eq!(sequential, fanned);
+
+    let _ = std::fs::remove_dir_all(&root);
+    ```
+
+Each worker decodes one file end to end - the cast, the partition restore, and the residual
+filters run on the worker, not the consumer - and a reorder buffer releases batches strictly in
+plan order, admitting the next file only as the cursor file drains. Pruning still happens first:
+a filtered scan fans out over the files the statistics could not exclude, not over the table. On
+the benchmark table - 32 files of 100k rows each - four workers read a full collect about twice
+as fast as one; the numbers live in `rust/benchmarks/iceberg.rs` under `read/`.
+
 ## The Spark quickstart, locally
 
 !!! note "All three"
@@ -2472,6 +2757,14 @@ the [`IOBase`](io.md) handle the caller supplies.
 
 No deletes. This module writes and reads data files; position and equality delete files are read as
 manifest content that a scan skips, not produced.
+
+No writes to a branch other than `main`: a commit's parent is always the current snapshot, so a
+branch is read with `scan_ref` and moved with `fast_forward` until commits learn to parent a
+branch's head.
+
+No compare-and-swap. The commit gate re-checks the current version and retries when beaten, but
+`IOBase` cannot make check-then-write atomic, so the guarantee is honest best-effort on plain
+storage and exact only where the storage itself serializes writers.
 
 Two partition transforms can place a row: `identity` and `void`. A write against a spec using
 `bucket`, `truncate`, or a calendar transform is refused by name rather than silently writing rows
