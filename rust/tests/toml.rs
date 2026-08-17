@@ -882,3 +882,26 @@ fn generic_dispatch_and_inference_are_deterministic_and_single_pass_compatible()
     assert_eq!(text::infer_format(b"").unwrap(), Format::Yaml);
     assert_eq!(text::infer_format(b"# comment\n").unwrap(), Format::Yaml);
 }
+
+#[test]
+fn a_datatype_pairing_survives_the_wire_with_the_datatype_it_declares() {
+    let value = Value::from_mapping([(
+        Value::from("price"),
+        Value::optional(yggdryl::DataType::Utf8, Value::from("AAPL")).unwrap(),
+    )])
+    .unwrap();
+
+    let encoded = toml::to_vec(&value).unwrap();
+    let text = std::str::from_utf8(&encoded).unwrap();
+    assert!(
+        text.contains("\"option\"") && text.contains("utf8"),
+        "the datatype has to reach the wire: {text}"
+    );
+
+    let decoded = toml::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, value);
+    assert_eq!(
+        decoded.get_key_str("price").unwrap().data_type().unwrap(),
+        yggdryl::DataType::Utf8
+    );
+}

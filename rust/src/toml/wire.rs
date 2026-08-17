@@ -4,7 +4,7 @@ use std::io::Write;
 
 use base64::Engine as _;
 
-use crate::{Error, Result, TimeUnit, Timezone, Value};
+use crate::{DataType, Error, Result, TimeUnit, Timezone, Value};
 
 pub(super) const MARKER: &str = "$yggdryl";
 const WIRE_VERSION: i64 = 1;
@@ -46,7 +46,7 @@ fn decode_envelope(body: &Value) -> Option<Result<Value>> {
     let names: &[&str] = match kind {
         "null" => &["version", "type"],
         "bytes" | "u64" | "i128" | "u128" | "decimal" | "date" | "time" | "timestamp"
-        | "duration" | "mapping" | "value" => &["version", "type", "value"],
+        | "duration" | "mapping" | "option" | "value" => &["version", "type", "value"],
         _ => return None,
     };
     if !has_exact_fields(fields, names) {
@@ -63,11 +63,35 @@ fn decode_envelope(body: &Value) -> Option<Result<Value>> {
         "date" => decode_date(fields),
         "time" | "timestamp" | "duration" => decode_temporal(kind, fields),
         "mapping" => decode_mapping(fields),
+        "option" => decode_option(fields),
         "value" => field(fields, "value")
             .cloned()
             .ok_or_else(|| codec_error("value envelope has no payload")),
         _ => return None,
     })
+}
+
+/// Rebuild the pairing an option envelope carries.
+///
+/// The datatype arrives as its canonical spelling and is read back by the one
+/// recursive schema grammar, and the pairing is rebuilt through the
+/// constructor that validates the two halves against each other.
+fn decode_option(fields: &[(Value, Value)]) -> Result<Value> {
+    let payload = field(fields, "value")
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| codec_error("option envelope value must be a datatype and a value"))?;
+    let [name, value] = payload else {
+        return Err(codec_error(
+            "option envelope value must be a datatype and a value",
+        ));
+    };
+    let name = name
+        .as_str()
+        .ok_or_else(|| codec_error("option envelope datatype must be text"))?;
+    let data_type = DataType::from_str(name)
+        .map_err(|_| codec_error("option envelope datatype is not a datatype"))?;
+    Value::optional(data_type, value.clone())
+        .map_err(|_| codec_error("option envelope value does not match its datatype"))
 }
 
 fn decode_bytes(fields: &[(Value, Value)]) -> Result<Value> {
@@ -491,6 +515,9 @@ fn is_enveloped(value: &Value) -> bool {
         | Value::Float(_)
         | Value::String(_)
         | Value::Sequence(_) => false,
+        // A datatype pairing has no TOML spelling at all: the datatype has to
+        // travel beside the value, which is what an envelope is for.
+        Value::Option(_) => true,
         Value::Mapping(entries) => !is_plain_mapping(entries),
         Value::Date(_) | Value::Time(..) | Value::Timestamp(..) => native_datetime(value).is_none(),
         Value::Null
@@ -509,9 +536,20 @@ fn is_enveloped(value: &Value) -> bool {
 /// count - adds nothing. The `["<unit>", count]` and `["<unscaled>", scale]`
 /// payloads are TOML arrays, which the parser counts as one more container on
 /// the way back, so the preflight has to count it on the way out.
-const fn envelope_payload_depth(value: &Value) -> usize {
+fn envelope_payload_depth(value: &Value) -> usize {
     match value {
         Value::Decimal(..) | Value::Time(..) | Value::Timestamp(..) | Value::Duration(..) => 1,
+        // The pair carrying the datatype and the value is one level, and the
+        // value inside it costs whatever its own projection costs.
+        Value::Option(typed) => {
+            let payload = typed.value();
+            let inner = if is_enveloped(payload) {
+                2 + envelope_payload_depth(payload)
+            } else {
+                usize::from(matches!(payload, Value::Sequence(_) | Value::Mapping(_)))
+            };
+            1 + inner
+        }
         _ => 0,
     }
 }
@@ -580,7 +618,8 @@ fn check_value_depth(value: &Value, parent_depth: usize, maximum: usize) -> Resu
         | Value::Date(_)
         | Value::Time(..)
         | Value::Timestamp(..)
-        | Value::Duration(..) => {
+        | Value::Duration(..)
+        | Value::Option(_) => {
             let wrapper_depth = parent_depth.saturating_add(1);
             let body_depth = wrapper_depth.saturating_add(1);
             observe_depth(wrapper_depth, maximum)?;
@@ -677,6 +716,7 @@ fn write_value<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
         | Value::Bytes(_)
         | Value::Decimal(..)
         | Value::Duration(..)
+        | Value::Option(_)
         | Value::Mapping(_) => write_wrapped_envelope(writer, value)?,
     }
     Ok(())
@@ -734,6 +774,13 @@ fn write_envelope_body<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
         }
         Value::Timestamp(count, unit, zone) => {
             write_temporal_body(writer, "timestamp", *count, *unit, zone.as_ref())?;
+        }
+        Value::Option(typed) => {
+            writer.write_all(b"{ version = 1, type = \"option\", value = [")?;
+            write_quoted(writer, &typed.data_type().to_string())?;
+            writer.write_all(b", ")?;
+            write_value(writer, typed.value())?;
+            writer.write_all(b"] }")?;
         }
         Value::Mapping(entries) => {
             writer.write_all(b"{ version = 1, type = \"mapping\", value = [")?;

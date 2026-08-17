@@ -812,3 +812,25 @@ mod numbers {
         assert_eq!(yaml::from_slice(text.as_bytes()).unwrap(), value, "{text}");
     }
 }
+
+#[test]
+fn a_datatype_pairing_survives_the_wire_with_the_datatype_it_declares() {
+    let value = Value::from_mapping([(
+        Value::from("price"),
+        Value::absent(yggdryl::DataType::Float64),
+    )])
+    .unwrap();
+
+    let encoded = yaml::to_vec(&value).unwrap();
+    let text = std::str::from_utf8(&encoded).unwrap();
+    assert!(
+        text.contains("\"option\"") && text.contains("float64"),
+        "the datatype has to reach the wire: {text}"
+    );
+
+    let decoded = yaml::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, value);
+    let price = decoded.get_key_str("price").unwrap();
+    assert!(price.is_null());
+    assert_eq!(price.data_type().unwrap(), yggdryl::DataType::Float64);
+}

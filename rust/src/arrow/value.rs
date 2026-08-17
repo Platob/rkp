@@ -32,6 +32,8 @@ use super::{Error, Result};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn array_from_values(field: &Field, values: &[&Value]) -> Result<ArrayRef> {
+    let payloads = payloads_for(field, values)?;
+    let values = payloads.as_deref().unwrap_or(values);
     let data_type = field.data_type();
     let arrow_type = field.to_arrow_ref()?.data_type().clone();
     // Arrow owns the canonical empty representation for every validated
@@ -219,6 +221,41 @@ pub(crate) fn array_from_values(field: &Field, values: &[&Value]) -> Result<Arra
 }
 
 #[allow(clippy::too_many_lines)]
+/// Replace every datatype pairing in a column with the value it holds.
+///
+/// The column already declares the datatype, so a pairing here is a caller
+/// stating it again. Stating it differently is the error: a value that names
+/// another column's datatype is refused rather than written into this one.
+/// Nothing is allocated for a column that holds no pairing, which is every
+/// column that came off the wire or out of a reader.
+fn payloads_for<'value>(
+    field: &Field,
+    values: &[&'value Value],
+) -> Result<Option<Vec<&'value Value>>> {
+    if !values.iter().any(|value| value.as_option().is_some()) {
+        return Ok(None);
+    }
+    values
+        .iter()
+        .map(|value| match value.as_option() {
+            Some(typed) if typed.data_type() == field.data_type() => Ok(typed.value()),
+            Some(typed) => Err(Error::InvalidValue {
+                path: smol_str::SmolStr::new(field.name()),
+                expected: smol_str::format_smolstr!(
+                    "a value of {}",
+                    crate::text::elide_display(field.data_type())
+                ),
+                actual: smol_str::format_smolstr!(
+                    "a value declared as {}",
+                    crate::text::elide_display(typed.data_type())
+                ),
+            }),
+            None => Ok(*value),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
 pub(crate) fn value_from_array(
     data_type: &DataType,
     array: &dyn Array,

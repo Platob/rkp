@@ -40,7 +40,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smol_str::SmolStr;
 
-use crate::{Error, Result, TimeUnit, Timezone};
+use crate::{Error, Result, TimeUnit, Timezone, TypedValue};
 
 use super::decimal;
 use super::temporal::temporal_key;
@@ -236,6 +236,14 @@ pub enum Value {
     Sequence(Arc<[Value]>),
     /// An insertion-ordered mapping with arbitrary unique keys.
     Mapping(Arc<[(Value, Value)]>),
+    /// A value that names the datatype it belongs to, present or absent.
+    ///
+    /// Every other variant names its datatype by being one. A null names only
+    /// `null`, so an absent value that has to keep its column's datatype -
+    /// which is what nullability means - carries it here instead. The pairing
+    /// compares, orders, and hashes as the value it holds, because the
+    /// datatype describes the value rather than changing it.
+    Option(Arc<TypedValue>),
 }
 
 impl<'de> Deserialize<'de> for Value {
@@ -265,6 +273,7 @@ impl<'de> Deserialize<'de> for Value {
             Duration(i64, TimeUnit),
             Sequence(Vec<Value>),
             Mapping(Vec<(Value, Value)>),
+            Option(TypedValue),
         }
 
         match StructuralValue::deserialize(deserializer)? {
@@ -286,6 +295,7 @@ impl<'de> Deserialize<'de> for Value {
             StructuralValue::Mapping(entries) => {
                 Self::from_mapping(entries).map_err(D::Error::custom)
             }
+            StructuralValue::Option(typed) => Ok(Self::Option(Arc::new(typed))),
         }
     }
 }
@@ -306,6 +316,12 @@ impl PartialOrd for Value {
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
+        // A datatype pairing is compared as the value it holds: the datatype
+        // says which column the value belongs to, which is not part of being
+        // greater or smaller than another value.
+        if matches!(self, Self::Option(_)) || matches!(other, Self::Option(_)) {
+            return self.as_payload().cmp(other.as_payload());
+        }
         match (integer(self), integer(other)) {
             (Some(left), Some(right)) => return compare_integer(left, right),
             (Some(_), None) => return value_rank(self).cmp(&value_rank(other)),
@@ -329,6 +345,7 @@ impl Ord for Value {
         }
         match self {
             Self::Null => Ordering::Equal,
+            Self::Option(_) => unreachable!("datatype pairings compared above"),
             Self::Bool(left) => same_kind!(Self::Bool(right) => left.cmp(right)),
             Self::I64(_) | Self::U64(_) | Self::I128(_) | Self::U128(_) => {
                 unreachable!("every integer width returned above")
@@ -363,6 +380,12 @@ impl Ord for Value {
 
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hashing the payload is what keeps `Hash` agreeing with `Ord`, which
+        // compares a datatype pairing as the value it holds.
+        if let Self::Option(typed) = self {
+            typed.value().hash(state);
+            return;
+        }
         value_rank(self).hash(state);
         if let Some(integer) = integer(self) {
             integer.hash(state);
@@ -390,6 +413,7 @@ impl Hash for Value {
             }
             Self::Sequence(value) => value.hash(state),
             Self::Mapping(value) => value.hash(state),
+            Self::Option(_) => unreachable!("datatype pairings hashed above"),
         }
     }
 }
@@ -446,6 +470,10 @@ const fn value_rank(value: &Value) -> u8 {
         Value::Duration(..) => 10,
         Value::Sequence(_) => 11,
         Value::Mapping(_) => 12,
+        // Unreachable through `cmp` and `hash`, which compare the payload of a
+        // datatype pairing; ranked with its payload's kind for any other
+        // caller rather than sorted after every value.
+        Value::Option(_) => 0,
     }
 }
 
@@ -473,6 +501,7 @@ impl Value {
             Self::Duration(..) => "duration",
             Self::Sequence(_) => "sequence",
             Self::Mapping(_) => "mapping",
+            Self::Option(_) => "optional",
         }
     }
 
@@ -496,6 +525,11 @@ impl Value {
                 }
             }
         } else {
+            // `Value` now reaches a `Field` through a datatype pairing, and a field
+            // caches its Arrow projection behind a `OnceLock`. That cache is invisible
+            // to `Hash` and `Eq`, which is exactly the condition this lint asks a
+            // caller to confirm before using the type as a key.
+            #[allow(clippy::mutable_key_type)]
             let mut seen = HashSet::with_capacity(entries.len());
             for (index, (key, _)) in entries.iter().enumerate() {
                 if !seen.insert(key) {
@@ -513,16 +547,16 @@ impl Value {
     }
 
     /// Return a boolean when this is a boolean.
-    pub const fn as_bool(&self) -> Option<bool> {
-        match self {
+    pub fn as_bool(&self) -> Option<bool> {
+        match self.as_payload() {
             Self::Bool(value) => Some(*value),
             _ => None,
         }
     }
 
     /// Return a signed integer when it fits `i128`.
-    pub const fn as_i128(&self) -> Option<i128> {
-        match self {
+    pub fn as_i128(&self) -> Option<i128> {
+        match self.as_payload() {
             Self::I64(value) => Some(*value as i128),
             Self::I128(value) => Some(*value),
             Self::U64(value) => Some(*value as i128),
@@ -532,8 +566,8 @@ impl Value {
     }
 
     /// Return an unsigned integer when it fits `u128`.
-    pub const fn as_u128(&self) -> Option<u128> {
-        match self {
+    pub fn as_u128(&self) -> Option<u128> {
+        match self.as_payload() {
             Self::I64(value) if *value >= 0 => Some(*value as u128),
             Self::U64(value) => Some(*value as u128),
             Self::I128(value) if *value >= 0 => Some(*value as u128),
@@ -543,8 +577,8 @@ impl Value {
     }
 
     /// Return a floating-point value when this is a float.
-    pub const fn as_f64(&self) -> Option<f64> {
-        match self {
+    pub fn as_f64(&self) -> Option<f64> {
+        match self.as_payload() {
             Self::Float(value) => Some(value.as_f64()),
             _ => None,
         }
@@ -552,7 +586,7 @@ impl Value {
 
     /// Return a string slice when this is a string.
     pub fn as_str(&self) -> Option<&str> {
-        match self {
+        match self.as_payload() {
             Self::String(value) => Some(value.as_str()),
             _ => None,
         }
@@ -560,7 +594,7 @@ impl Value {
 
     /// Return bytes when this is a byte value.
     pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
+        match self.as_payload() {
             Self::Bytes(value) => Some(value),
             _ => None,
         }
@@ -568,7 +602,7 @@ impl Value {
 
     /// Return sequence children without allocating.
     pub fn as_sequence(&self) -> Option<&[Self]> {
-        match self {
+        match self.as_payload() {
             Self::Sequence(values) => Some(values),
             _ => None,
         }
@@ -576,7 +610,7 @@ impl Value {
 
     /// Return mapping entries without allocating.
     pub fn as_mapping(&self) -> Option<&[(Self, Self)]> {
-        match self {
+        match self.as_payload() {
             Self::Mapping(entries) => Some(entries),
             _ => None,
         }
@@ -610,6 +644,9 @@ impl Value {
     }
 
     /// Look up a string mapping key without constructing a temporary value.
+    ///
+    /// A key that carries its datatype is found by the text it holds, because
+    /// that is the key it compares equal to.
     pub fn get_key_str(&self, key: &str) -> Option<&Self> {
         self.as_mapping()?
             .iter()
@@ -636,12 +673,20 @@ impl Value {
     }
 
     /// Return whether this is the null value.
-    pub const fn is_null(&self) -> bool {
-        matches!(self, Self::Null)
+    ///
+    /// A datatype pairing is null exactly when the value it holds is absent,
+    /// so a caller asking whether a value is missing never has to know whether
+    /// the null carries a datatype.
+    pub fn is_null(&self) -> bool {
+        match self {
+            Self::Null => true,
+            Self::Option(typed) => typed.is_absent(),
+            _ => false,
+        }
     }
 
     /// Return whether this value holds other values.
-    pub const fn is_container(&self) -> bool {
+    pub fn is_container(&self) -> bool {
         matches!(self, Self::Sequence(_) | Self::Mapping(_))
     }
 
@@ -662,7 +707,7 @@ impl Value {
     ///
     /// A wider integer that does not fit returns `None` rather than wrapping,
     /// so a caller never silently loses magnitude.
-    pub const fn as_i64(&self) -> Option<i64> {
+    pub fn as_i64(&self) -> Option<i64> {
         match self.as_i128() {
             Some(value) if value >= i64::MIN as i128 && value <= i64::MAX as i128 => {
                 Some(value as i64)
@@ -672,7 +717,7 @@ impl Value {
     }
 
     /// Read this value as a `u64`, when it fits.
-    pub const fn as_u64(&self) -> Option<u64> {
+    pub fn as_u64(&self) -> Option<u64> {
         match self.as_u128() {
             Some(value) if value <= u64::MAX as u128 => Some(value as u64),
             _ => None,

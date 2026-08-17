@@ -1,7 +1,8 @@
 use base64::Engine as _;
+use smol_str::{SmolStr, format_smolstr};
 
 use super::{Limits, Value};
-use crate::{Error, Result, TimeUnit};
+use crate::{DataType, Error, Result, TimeUnit};
 
 pub(crate) const JSON_MARKER: &str = "$yggdryl";
 const YAML_MAPPING: &str = "yggdryl/map";
@@ -203,6 +204,7 @@ fn is_envelope_kind(kind: &str) -> bool {
             | "timestamp"
             | "duration"
             | "mapping"
+            | "option"
     )
 }
 
@@ -386,6 +388,41 @@ fn decode_mapping_entries(
     Value::from_mapping(decoded)
 }
 
+/// Decode the datatype and the value a pairing envelope carries.
+///
+/// The datatype arrives as its canonical spelling, so it is read back by the
+/// one recursive schema grammar rather than by a second parser here. The value
+/// is decoded as any other payload is, and the pairing is rebuilt through the
+/// constructor that validates the two against each other - a document claiming
+/// a value its datatype does not accept fails here rather than downstream.
+fn decode_option(value: &RawValue, depth: usize, state: &mut DecodeState) -> Result<Value> {
+    let Some([name, payload]) = raw_sequence(value) else {
+        return Err(codec_error(
+            state.format,
+            "option envelope value must be a datatype and a value",
+        ));
+    };
+    let Some(name) = raw_string(name) else {
+        return Err(codec_error(
+            state.format,
+            "option envelope datatype must be text",
+        ));
+    };
+    let data_type = DataType::from_str(name).map_err(|error| {
+        codec_reason(
+            state.format,
+            format_smolstr!("option envelope datatype is not a datatype: {error}"),
+        )
+    })?;
+    let payload = decode(
+        clone_raw(payload).ok_or_else(|| codec_error(state.format, "invalid option value"))?,
+        depth + 1,
+        state,
+    )?;
+    Value::optional(data_type, payload)
+        .map_err(|error| codec_reason(state.format, format_smolstr!("{error}")))
+}
+
 fn decode_yaml_envelope(
     fields: &[(RawValue, RawValue)],
     depth: usize,
@@ -427,6 +464,7 @@ fn decode_envelope_payload(
         "date" => parse_date(value, state.format),
         "time" | "timestamp" | "duration" => parse_temporal(kind, value, state.format),
         "mapping" => decode_mapping_entries(value, depth, state),
+        "option" => decode_option(value, depth, state),
         _ => unreachable!("recognized Yggdryl envelope kind"),
     }
 }
@@ -535,5 +573,14 @@ pub(super) fn codec_error(format: &'static str, reason: &'static str) -> Error {
         format,
         position: 0,
         reason: reason.into(),
+    }
+}
+
+/// Report a failure whose text is built from what the document actually held.
+fn codec_reason(format: &'static str, reason: SmolStr) -> Error {
+    Error::Codec {
+        format,
+        position: 0,
+        reason,
     }
 }

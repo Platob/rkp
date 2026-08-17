@@ -406,6 +406,15 @@ fn write_inline<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
             write!(writer, "{days}")?;
             writer.write_all(b"}")?;
         }
+        // The datatype travels as its canonical spelling, which is what
+        // `DataType::from_str` reads back, so the pairing survives the trip.
+        Value::Option(typed) => {
+            writer.write_all(b"{\"$yggdryl\": \"option\", \"value\": [")?;
+            write_quoted(writer, &typed.data_type().to_string())?;
+            writer.write_all(b", ")?;
+            write_inline_recursive(writer, typed.value())?;
+            writer.write_all(b"]}")?;
+        }
         Value::Time(count, unit) => write_temporal(writer, "time", *count, *unit, None)?,
         Value::Duration(count, unit) => write_temporal(writer, "duration", *count, *unit, None)?,
         Value::Timestamp(count, unit, zone) => {

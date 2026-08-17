@@ -62,6 +62,10 @@ pub(crate) fn from_py(value: &Bound<'_, PyAny>) -> PyResult<Value> {
 /// equality.
 pub(crate) fn as_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     match value {
+        // A pairing is a value plus the datatype it belongs to, and Python's
+        // datatype surface is `DataType`, not the object a value converts to.
+        // The view is therefore the value it holds: `None` for an absent one.
+        Value::Option(typed) => as_py(py, typed.value()),
         Value::Null => Ok(py.None()),
         Value::Bool(value) => Ok(value.into_pyobject(py)?.to_owned().into_any().unbind()),
         Value::I64(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),

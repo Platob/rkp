@@ -578,3 +578,65 @@ fn custom_depth_limits_replace_serde_jsons_default_recursion_cap() {
     .unwrap_err();
     assert!(error.to_string().contains("parser hard limit of 384"));
 }
+
+#[test]
+fn a_datatype_pairing_survives_the_wire_with_the_datatype_it_declares() {
+    let value = Value::from_mapping([
+        (
+            Value::from("price"),
+            Value::absent(yggdryl::DataType::Decimal128 {
+                precision: 9,
+                scale: 3,
+            }),
+        ),
+        (
+            Value::from("quantity"),
+            Value::optional(yggdryl::DataType::Int64, Value::from(7_i64)).unwrap(),
+        ),
+    ])
+    .unwrap();
+
+    let encoded = json::to_vec(&value).unwrap();
+    let text = std::str::from_utf8(&encoded).unwrap();
+    assert!(
+        text.contains(r#""type":"option""#) && text.contains(r#""decimal128(9,3)""#),
+        "the datatype has to reach the wire: {text}"
+    );
+
+    // The pairing comes back whole: the datatype is read by the one schema
+    // grammar and the value is validated against it again on the way in.
+    let decoded = json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, value);
+    let price = decoded.get_key_str("price").unwrap();
+    assert!(price.is_null());
+    assert_eq!(
+        price.data_type().unwrap(),
+        yggdryl::DataType::Decimal128 {
+            precision: 9,
+            scale: 3
+        }
+    );
+    assert_eq!(decoded.get_key_str("quantity").unwrap().as_i64(), Some(7));
+}
+
+#[test]
+fn an_option_envelope_that_contradicts_itself_is_refused() {
+    // The datatype and the value are validated against each other while
+    // decoding, so a document cannot smuggle in a pairing that never held.
+    let source = r#"{"$yggdryl":{"version":1,"type":"option","value":["int64","seven"]}}"#;
+    let error = json::from_str(source).unwrap_err().to_string();
+    assert!(
+        error.contains("int64") && error.contains("string"),
+        "the failure must name both sides: {error}"
+    );
+
+    let source = r#"{"$yggdryl":{"version":1,"type":"option","value":["not a datatype",1]}}"#;
+    assert!(json::from_str(source).is_err());
+
+    // A mapping that merely looks like the envelope keeps its own meaning.
+    let escaped = Value::from_mapping([(Value::from("$yggdryl"), Value::from("option"))]).unwrap();
+    assert_eq!(
+        json::from_slice(&json::to_vec(&escaped).unwrap()).unwrap(),
+        escaped
+    );
+}

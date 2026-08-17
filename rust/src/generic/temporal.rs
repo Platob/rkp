@@ -73,7 +73,7 @@ impl Value {
 
     /// Read a timestamp as its count, unit, and zone name.
     pub fn as_timestamp(&self) -> Option<(i64, TimeUnit, Option<&str>)> {
-        match self {
+        match self.as_payload() {
             Self::Timestamp(count, unit, zone) => {
                 Some((*count, *unit, zone.as_ref().map(Timezone::as_str)))
             }
@@ -82,32 +82,32 @@ impl Value {
     }
 
     /// Read a timestamp as its count, unit, and validated zone.
-    pub const fn as_timestamp_in(&self) -> Option<(i64, TimeUnit, Option<&Timezone>)> {
-        match self {
+    pub fn as_timestamp_in(&self) -> Option<(i64, TimeUnit, Option<&Timezone>)> {
+        match self.as_payload() {
             Self::Timestamp(count, unit, zone) => Some((*count, *unit, zone.as_ref())),
             _ => None,
         }
     }
 
     /// Read a date as its day count since the Unix epoch.
-    pub const fn as_date(&self) -> Option<i32> {
-        match self {
+    pub fn as_date(&self) -> Option<i32> {
+        match self.as_payload() {
             Self::Date(days) => Some(*days),
             _ => None,
         }
     }
 
     /// Read a time of day as its count and unit.
-    pub const fn as_time(&self) -> Option<(i64, TimeUnit)> {
-        match self {
+    pub fn as_time(&self) -> Option<(i64, TimeUnit)> {
+        match self.as_payload() {
             Self::Time(count, unit) => Some((*count, *unit)),
             _ => None,
         }
     }
 
     /// Read a duration as its count and unit.
-    pub const fn as_duration(&self) -> Option<(i64, TimeUnit)> {
-        match self {
+    pub fn as_duration(&self) -> Option<(i64, TimeUnit)> {
+        match self.as_payload() {
             Self::Duration(count, unit) => Some((*count, *unit)),
             _ => None,
         }
@@ -120,7 +120,7 @@ impl Value {
     /// seconds would drop digits, so it answers `None` rather than truncating.
     /// A date carries no unit and answers `None`.
     pub fn temporal_count_at(&self, unit: TimeUnit) -> Option<i64> {
-        let (count, current) = match self {
+        let (count, current) = match self.as_payload() {
             Self::Timestamp(count, current, _)
             | Self::Time(count, current)
             | Self::Duration(count, current) => (*count, *current),
@@ -137,9 +137,9 @@ impl Value {
     }
 
     /// Return whether this value is any of the four temporals.
-    pub const fn is_temporal(&self) -> bool {
+    pub fn is_temporal(&self) -> bool {
         matches!(
-            self,
+            self.as_payload(),
             Self::Timestamp(..) | Self::Date(_) | Self::Time(..) | Self::Duration(..)
         )
     }

@@ -70,6 +70,27 @@ pub(crate) fn validate_row(root: &Field, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Validate one value against the datatype it claims, outside any row.
+///
+/// A [`crate::TypedValue`] is one value and one datatype with no field around
+/// them, so it validates through the same walk a column value takes and
+/// reports the same failures, rooted at the value itself.
+pub(crate) fn validate_data_type_value_for(data_type: &DataType, value: &Value) -> Result<()> {
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    validate_data_type_value(data_type, value, 0).map_err(|failure| {
+        let mut path = String::from("$");
+        for segment in failure.path {
+            push_path_segment(&mut path, segment);
+        }
+        Error::InvalidRecord {
+            path: SmolStr::from(path),
+            reason: failure.reason,
+        }
+    })
+}
+
 /// Rewrite one row value into the exact representation a root field declares.
 pub(crate) fn canonicalize_row(root: &Field, value: Value) -> Result<Value> {
     let Some(values) = value.as_sequence() else {
@@ -109,6 +130,13 @@ fn canonicalize_field_value(field: &Field, value: &Value) -> Result<(Value, bool
 }
 
 fn canonicalize_field_payload(field: &Field, value: &Value) -> Result<(Value, bool)> {
+    // The canonical row is the physical one the schema declares, and the
+    // schema is where the datatype lives, so a pairing canonicalizes to the
+    // value it holds rather than keeping a second copy of the column's type.
+    if let Some(typed) = value.as_option() {
+        let (canonical, _) = canonicalize_field_payload(field, typed.value())?;
+        return Ok((canonical, true));
+    }
     if matches!(value, Value::Null) {
         return Ok((Value::Null, false));
     }
@@ -410,6 +438,11 @@ fn duplicate_mapping_key_index(entries: &[(Value, Value)]) -> Option<usize> {
                 .any(|(key, _)| key == &entries[*index].0)
         });
     }
+    // `Value` now reaches a `Field` through a datatype pairing, and a field
+    // caches its Arrow projection behind a `OnceLock`. That cache is invisible
+    // to `Hash` and `Eq`, which is exactly the condition this lint asks a
+    // caller to confirm before using the type as a key.
+    #[allow(clippy::mutable_key_type)]
     let mut seen = HashSet::with_capacity(entries.len());
     entries
         .iter()
@@ -509,6 +542,18 @@ fn validate_field_payload_at_depth(
             "record nesting exceeds the hard limit of {}",
             DataType::PARSE_RECURSION_LIMIT
         )));
+    }
+    // A pairing states the datatype the field already declares, so the two
+    // have to agree before the value inside it is worth looking at.
+    if let Some(typed) = value.as_option() {
+        if typed.data_type() != field.data_type() {
+            return Err(ValidationFailure::new(format_smolstr!(
+                "expected a value of {}, got a value declared as {}",
+                crate::text::elide_display(field.data_type()),
+                crate::text::elide_display(typed.data_type()),
+            )));
+        }
+        return validate_field_payload_at_depth(field, typed.value(), depth);
     }
     if value_is_logically_null(field.data_type(), value) && !field.is_nullable() {
         return Err(ValidationFailure::new("non-nullable field received null"));

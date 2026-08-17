@@ -114,11 +114,21 @@ impl Value {
                 let (value, _) = agreed(values, "mapping value", depth)?;
                 DataType::map_of(key, value, false)
             }
+            // The pairing was built to carry this answer, so reading it is the
+            // whole inference: an absent value names the datatype it is
+            // missing from rather than `null`.
+            Self::Option(typed) => Ok(typed.data_type().clone()),
         }
     }
 }
 
 /// Return the one datatype every non-null value names, and whether any was null.
+///
+/// A value that carries its own datatype answers both halves at once: it names
+/// the datatype even while absent, and declaring itself optional is what makes
+/// the field nullable. That is the difference between a column of typed nulls,
+/// which keeps its datatype, and a column of bare nulls, which has none to
+/// keep.
 fn agreed<'a>(
     values: impl IntoIterator<Item = &'a Value>,
     role: &'static str,
@@ -127,6 +137,18 @@ fn agreed<'a>(
     let mut agreed: Option<DataType> = None;
     let mut nullable = false;
     for value in values {
+        if let Some(typed) = value.as_option() {
+            nullable = true;
+            let data_type = typed.data_type().clone();
+            match &agreed {
+                Some(existing) if existing != &data_type => {
+                    return Err(disagreement(role, existing, &data_type));
+                }
+                Some(_) => {}
+                None => agreed = Some(data_type),
+            }
+            continue;
+        }
         if value.is_null() {
             nullable = true;
             continue;
@@ -134,11 +156,7 @@ fn agreed<'a>(
         let data_type = value.data_type_at(depth + 1)?;
         match &agreed {
             Some(existing) if existing != &data_type => {
-                return Err(unnameable(format_smolstr!(
-                    "every {role} must name one datatype, got {} and {}",
-                    crate::text::elide_display(existing),
-                    crate::text::elide_display(&data_type),
-                )));
+                return Err(disagreement(role, existing, &data_type));
             }
             Some(_) => {}
             None => agreed = Some(data_type),
@@ -146,6 +164,15 @@ fn agreed<'a>(
     }
     // Nothing but nulls names the null type, which is a real Arrow column.
     Ok(agreed.map_or((DataType::Null, true), |data_type| (data_type, nullable)))
+}
+
+/// Build the failure raised when two values in one role name two datatypes.
+fn disagreement(role: &'static str, expected: &DataType, actual: &DataType) -> Error {
+    unnameable(format_smolstr!(
+        "every {role} must name one datatype, got {} and {}",
+        crate::text::elide_display(expected),
+        crate::text::elide_display(actual),
+    ))
 }
 
 /// Return the exact decimal a coefficient and scale name.

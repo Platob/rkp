@@ -362,6 +362,73 @@ YAML, `!yggdryl/bytes` and its siblings still select the kind they name, and eve
 as the annotation YAML defines it to be. Nothing on the write path emits a tag in any format, so no
 round trip through this crate produces one.
 
+## An absent value that still names its column
+
+!!! note "Rust only"
+    `TypedValue` is a core value the bindings do not project yet: their
+    datatype surface is `DataType`, so a pairing arrives in Python and
+    JavaScript as the value it holds.
+
+```rust
+use yggdryl::{DataType, TypedValue, Value, json};
+
+// `Value::data_type` reads a datatype off a value because every variant
+// carries the parts its datatype needs. A null is the exception: it names
+// `null` and nothing else, so an absent price and an absent timestamp are the
+// same value and neither says what is missing.
+assert_eq!(Value::Null.data_type()?, DataType::Null);
+
+// A pairing puts the answer back. The value is validated against the datatype,
+// so a pairing that exists is one that holds.
+let price = Value::absent(DataType::Decimal128 { precision: 9, scale: 3 });
+assert!(price.is_null());
+assert_eq!(
+    price.data_type()?,
+    DataType::Decimal128 { precision: 9, scale: 3 }
+);
+assert!(TypedValue::from_parts(DataType::Int64, Value::from("seven")).is_err());
+
+// It travels: the datatype goes out as its canonical spelling and is read back
+// by the same grammar that parses a schema.
+let encoded = json::to_vec(&price)?;
+assert_eq!(json::from_slice(&encoded)?.data_type()?, price.data_type()?);
+```
+
+A column of nulls is the case this exists for. Inference reads the one datatype every value in a
+sequence names, and a null agrees with all of them, so a column of bare nulls is a column of
+`null` - the right answer to the wrong question, because the caller knew the datatype and had
+nowhere to put it. A column of typed nulls is a column of that datatype, and one typed null among
+real values leaves the datatype alone and only marks the field nullable:
+
+```rust
+use yggdryl::{DataType, Field, Value};
+
+let column = Value::from_sequence([
+    Value::from(1_i64),
+    Value::absent(DataType::Int64),
+]);
+assert_eq!(
+    column.data_type()?,
+    DataType::list(Field::new("item", DataType::Int64, true))
+);
+
+// Declaring a value optional is a statement about the column, so a pairing
+// makes the field nullable whether or not this row is missing.
+let present = Value::from_sequence([Value::optional(DataType::Int64, Value::from(1_i64))?]);
+assert_eq!(
+    present.data_type()?,
+    DataType::list(Field::new("item", DataType::Int64, true))
+);
+```
+
+The pairing is a value, not a second schema. It compares, orders, and hashes as the value it holds -
+an absent `int64` equals a bare null - so a row that carries datatypes still compares against one
+that does not, and every reader that only wants the payload gets it from `as_str`, `as_i64`, and
+their siblings without knowing a pairing was there. Where a schema already exists the pairing has
+nothing to add and is not kept: a field validates it by checking the two datatypes agree and then
+validating the value it holds, and canonicalizing a row against that field leaves the plain value
+behind.
+
 ## Four formats, one surface
 
 === "Rust"

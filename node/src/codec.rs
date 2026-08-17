@@ -1297,6 +1297,10 @@ fn value_to_transport(value: &Value, depth: usize, max_depth: usize) -> Result<J
         )));
     }
     match value {
+        // A pairing is a value plus the datatype it belongs to, and the
+        // JavaScript datatype surface is `DataType`, not the transport a value
+        // converts to. The view is the value it holds: `null` for an absent one.
+        Value::Option(typed) => value_to_transport(typed.value(), depth, max_depth),
         Value::Null => Ok(JsonValue::Null),
         Value::Bool(value) => Ok(JsonValue::Bool(*value)),
         Value::I64(value) => integer_transport(i128::from(*value)),

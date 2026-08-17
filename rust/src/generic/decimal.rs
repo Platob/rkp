@@ -36,16 +36,16 @@ impl Value {
     }
 
     /// Return the unscaled integer and scale when this is an exact decimal.
-    pub const fn as_decimal(&self) -> Option<(i128, i8)> {
-        match self {
+    pub fn as_decimal(&self) -> Option<(i128, i8)> {
+        match self.as_payload() {
             Self::Decimal(unscaled, scale) => Some((*unscaled, *scale)),
             _ => None,
         }
     }
 
     /// Return whether this value is an exact decimal.
-    pub const fn is_decimal(&self) -> bool {
-        matches!(self, Self::Decimal(..))
+    pub fn is_decimal(&self) -> bool {
+        matches!(self.as_payload(), Self::Decimal(..))
     }
 
     /// Return this decimal's unscaled integer at `scale`, when it is exact.

@@ -11,6 +11,7 @@ mod limits;
 pub(crate) mod position;
 pub(crate) mod wire;
 
+pub use crate::generic::TypedValue;
 pub use crate::generic::value::{Children, Float, Value};
 pub use codec::{Json, Jsonl, Limited, TextCodec, Toml, Yaml};
 pub(crate) use display::{elide_display, elide_to, expected_got, stable_hash_display};
@@ -362,6 +363,9 @@ pub(crate) fn check_encode_depth(value: &Value, format: &'static str) -> Result<
                     visit(value, child_depth, maximum, format)?;
                 }
             }
+            // A pairing holds one value inside its envelope, so its payload
+            // sits one level deeper on the wire and is counted as one.
+            Value::Option(typed) => visit(typed.value(), child_depth, maximum, format)?,
             // Spelled out rather than left to a wildcard: a value that holds
             // other values and is not named here would escape the depth limit
             // silently, so a new variant has to be classified to compile.

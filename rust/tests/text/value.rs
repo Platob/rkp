@@ -1,6 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use yggdryl::{TimeUnit, Value};
+use yggdryl::{DataType, TimeUnit, Value};
 
 /// One value of every kind, in the order [`Value`]'s total ordering puts them.
 ///
@@ -17,6 +17,9 @@ fn one_of_every_kind() -> Vec<Value> {
         Value::from(1.5),
         Value::decimal(-1_050, 2),
         Value::from("AAPL"),
+        // A pairing sorts with the value it holds rather than with the other
+        // pairings, so it belongs among the strings when it carries one.
+        Value::optional(DataType::Utf8, Value::from("MSFT")).unwrap(),
         Value::from(b"\x00\xff".as_slice()),
         Value::date(19_723),
         Value::time(45_296_000_000, TimeUnit::Microsecond),
@@ -54,7 +57,8 @@ fn every_kind_has_its_own_place_in_the_total_ordering() {
 
     // Kinds arrive in runs rather than interleaved, so a value of one kind
     // never sorts between two of another. The four integer widths are the
-    // deliberate exception: they are one number line spelled four ways.
+    // deliberate exception: they are one number line spelled four ways, as is
+    // a datatype pairing, which sorts as the value it holds.
     let mut kinds = values.iter().map(Value::kind).collect::<Vec<_>>();
     kinds.dedup();
     assert_eq!(
@@ -62,6 +66,31 @@ fn every_kind_has_its_own_place_in_the_total_ordering() {
         values.len() - 1,
         "only the zoned and naive timestamps share a kind: {kinds:?}"
     );
+}
+
+#[test]
+fn a_datatype_pairing_is_the_value_it_holds() {
+    fn hash(value: &Value) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    // Absence is absence whether or not it names a datatype, so a row that
+    // carries datatypes still compares against one that does not.
+    let absent = Value::absent(DataType::Int64);
+    assert_eq!(absent, Value::Null);
+    assert_eq!(hash(&absent), hash(&Value::Null));
+    assert!(absent.is_null());
+
+    let present = Value::optional(DataType::Int64, Value::from(7_i64)).unwrap();
+    assert_eq!(present, Value::from(7_i64));
+    assert_eq!(hash(&present), hash(&Value::from(7_i64)));
+    assert_eq!(present.as_i64(), Some(7));
+
+    // The datatype is what the pairing adds, and it survives being read back.
+    assert_eq!(present.data_type().unwrap(), DataType::Int64);
+    assert_eq!(absent.data_type().unwrap(), DataType::Int64);
 }
 
 #[test]

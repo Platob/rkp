@@ -5,7 +5,7 @@ use serde::ser::{SerializeMap, SerializeSeq, SerializeTuple};
 use serde::{Serialize, Serializer};
 
 use crate::text::wire::JSON_MARKER;
-use crate::{TimeUnit, Timezone, Value};
+use crate::{DataType, TimeUnit, Timezone, TypedValue, Value};
 
 const WIRE_VERSION: u64 = 1;
 
@@ -58,6 +58,7 @@ impl Serialize for JsonRef<'_> {
                 mapping.end()
             }
             Value::Mapping(entries) => JsonEnvelopeRef::Mapping(entries).serialize(serializer),
+            Value::Option(typed) => JsonEnvelopeRef::Option(typed).serialize(serializer),
         }
     }
 }
@@ -80,6 +81,7 @@ enum JsonEnvelopeRef<'a> {
     Timestamp(i64, TimeUnit, Option<&'a Timezone>),
     Duration(i64, TimeUnit),
     Mapping(&'a [(Value, Value)]),
+    Option(&'a TypedValue),
 }
 
 impl Serialize for JsonEnvelopeRef<'_> {
@@ -114,6 +116,7 @@ impl Serialize for JsonEnvelopeBody<'_> {
             JsonEnvelopeRef::Timestamp(..) => "timestamp",
             JsonEnvelopeRef::Duration(..) => "duration",
             JsonEnvelopeRef::Mapping(_) => "mapping",
+            JsonEnvelopeRef::Option(_) => "option",
         };
         mapping.serialize_entry("type", kind)?;
         match self.0 {
@@ -155,8 +158,40 @@ impl Serialize for JsonEnvelopeBody<'_> {
             JsonEnvelopeRef::Mapping(entries) => {
                 mapping.serialize_entry("value", &EntriesRef(entries))?;
             }
+            // The datatype travels as its canonical spelling, which is what
+            // `DataType::from_str` reads back, so the pairing survives the
+            // trip through a format that has no datatypes of its own.
+            JsonEnvelopeRef::Option(typed) => {
+                mapping.serialize_entry("value", &OptionRef(typed))?;
+            }
         }
         mapping.end()
+    }
+}
+
+struct OptionRef<'a>(&'a TypedValue);
+
+impl Serialize for OptionRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut pair = serializer.serialize_tuple(2)?;
+        pair.serialize_element(&DisplayRef(self.0.data_type()))?;
+        pair.serialize_element(&JsonRef(self.0.value()))?;
+        pair.end()
+    }
+}
+
+/// Serialize a canonical `Display` without building the `String` first.
+struct DisplayRef<'a>(&'a DataType);
+
+impl Serialize for DisplayRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self.0)
     }
 }
 
