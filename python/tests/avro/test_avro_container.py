@@ -116,6 +116,66 @@ def test_random_reads_reuse_one_decoded_block() -> None:
     assert container.nbytes == warm
 
 
+def test_a_path_container_maps_the_file_instead_of_reading_it(
+    tmp_path: Path,
+) -> None:
+    """Opening a path must cost pages touched, not the size of the file."""
+
+    destination = tmp_path / "rows.avro"
+    wide = [{"identifier": index, "label": "x" * 200} for index in range(4000)]
+    write_container(destination, SCHEMA, wide, sync_interval=4096)
+    size = destination.stat().st_size
+
+    container = Avro(destination, mode="r")
+
+    assert size > 400_000
+    # A buffer container holds the whole image; a mapped one holds its index.
+    assert container.nbytes < size // 4
+    assert container[0] == wide[0]
+    assert container[3999] == wide[3999]
+    assert len(container) == len(wide)
+
+
+def test_appending_to_a_path_never_reads_the_file_it_appends_to(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "rows.avro"
+    write_container(destination, SCHEMA, ROWS, sync_marker=SYNC, sync_interval=16)
+    original = destination.read_bytes()
+
+    with Avro(destination, mode="a") as container:
+        container.append({"identifier": 99, "label": "appended"})
+        # Nothing of the mapped file has been copied into memory.
+        assert container.nbytes < len(original)
+
+    grown = destination.read_bytes()
+    assert grown.startswith(original)
+    assert list(read_container(destination))[-1] == {
+        "identifier": 99,
+        "label": "appended",
+    }
+
+
+def test_a_missing_or_unreadable_path_keeps_its_os_error(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        read_container(tmp_path / "absent.avro")
+    with pytest.raises(IsADirectoryError):
+        read_container(tmp_path)
+
+
+def test_rewriting_a_mapped_container_replaces_the_file(tmp_path: Path) -> None:
+    """A rewrite must let the map go before renaming over the file."""
+
+    destination = tmp_path / "rows.avro"
+    write_container(destination, SCHEMA, ROWS, sync_marker=SYNC, sync_interval=16)
+
+    with Avro(destination, mode="r+") as container:
+        container[0] = {"identifier": 0, "label": "rewritten"}
+
+    assert read_container(destination)[0] == {"identifier": 0, "label": "rewritten"}
+    assert [item.name for item in tmp_path.iterdir()] == ["rows.avro"]
+
+
 def test_a_small_cache_budget_still_returns_every_record() -> None:
     payload = _written(codec="deflate", sync_interval=1)
 

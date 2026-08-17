@@ -9,6 +9,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::binary::{Reader, decode_node, encode_node, write_long};
 use crate::error::{self, Result};
+use crate::image::Image;
 use crate::schema::Schema;
 use crate::value::Value;
 
@@ -66,7 +67,7 @@ pub struct Container {
     metadata: Vec<(String, Vec<u8>)>,
     sync_marker: [u8; SYNC_SIZE],
     sync_interval: usize,
-    data: Vec<u8>,
+    data: Image,
     body: usize,
     offsets: Vec<usize>,
     data_offsets: Vec<usize>,
@@ -128,7 +129,7 @@ impl Container {
             metadata: entries,
             sync_marker,
             sync_interval,
-            data,
+            data: Image::Owned(data),
             body,
             offsets: Vec::new(),
             data_offsets: Vec::new(),
@@ -150,10 +151,35 @@ impl Container {
 
     /// Open an existing container image and index its blocks.
     pub fn open(data: Vec<u8>, sync_interval: usize, cache_budget: usize) -> Result<Container> {
-        if data.len() < MAGIC.len() || data[..MAGIC.len()] != MAGIC {
+        Container::open_image(Image::Owned(data), sync_interval, cache_budget)
+    }
+
+    /// Open a container file by mapping it rather than reading it.
+    ///
+    /// Residency becomes the pages the container actually touches, so an
+    /// append reaches the header alone and an indexed read reaches the block
+    /// framing plus one payload.  See [`Image::map`] for what mapping assumes
+    /// about concurrent writers.
+    pub fn open_path(
+        path: &std::path::Path,
+        sync_interval: usize,
+        cache_budget: usize,
+    ) -> Result<Container> {
+        let image =
+            Image::map(path).map_err(|error| crate::error::Error::Container(error.to_string()))?;
+        Container::open_image(image, sync_interval, cache_budget)
+    }
+
+    /// Open an existing container from any image.
+    pub fn open_image(data: Image, sync_interval: usize, cache_budget: usize) -> Result<Container> {
+        let view = match data.contiguous() {
+            Some(view) => view,
+            None => return error::container("cannot open a container mid-append"),
+        };
+        if view.len() < MAGIC.len() || view[..MAGIC.len()] != MAGIC {
             return error::decode("missing Avro object container magic bytes");
         }
-        let mut reader = Reader::whole(&data);
+        let mut reader = Reader::whole(view);
         reader.seek(MAGIC.len());
         let metadata = read_metadata(&mut reader)?;
         let marker = reader.read_bytes(SYNC_SIZE)?;
@@ -262,8 +288,49 @@ impl Container {
     }
 
     /// Return the resident size of the image, index, and payload cache.
+    ///
+    /// A mapped image costs address space rather than memory, so it counts
+    /// only what the container itself allocated: the blocks framed since the
+    /// map, the staged bytes, the payload cache, and the index.
     pub fn nbytes(&self) -> usize {
-        self.data.len() + self.staged.len() + self.cache_bytes + 32 * self.counts.len()
+        self.data.resident() + self.staged.len() + self.cache_bytes + 32 * self.counts.len()
+    }
+
+    /// Return whether this container reads from a mapped file.
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.data, Image::Mapped { .. })
+    }
+
+    /// Copy a mapped image into owned memory and let go of the file.
+    ///
+    /// A host about to replace the file it mapped must call this first.  On
+    /// Windows a mapped file cannot be renamed over at all, and everywhere
+    /// else the map would silently keep serving the replaced inode.
+    pub fn detach(&mut self) {
+        self.data.detach();
+    }
+
+    /// Return the bytes framed after a given durable length, without
+    /// materializing the image.
+    ///
+    /// A host appending to a file writes exactly this and nothing else, so an
+    /// append never has to read the file it appends to.
+    pub fn tail(&mut self, persisted: usize) -> Result<&[u8]> {
+        if !self.staged_values.is_empty() {
+            self.frame_staged()?;
+        }
+        if persisted > self.data.len() {
+            return error::container("the durable container is longer than its image");
+        }
+        // A range that straddles the mapped/tail seam is describable by no
+        // single slice, so collapse the image first in that one case.
+        if self.data.tail_from(persisted).is_none() {
+            self.data.bytes();
+        }
+        match self.data.tail_from(persisted) {
+            Some(tail) => Ok(tail),
+            None => error::container("the container tail is not addressable"),
+        }
     }
 
     /// Return every block's framing.
@@ -450,12 +517,13 @@ impl Container {
     /// Return the materialized image, applying every pending change.
     pub fn image(&mut self) -> Result<&[u8]> {
         self.materialize()?;
-        Ok(&self.data)
+        Ok(self.data.bytes())
     }
 
-    /// Return the image without materializing pending changes.
-    pub fn image_unchecked(&self) -> &[u8] {
-        &self.data
+    /// Return the image without materializing pending changes, when the
+    /// bytes already form one slice.
+    pub fn image_unchecked(&self) -> Option<&[u8]> {
+        self.data.contiguous()
     }
 
     /// Return how many bytes are already framed in the image.
@@ -526,8 +594,14 @@ impl Container {
         let mut position = self.body;
         let mut total = 0usize;
         let limit = self.data.len();
+        // Indexing only ever runs at open time, before anything has been
+        // framed, so the image is still one slice.
+        let view = match self.data.contiguous() {
+            Some(view) => view,
+            None => return error::container("cannot index a container mid-append"),
+        };
         while position < limit {
-            let mut reader = Reader::new(&self.data, position, limit);
+            let mut reader = Reader::new(view, position, limit);
             let count = reader.read_long()?;
             let size = reader.read_long()?;
             if count < 0 || size < 0 {
@@ -544,7 +618,7 @@ impl Container {
                      {total} records are intact"
                 ));
             }
-            if self.data[end - SYNC_SIZE..end] != sync {
+            if view[end - SYNC_SIZE..end] != sync {
                 return error::decode(format!(
                     "Avro container block sync marker mismatch at byte {}",
                     end - SYNC_SIZE
@@ -568,7 +642,10 @@ impl Container {
     fn decode_block(&self, ordinal: usize) -> Result<(Vec<u8>, Vec<usize>)> {
         let data_offset = self.data_offsets[ordinal];
         let size = self.sizes[ordinal];
-        let payload = decompress(&self.codec, &self.data[data_offset..data_offset + size])?;
+        let payload = decompress(
+            &self.codec,
+            self.data.slice(data_offset, data_offset + size),
+        )?;
         let count = self.counts[ordinal];
         let mut starts = Vec::with_capacity(count);
         let mut reader = Reader::whole(&payload);
@@ -667,11 +744,15 @@ impl Container {
         }
         let payload = compress(&self.codec, &self.staged)?;
         let offset = self.data.len();
-        write_long(self.staged_values.len() as i64, &mut self.data);
-        write_long(payload.len() as i64, &mut self.data);
-        let data_offset = self.data.len();
-        self.data.extend_from_slice(&payload);
-        self.data.extend_from_slice(&self.sync_marker);
+        // Frame into a scratch buffer so a mapped image only ever grows by
+        // whole blocks appended to its tail.
+        let mut frame = Vec::with_capacity(payload.len() + SYNC_SIZE + 16);
+        write_long(self.staged_values.len() as i64, &mut frame);
+        write_long(payload.len() as i64, &mut frame);
+        let data_offset = offset + frame.len();
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&self.sync_marker);
+        self.data.extend(&frame);
         self.offsets.push(offset);
         self.data_offsets.push(data_offset);
         self.sizes.push(payload.len());
@@ -725,7 +806,7 @@ impl Container {
 
         let rewrite_from = self.offsets[floor];
         let mut image = Vec::with_capacity(self.data.len());
-        image.extend_from_slice(&self.data[..rewrite_from]);
+        self.data.copy_range(0, rewrite_from, &mut image);
         let mut offsets: Vec<usize> = self.offsets[..floor].to_vec();
         let mut data_offsets: Vec<usize> = self.data_offsets[..floor].to_vec();
         let mut sizes: Vec<usize> = self.sizes[..floor].to_vec();
@@ -762,12 +843,12 @@ impl Container {
                 data_offsets.push(position + (self.data_offsets[ordinal] - start));
                 sizes.push(self.sizes[ordinal]);
                 counts.push(self.counts[ordinal]);
-                image.extend_from_slice(&self.data[start..end]);
+                self.data.copy_range(start, end, &mut image);
             }
         }
 
         self.stable = self.stable.min(rewrite_from);
-        self.data = image;
+        self.data = Image::Owned(image);
         self.offsets = offsets;
         self.data_offsets = data_offsets;
         self.sizes = sizes;

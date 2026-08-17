@@ -50,11 +50,6 @@ pub fn encode_error(message: impl Into<String>) -> PyErr {
     AvroEncodeError::new_err(message.into())
 }
 
-/// Raise a container error.
-pub fn container_error(message: impl Into<String>) -> PyErr {
-    AvroError::new_err(message.into())
-}
-
 /// Raise a plain value error, for host-side argument checks.
 pub fn value_error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())

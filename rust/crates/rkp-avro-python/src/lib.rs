@@ -15,7 +15,7 @@ use rkp_avro::schema::{Kind, Logical, Schema as CoreSchema};
 use rkp_avro::{Value, binary, json};
 
 use convert::{into_python, into_value, json_to_python, python_to_json};
-use errors::{container_error, to_py, value_error};
+use errors::{to_py, value_error};
 
 /// One record field, as the Python model sees it.
 #[pyclass(
@@ -289,6 +289,29 @@ impl PyContainer {
         Ok(PyContainer { inner, schema })
     }
 
+    /// Open a container file by mapping it rather than reading it.
+    #[staticmethod]
+    #[pyo3(signature = (path, sync_interval, cache_bytes))]
+    fn open_path(path: &str, sync_interval: usize, cache_bytes: usize) -> PyResult<PyContainer> {
+        // Map here rather than in the core so a filesystem failure keeps its
+        // errno and reaches Python as the OSError subclass it always was.
+        let image = rkp_avro::Image::map(std::path::Path::new(path))?;
+        let inner = Container::open_image(image, sync_interval, cache_bytes).map_err(to_py)?;
+        let schema = inner.schema().clone();
+        Ok(PyContainer { inner, schema })
+    }
+
+    /// Copy a mapped image into owned memory and release the file.
+    fn detach(&mut self) {
+        self.inner.detach();
+    }
+
+    /// Return whether this container reads from a mapped file.
+    #[getter]
+    fn is_mapped(&self) -> bool {
+        self.inner.is_mapped()
+    }
+
     /// Return the container's writer schema.
     fn schema(&self) -> PySchema {
         PySchema {
@@ -403,15 +426,13 @@ impl PyContainer {
         Ok(PyBytes::new(py, image))
     }
 
-    /// Return the bytes appended since the given durable length.
+    /// Return the bytes framed since the given durable length.
+    ///
+    /// A host appending to a file writes exactly this, so an append never
+    /// materializes the file it appends to.
     fn tail<'py>(&mut self, py: Python<'py>, persisted: usize) -> PyResult<Bound<'py, PyBytes>> {
-        let image = self.inner.image().map_err(to_py)?;
-        if persisted > image.len() {
-            return Err(container_error(
-                "the durable container is longer than its image",
-            ));
-        }
-        Ok(PyBytes::new(py, &image[persisted..]))
+        let tail = self.inner.tail(persisted).map_err(to_py)?;
+        Ok(PyBytes::new(py, tail))
     }
 
     /// Return whether changes are staged.

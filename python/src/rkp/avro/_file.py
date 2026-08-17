@@ -153,21 +153,26 @@ class Avro:
             if source is None:
                 raise ValueError("opening an Avro container requires a source")
             self._path, self._stream, self._origin = _resolve_source(source)
-            payload = _read(source)
-            if isinstance(payload, str):
-                payload = payload.encode("utf-8")
-            image = bytes(payload)
-            if (
-                not image.startswith(MAGIC)
-                and self._origin == "memory"
-                and isinstance(source, str)
-            ):
-                raise _avro.AvroDecodeError(
-                    "missing Avro object container magic bytes; a separator-free "
-                    "string is a buffer, not a path, so pass Path(...) for a file name"
+            if self._path is not None:
+                # Map the file rather than read it: residency becomes the pages
+                # the container actually touches, so appending to a large
+                # container reaches its header and nothing else.
+                self._core = _avro.Container.open_path(
+                    str(self._path), sync_interval, cache_bytes
                 )
-            self._core = _avro.Container.open(image, sync_interval, cache_bytes)
-            self._persisted = len(image)
+                self._persisted = self._core.framed_len
+            else:
+                payload = _read(source)
+                if isinstance(payload, str):
+                    payload = payload.encode("utf-8")
+                image = bytes(payload)
+                if not image.startswith(MAGIC) and isinstance(source, str):
+                    raise _avro.AvroDecodeError(
+                        "missing Avro object container magic bytes; a separator-free "
+                        "string is a buffer, not a path, so pass Path(...) for a file name"
+                    )
+                self._core = _avro.Container.open(image, sync_interval, cache_bytes)
+                self._persisted = len(image)
             if schema is not None and parse_schema(schema) != self.schema:
                 raise _avro.AvroDecodeError(
                     "the requested Avro schema does not match the container's "
@@ -499,18 +504,25 @@ class Avro:
             )
 
     def _persist(self) -> None:
-        image = self._core.image()
-        # The core reports how much of the image has not moved since the last
-        # write-out, so an append stays an append however the image was reached.
-        extends = 0 < self._persisted <= min(self._core.stable, len(image))
+        # Decide before materializing: on the append path the file being
+        # appended to is never read, and `image()` here would undo exactly
+        # that.  `stable` reports how much of the image has not moved since the
+        # last write-out, but a pending edit has not lowered it yet, so ask
+        # `needs_rewrite` whether materializing is about to.
+        extends = not self._core.needs_rewrite and 0 < self._persisted <= min(
+            self._core.stable, self._core.framed_len
+        )
         if self._origin == "memory":
-            pass
-        elif self._origin == "stream":
+            self._persisted = len(self._core.image())
+            self._core.mark_persisted()
+            return
+        if self._origin == "stream":
             stream = self._stream
             if extends:
                 stream.seek(self._persisted)
-                stream.write(image[self._persisted :])
+                stream.write(self._core.tail(self._persisted))
             else:
+                image = self._core.image()
                 stream.seek(0)
                 stream.write(image)
                 truncate = getattr(stream, "truncate", None)
@@ -522,15 +534,33 @@ class Avro:
         else:
             path = self._path
             assert path is not None
-            if extends and path.exists() and path.stat().st_size == self._persisted:
+            if extends and _size_of(path) == self._persisted:
                 # Nothing already durable moved, so only new frames are written.
                 with open(path, "r+b") as stream:
                     stream.seek(0, os.SEEK_END)
-                    stream.write(image[self._persisted :])
+                    stream.write(self._core.tail(self._persisted))
             else:
-                _atomic_write(path, image)
-        self._persisted = len(image)
+                # Replacing the file this container mapped: take the bytes into
+                # memory and let the map go first.  Windows refuses to rename
+                # over a mapped file at all, and elsewhere the map would keep
+                # serving the replaced inode.
+                self._core.detach()
+                _atomic_write(path, self._core.image())
+        self._persisted = self._core.framed_len
         self._core.mark_persisted()
+
+
+def _size_of(path: Path) -> int:
+    """Return a file's size, or -1 when it is not there.
+
+    One ``stat`` answers both questions the append fast path asks, where
+    ``exists()`` followed by ``stat()`` asked the filesystem twice.
+    """
+
+    try:
+        return path.stat().st_size
+    except OSError:
+        return -1
 
 
 def _block(info: Any) -> AvroBlock:

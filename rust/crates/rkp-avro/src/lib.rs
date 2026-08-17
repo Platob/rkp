@@ -19,12 +19,14 @@
 pub mod binary;
 pub mod container;
 pub mod error;
+pub mod image;
 pub mod json;
 pub mod schema;
 pub mod value;
 
 pub use container::{Block, Container};
 pub use error::{Error, Result};
+pub use image::Image;
 pub use schema::{Kind, Logical, Schema, rabin};
 pub use value::Value;
 

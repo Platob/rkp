@@ -12,3 +12,4 @@ serde_json.workspace = true
 flate2.workspace = true
 bzip2.workspace = true
 liblzma.workspace = true
+memmap2 = "0.9"
