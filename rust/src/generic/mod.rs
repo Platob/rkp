@@ -14,7 +14,8 @@
 //! its own objects to it. Its scalar behavior is split by what it describes -
 //! `value` for the shape and the ordering, `decimal` and `temporal` for the
 //! kinds that carry a scale or a unit, `inference` for the datatype a value
-//! already names.
+//! already names, and `typed` for one value paired with the datatype it
+//! belongs to.
 //! - [`Media`] names every record encoding bound to a handle.
 //! - [`RecordOptions`] names every encoding's read and write settings.
 //!
@@ -32,6 +33,7 @@ mod media;
 mod options;
 mod temporal;
 mod text;
+mod typed;
 pub mod value;
 
 pub use codec::Codec;
@@ -41,4 +43,5 @@ pub use media::Media;
 #[cfg(feature = "arrow")]
 pub use options::{IORecordOptions, RecordOptions};
 pub use text::Text;
+pub use typed::TypedValue;
 pub use value::{Children, Float, Value};

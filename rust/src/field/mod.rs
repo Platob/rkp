@@ -49,6 +49,7 @@ pub(crate) use diff::push_field_name_path;
 pub use diff::{Differences, OwnedDifferences};
 pub(crate) use diff::{data_types_equal, show_diff};
 pub use typed::{FieldType, TypedField, TypedFieldRef};
+pub(crate) use value::validate_data_type_value_for;
 
 /// A null-typed field.
 pub type NullField = TypedField<scalar::Null>;

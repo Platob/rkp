@@ -362,6 +362,43 @@ YAML, `!yggdryl/bytes` and its siblings still select the kind they name, and eve
 as the annotation YAML defines it to be. Nothing on the write path emits a tag in any format, so no
 round trip through this crate produces one.
 
+## One value against one datatype
+
+!!! note "Rust only"
+    `TypedValue` is a core value the bindings do not project yet.
+
+`Value::data_type` names the datatype a value already is, and a [`Field`](field.md) validates a whole
+row against a schema. `TypedValue` is the pair in between: one value and one datatype, checked
+against each other, for a caller holding a single value with no row and no schema around it.
+
+```rust
+use yggdryl::{DataType, TypedValue, Value};
+
+let price = TypedValue::from_parts(DataType::Int64, Value::from(7_i64))?;
+assert_eq!(price.data_type(), &DataType::Int64);
+assert_eq!(price.value(), &Value::I64(7));
+
+// The value is checked against the datatype, through the same walk a column
+// value takes, so a pairing that exists is one that holds.
+assert!(TypedValue::from_parts(DataType::Int64, Value::from("seven")).is_err());
+
+// A value can also name its own datatype.
+assert_eq!(
+    TypedValue::from_value(Value::from(1.5))?.data_type(),
+    &DataType::Float64
+);
+
+// A null is accepted by every datatype: nullability belongs to the field that
+// holds the column, not to the value in it.
+let missing = TypedValue::from_parts(DataType::Int64, Value::Null)?;
+assert!(missing.is_null());
+assert!(!price.is_null());
+```
+
+The last one is the rule the whole value model follows. A `Value` accepts a null wherever a value
+goes, and the schema beside it says whether that was allowed - which is why inference reports a
+column of nulls as `null` and a null among real values as the datatype of the others, made nullable.
+
 ## Four formats, one surface
 
 === "Rust"
