@@ -399,6 +399,45 @@ The last one is the rule the whole value model follows. A `Value` accepts a null
 goes, and the schema beside it says whether that was allowed - which is why inference reports a
 column of nulls as `null` and a null among real values as the datatype of the others, made nullable.
 
+## A typed value per datatype
+
+!!! note "Rust only"
+    The typed value markers are core values the bindings do not project yet.
+
+A pairing that has not been narrowed holds any datatype. A caller who knows which datatype is
+coming can say so in the type instead: `TypedValue<K>` takes the same compile-time markers a
+[`Field`](field.md) takes, and there is one alias per datatype.
+
+```rust
+use yggdryl::generic::{Int64Value, TimestampValue, Utf8Value};
+use yggdryl::{DataType, TimeUnit, TypedValue, Value};
+
+// A statically known datatype needs only its value.
+let price = Int64Value::new(Value::from(7_i64))?;
+assert_eq!(price.data_type(), &DataType::Int64);
+
+// The marker is checked, and so is the value against it.
+assert!(Int64Value::new(Value::from("seven")).is_err());
+assert!(Int64Value::try_from_parts(DataType::Utf8, Value::from("seven")).is_err());
+assert_eq!(Utf8Value::try_from_value(Value::from("AAPL"))?.value(), &Value::from("AAPL"));
+
+// A parameterized datatype keeps its parameters in the pairing, not the marker.
+let at = TimestampValue::try_from_parts(
+    DataType::Timestamp(TimeUnit::Microsecond, None),
+    Value::timestamp(0, TimeUnit::Microsecond, None)?,
+)?;
+assert_eq!(at.data_type(), &DataType::Timestamp(TimeUnit::Microsecond, None));
+
+// Narrowing and widening move the same two halves between markers.
+let dynamic: TypedValue = at.into_any();
+assert!(dynamic.try_into_typed::<yggdryl::field::binary::Utf8>().is_err());
+```
+
+The marker is zero-sized, so `Int64Value` is the same two words `TypedValue` is; it narrows what the
+type system will accept, not what the value costs. `AnyType` is the marker that accepts every
+datatype, and it is what a bare `TypedValue` carries - which is why `from_parts` and `from_value`
+stay the dynamic spellings and the narrowed ones are `try_from_parts` and `try_from_value`.
+
 ## Four formats, one surface
 
 === "Rust"

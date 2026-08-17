@@ -120,9 +120,14 @@ that compiles annotations into native values.
 - Keep protocol-specific metadata as inert string properties named
   `<scheme>:<property>`. Reuse `Scheme` for the prefix and one generic property
   API; do not add protocol execution, network clients, or duplicate
-  per-protocol maps to the core. The exact Arrow/Parquet compatibility key
-  `PARQUET:field_id` is the reserved exception: own it through Field's typed ID
-  API rather than normalizing it as a generic protocol property.
+  per-protocol maps to the core. A per-protocol *view* is not a duplicate map:
+  it remembers the prefix and reads out of the one shared snapshot, which is
+  what keeps a `scheme:name` key from being spelled by hand at a call site. The
+  exact Arrow/Parquet compatibility key `PARQUET:field_id` is the reserved
+  exception: own it through Field's typed ID API rather than normalizing it as
+  a generic protocol property. A module that carries state in its own namespace
+  - Iceberg's `iceberg:doc`, `iceberg:transform`, `iceberg:spec-id` - reaches it
+  through that view rather than through a private key constant.
 - Store HTTP representation metadata under canonical lowercase `http:*`
   property keys for both HTTP and HTTPS.
 
@@ -218,11 +223,20 @@ that compiles annotations into native values.
   is the authority on which columns are partition columns, because nothing in a
   batch says which of its columns belong in a path: a folder whose leaves spell
   out `column=value` partitions by those columns, and a folder whose leaves do
-  not is one table in one leaf. `io/partition.rs` moves those columns between the
+  not takes the layout from the declared schema, whose partition-marked fields
+  say it - and a folder that has neither is one table in one leaf. A declaration
+  that contradicts a stored layout is refused naming both, because one write
+  cannot mean two trees. `io/partition.rs` moves those columns between the
   path and the rows, typed as the schema declares, left alone when the data
   already carries them, and spelled `null` when a value is absent - which is the
   one thing a path cannot say for itself, so a declared nullable column is what
-  turns the text back into a null.
+  turns the text back into a null. A restored partition column carries the
+  marker, so a lake read back reports the layout it was stored in.
+- One renderer spells every partition value. `io::partition::partition_text`
+  renders one value the way `partition_values` renders a whole column - the
+  encoding's own display, `null` for the absence of one - so a table format
+  writing a directory name and a folder writing the same one cannot disagree
+  about how a date is spelled. Never add a second partition-text renderer.
 - Content coding belongs to the handle, not to the format. A handle named
   `trades.arrows.gz` round-trips compressed with no extra argument, because
   `IOBase::codec` recovers the coding from the media type. Parquet is the
@@ -280,9 +294,19 @@ that compiles annotations into native values.
   cannot come from a reader that has not been read.
 - **The manifest is the authority on a partition value; the path is layout.**
   An Iceberg table writes the same `column=value` directories `hive_partitions`
-  reads, and a scan must still take partition values from the manifest tuple: a
-  null value is spelled `null` in a path, and a path cannot say whether that is
-  the string or the absence.
+  reads - through the one renderer every partition value goes through, so a date
+  is `day=2024-01-01` in a table and in a lake alike - and a scan must still take
+  partition values from the manifest tuple: a null value is spelled `null` in a
+  path, and a path cannot say whether that is the string or the absence. A scan
+  compares the manifest's *value* to the filter's, with the text as a fallback,
+  because a value is what the manifest holds and text is what a path can say.
+- **A spec and a schema say the same thing, so neither is invented twice.**
+  `PartitionSpec::partition_field` stamps each tuple child with its transform,
+  its source column, and the partition marker, so `PartitionSpec::from_field`
+  reads the spec back off the tuple; `mark_partitions` marks the schema's own
+  columns, and `PartitionSpec::from_schema` builds an identity spec from a
+  schema that already carries them. A table's stored schema therefore reports
+  its layout whether it was just created or just opened.
 - **A transform that cannot place a row is refused by name.** Only `identity`
   and `void` are invertible here, so a write against a spec using `bucket`,
   `truncate`, or a calendar transform reports which transform stopped it rather
@@ -476,10 +500,13 @@ Keep these conversion names exact; do not add alternate aliases:
   MIME values classified by the one core table as encodings may occupy the
   encoding sequence.
 - `Scheme` doubles as the compatibility vocabulary: `Scheme::ARROW`,
-  `SPARK`, `POLARS`, and `PANDAS` are the targets `to_scheme_compat` accepts,
-  and `Scheme::COMPATIBILITY_TARGETS` lists them. `is_compatibility_target`
-  and `is_storage` classify a scheme; `default_port` answers the network ones.
-  Never add a second scheme-like enum.
+  `SPARK`, `POLARS`, `PANDAS`, and `ICEBERG` are the targets
+  `to_scheme_compat` accepts, and `Scheme::COMPATIBILITY_TARGETS` lists them.
+  `is_compatibility_target` and `is_storage` classify a scheme; `default_port`
+  answers the network ones. Never add a second scheme-like enum. The Iceberg
+  target widens what widens losslessly; the Iceberg *codec* stays strict, so
+  `PrimitiveType::from_data_type` still refuses a datatype the format cannot
+  spell rather than widening it behind a writer's back.
 - `Codec`: the closed content codings are `Identity`, `Gzip`, `Zlib`,
   `Deflate`, and `Zstd`; `from_str` accepts the legacy `x-` prefix,
   `from_mime_type`/`from_media_type`/`from_url` recover a coding from a name,
@@ -520,6 +547,26 @@ Keep these conversion names exact; do not add alternate aliases:
   `get_property`, `has_property`, `set_property`, `remove_property`,
   `clear_properties`, `property_iter`, `try_with_property`, and
   `with_properties_cleared`.
+- One protocol's properties also have a view that remembers the protocol:
+  `Metadata::protocol`, `Field::protocol`, and `Field::protocol_mut`, plus one
+  named accessor per well-known protocol generated from the single list in
+  `metadata.rs` (`field.iceberg()`, `field.iceberg_mut()`,
+  `metadata.postgres()`, ...; `https` is deliberately absent because it shares
+  the canonical `http:` namespace). A view is a borrow, never a copy. Its
+  vocabulary is the collection one - `get`, `contains_key`, `len`, `is_empty`,
+  `iter`, `next_entry`, `key`, `insert`, `update`, `set`, `remove`, `clear` -
+  where `set` replaces only that protocol's properties and leaves every other
+  key alone. Mutation still goes through Field's cache-aware methods; a view
+  never touches metadata storage itself. Bindings project the view as one live
+  mapping object (Python mapping dunders, JavaScript Map protocol), not as a
+  snapshot copy.
+- A Field can act as a partition column: the reserved `field:partition` marker,
+  read with `is_partition` and written with `set_partition`/`with_partition`,
+  says a path spells this column out. A struct root answers
+  `partition_fields`, `partition_field_names`, `partition_field_len`,
+  `has_partition_fields`, `only_partition_fields`, `without_partition_fields`,
+  and `with_partition_fields`. An unmarked field stores no marker at all, so
+  two schemas that partition the same way stay exactly equal.
 - Arrow/Parquet Field identity is exactly `id`, `set_id`, `remove_id`, and
   `with_id`. Store it under the exact Arrow convention `PARQUET:field_id` as a
   canonical signed 32-bit decimal integer. Generic metadata construction,
@@ -536,7 +583,8 @@ Keep these conversion names exact; do not add alternate aliases:
   unchanged. Keep the preexisting bare `location` distinct from
   `http_location`.
 - `Metadata`: `new`, `from_entries`, `from_arrow`, `from_json`, `to_arrow`,
-  `into_arrow`, `to_json`, `into_json`, `get`, `contains_key`, and `iter`.
+  `into_arrow`, `to_json`, `into_json`, `get`, `contains_key`, `iter`, and
+  `protocol`.
 - `Uri`, `Url`, and `Urn`: `from_str`, `from_path`, `from_uri`, `to_json`,
   `into_json`, `to_uri`, and `into_uri` where the conversion is meaningful.
   `Uri` additionally uses `to_url`, `into_url`, `to_urn`, and `into_urn`;
@@ -570,6 +618,14 @@ Keep these conversion names exact; do not add alternate aliases:
   calls `toml::validate_for_write_with_limits` before opening or truncating a
   destination, using the runtime's decode limits, then streams through
   `to_writer`. Rust callers using core defaults may use `validate_for_write`.
+- `TypedValue` is one value paired with the datatype it belongs to, validated
+  against it on construction. It carries the same compile-time markers a Field
+  does - `TypedValue<K>` where `K` is a `FieldType`, one alias per datatype
+  (`Int64Value`, `Utf8Value`, ...), and `AnyType` for a pairing that has not
+  been narrowed, which is the default. Narrowed construction is `try_from_parts`
+  and `try_from_value`, the dynamic pairing keeps `from_parts` and `from_value`,
+  and a statically known datatype adds `new`. Never add a second marker family:
+  a value and a field spell the same one.
 - Codec values: validated construction uses `Value::from_sequence` and
   `Value::from_mapping`; `Float` exposes borrowed state through `as_f64` and
   consumes through `into_f64`. There is no application-tag carrier: a name over
@@ -823,8 +879,8 @@ names a rule is incomplete.
   before materializing; caller-built public enum variants must not bypass
   those caps.
 - Schema compatibility targets are the shared `Scheme` values
-  (`arrow`, `spark`, `polars`, `pandas`); `Scheme::COMPATIBILITY_TARGETS` is
-  the list. Arrow is a validated cache-preserving no-op, and every other target
+  (`arrow`, `spark`, `polars`, `pandas`, `iceberg`);
+  `Scheme::COMPATIBILITY_TARGETS` is the list. Arrow is a validated cache-preserving no-op, and every other target
   runs the one generic recursive walker with a per-target scalar matrix. A
   rewrite must preserve Field name/nullability/metadata, invalidate a populated
   Arrow cache exactly once, and reject extension storage rather than relabeling

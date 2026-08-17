@@ -594,8 +594,47 @@ assert!(hashed.require_writable().unwrap_err().to_string().contains("bucket[16]"
 
 Iceberg writes partition directories in exactly the `column=value` shape
 [`Url::hive_partitions`](uri.md) already reads, so a table this module writes is also a lake the rest
-of the crate can walk with [`IOBase::children_where`](io.md). Unlike Hive, an Iceberg data file still
-stores its partition columns, so a scan needs no restoration step in the normal case.
+of the crate can walk with [`IOBase::children_where`](io.md). It is the same shape because it is the
+same renderer: `partition_path` spells a value through
+[`io::partition::partition_text`](io.md#partition-columns-in-the-data), which is what a partitioned
+folder write applies to a whole column, so a date is `day=2024-01-01` in a table and in a lake alike.
+Unlike Hive, an Iceberg data file still stores its partition columns, so a scan needs no restoration
+step in the normal case.
+
+A spec and a schema say the same thing, so neither has to be spelled twice. The partition tuple
+carries what produced each of its columns - the transform, the source column, and the partition
+marker every path-borne column carries - and a schema can carry the marks itself:
+
+```rust
+use yggdryl::iceberg::{PartitionSpec, assign_field_ids};
+use yggdryl::DataType;
+
+let mut schema = DataType::from_fields([
+    DataType::Int64.required_field("id"),
+    DataType::Utf8.nullable_field("venue"),
+])?
+.required_field("row");
+assign_field_ids(&mut schema, 1)?;
+let spec = PartitionSpec::identity(1, &schema, &["venue"])?;
+
+// The tuple describes itself, so the spec reads back off it.
+let partition = spec.partition_field(&schema)?;
+assert_eq!(partition.iceberg().get("spec-id"), Some("1"));
+let venue = partition.get_field_by_name("venue").expect("the partition column");
+assert!(venue.is_partition());
+assert_eq!(venue.iceberg().get("transform"), Some("identity"));
+assert_eq!(PartitionSpec::from_field(&partition)?, spec);
+
+// And a schema that marks its own partition columns needs no column list.
+let marked = spec.mark_partitions(&schema)?;
+assert_eq!(marked.partition_field_names().collect::<Vec<_>>(), ["venue"]);
+assert_eq!(PartitionSpec::from_schema(1, &marked)?, spec);
+```
+
+A table marks its stored schema this way when it is created and again when it is opened, so
+`Table::schema` reports the layout whichever end you came in from - and the mark is core Field
+metadata, not an Iceberg document key, so it survives into Arrow and Parquet without the table
+metadata beside it.
 
 **The manifest is the authority on a partition value, not the path.** A null value is spelled `null`
 in a directory name, and a path cannot say whether that is the string `"null"` or the absence of a
@@ -1588,8 +1627,23 @@ assert_eq!(
 ```
 
 `int8`, `uint32`, `interval`, `union`, `decimal256`, and any `time` or `timestamp` unit other than
-microsecond and nanosecond have no Iceberg spelling. Widen them yourself before writing, so the
-column type in the table is one you chose.
+microsecond and nanosecond have no Iceberg spelling, and this conversion refuses them rather than
+widening them behind your back - the column type in the table has to be one you chose.
+
+Choosing it is one call: `iceberg` is a
+[schema-compatibility target](datatype.md#compatibility-rewriting) like `spark` and `polars`, so the
+widenings that are lossless are named in one place and applied by the one recursive walker.
+
+```rust
+use yggdryl::iceberg::PrimitiveType;
+use yggdryl::{DataType, Scheme};
+
+// The narrow integers widen; the refusals stay refusals.
+let widened = DataType::Int8.to_scheme_compat(&Scheme::ICEBERG)?;
+assert_eq!(widened, DataType::Int32);
+assert_eq!(PrimitiveType::from_data_type(&widened)?.to_string(), "int");
+assert!(DataType::Interval(yggdryl::TimeUnit::YearMonth).to_scheme_compat(&Scheme::ICEBERG).is_err());
+```
 
 ## Nested types
 
