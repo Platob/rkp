@@ -1510,22 +1510,44 @@ binaries, caches, and `node_modules` after validation.
 
 ## Releases
 
-- `.github/workflows/release.yml` publishes all three surfaces from one `v*`
-  tag: the `yggdryl` crate to crates.io, wheels (five platforms, CPython
-  3.10-3.14) plus the sdist to PyPI, and `@yggdryl/node` to npm carrying
-  every platform's native module in one package - the generated loader picks
-  the binary at require time. Running the workflow by hand builds and
-  verifies everything without publishing; use that to rehearse.
-- One version, spelled three times: the workspace `Cargo.toml`,
-  `python/pyproject.toml`, and `node/package.json` must agree, and the tag
-  must be `v` plus that version - the preflight job refuses anything else.
-  Bump all three in the same commit; nothing else carries a version.
-- Credentials are repository configuration, never workflow content: the
-  `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN` secrets, and PyPI trusted publishing
-  (OIDC) bound to the `pypi` environment. Do not add a fourth registry or a
-  stored PyPI password.
-- Every built artifact is smoke tested on its own platform before anything
-  publishes - a wheel by an end-to-end table round trip, a native module by
-  the full Node test suite - and the npm publish refuses a package missing
-  any platform binary. Keep it that way: an artifact that was never imported
-  is not released.
+- **`main` is the release trigger, and the tag is the receipt.**
+  `.github/workflows/release.yml` runs on every push to `main`: a version
+  whose `v<version>` tag already exists costs one preflight job and nothing
+  else, and a version without one builds, publishes to all three registries,
+  and only then creates the tag and the GitHub release. Releasing is
+  therefore committing a version bump to `main`; pushing a `v*` tag by hand
+  releases the same way, and a hand-run of the workflow builds and verifies
+  everything without publishing - use that to rehearse.
+- **Every publish is idempotent, and the tag lands last.** A registry that
+  already has the version is skipped, never failed - the crates sparse
+  index, PyPI's `skip-existing`, and an `npm view` probe decide - so a run
+  that died halfway is repaired by re-running it or by the next push to
+  `main`: only the missing registries publish. Never create the tag before
+  the registries have the version.
+- **One version, spelled three times.** The workspace `Cargo.toml`,
+  `python/pyproject.toml`, and `node/package.json` must agree, and a pushed
+  tag must be `v` plus that version - the preflight job refuses anything
+  else. Bump all three in the same commit; nothing else carries a version.
+  A version a registry has already taken can never be re-released; bump
+  forward instead.
+- **The surfaces**: the `yggdryl` crate to crates.io; wheels for every
+  CPython the project supports (3.10 through 3.14 today) across manylinux
+  and musllinux x86_64 and aarch64, macOS x86_64 and arm64, and Windows x64
+  and arm64 (from 3.11, the first CPython published there), plus the sdist,
+  to PyPI; and `@yggdryl/node` to npm carrying every platform's native
+  module in one package - the generated loader picks the binary at require
+  time.
+- **Credentials are repository configuration, never workflow content**: the
+  `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN` secrets, and PyPI trusted
+  publishing (OIDC) bound to the `pypi` environment. The workflow names no
+  repository, so it survives a migration - but the PyPI trusted-publisher
+  binding does name one and must be re-registered after migrating. Do not
+  add a fourth registry or a stored PyPI password.
+- **Nothing publishes untested.** A wheel is smoke tested on its build
+  platform by an end-to-end table round trip wherever its wheel can install
+  there (musl wheels cannot install on the glibc runner that builds them,
+  and a platform PyArrow ships no wheel for has nothing to install against -
+  those build-only targets are marked in the workflow, not silently
+  skipped); a native module passes the full Node suite on its own platform;
+  and the npm publish refuses a package missing any platform binary. An
+  artifact that was never imported is not released.

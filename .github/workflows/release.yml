@@ -1,20 +1,32 @@
 name: Release
 
-# One workflow publishes all three package surfaces from one tag: the core
-# crate to crates.io, the Python wheels and sdist to PyPI, and the Node.js
-# package - carrying every platform's native module - to npm. A `v*` tag is
-# the trigger and the single source of truth for the version; running the
-# workflow by hand builds and verifies everything without publishing, so a
-# release can be rehearsed.
+# One workflow releases all three package surfaces - the core crate to
+# crates.io, the Python wheels and sdist to PyPI, and the Node.js package
+# carrying every platform's native module to npm - and `main` drives it: a
+# push whose version has no `v<version>` tag yet builds, publishes, and then
+# creates the tag and the GitHub release as the record that the version is
+# fully out. A push whose version is already tagged does nothing beyond the
+# preflight, so ordinary commits cost one small job.
 #
-# Credentials, configured once on the repository:
+# Every publish is idempotent - a registry that already has the version is
+# skipped, never failed - so a run that died halfway is repaired by re-running
+# it (or by the next push to `main`): only the missing registries publish, and
+# the tag still lands last. Pushing a `v*` tag by hand releases the same way,
+# and running the workflow by hand builds and verifies everything without
+# publishing, so a release can be rehearsed.
+#
+# Nothing here names the repository - only `github.*` context - so the
+# workflow survives a repository migration. Credentials, configured once on
+# the repository (and again after any migration):
 #   - crates.io: the `CARGO_REGISTRY_TOKEN` secret.
 #   - PyPI: trusted publishing (OIDC) for this repository and workflow,
-#     bound to the `pypi` environment - no stored secret.
+#     bound to the `pypi` environment - no stored secret, and the binding
+#     names the repository, so a migrated repository must be re-registered.
 #   - npm: the `NPM_TOKEN` secret, an automation token for `@yggdryl/node`.
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -22,7 +34,7 @@ permissions:
   contents: read
 
 # Never cancel a release mid-publish: a half-published version is worse than
-# a slow one.
+# a slow one. Queued runs of the same ref wait instead.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -33,15 +45,21 @@ env:
 jobs:
   preflight:
     # The workspace manifest, the Python project, and the npm package each
-    # spell the version; a release where they disagree - or where the tag
-    # names none of them - stops here, before anything is built.
+    # spell the version; a release where they disagree - or where a pushed
+    # tag names none of them - stops here, before anything is built. The one
+    # decision this job publishes: whether this run releases (`publish`), and
+    # which version it is.
     name: Versions agree
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.decide.outputs.version }}
+      publish: ${{ steps.decide.outputs.publish }}
     steps:
       - uses: actions/checkout@v6
-      - name: One version, three manifests, and the tag that names it
+      - name: One version, three manifests, and whether it is already out
+        id: decide
         run: |
-          python3 - <<'EOF'
+          version=$(python3 - <<'EOF'
           import json
           import os
           import sys
@@ -67,16 +85,36 @@ jobs:
               tag = ref.removeprefix("refs/tags/")
               if tag != f"v{workspace}":
                   sys.exit(f"expected the tag v{workspace}, got {tag}")
-          print(f"releasing {workspace}")
+          print(workspace)
           EOF
+          )
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # A hand-run rehearses: build and verify everything, publish
+            # nothing.
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "rehearsal for $version"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "releasing $version from its tag"
+          elif git ls-remote --exit-code origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "$version is already tagged; nothing to release"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "releasing $version from main"
+          fi
 
   crate:
     # crates.io carries only the core: the binding crates are `publish =
     # false` because their artifacts are the wheel and the npm package. The
-    # dry run always happens, so a hand-run rehearses the same packaging and
-    # verification a tag performs.
+    # dry run always happens, so a rehearsal exercises the same packaging and
+    # verification a release performs; the sparse index says whether the
+    # version is already up, so a repaired run skips instead of failing.
     name: crates.io (yggdryl)
     needs: preflight
+    if: needs.preflight.outputs.publish == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -85,58 +123,140 @@ jobs:
       - name: Package and verify
         run: cargo publish --locked -p yggdryl --dry-run
       - name: Publish
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.preflight.outputs.publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked -p yggdryl
+        run: |
+          version="${{ needs.preflight.outputs.version }}"
+          if curl -fsSL "https://index.crates.io/yg/gd/yggdryl" | grep -q "\"vers\":\"$version\""; then
+            echo "crates.io already has yggdryl $version; skipping"
+          else
+            cargo publish --locked -p yggdryl
+          fi
 
   wheels:
-    # One job per platform, each building a wheel per CPython the project
-    # supports. The interpreters are named bare so maturin resolves them from
-    # the manylinux image on Linux and from the setup-python tool cache on
-    # macOS and Windows; 3.12 is listed last so it is the default `python`
-    # the smoke test runs under, where PyArrow wheels are certain to exist.
+    # One job per platform and libc, each building a wheel per CPython the
+    # project supports (3.10 through 3.14; Windows on ARM starts at 3.11,
+    # the first CPython published for it). The interpreters are named bare so
+    # maturin resolves them from the manylinux and musllinux images on Linux
+    # and from the setup-python tool cache elsewhere; where a smoke test
+    # runs, 3.12 is listed last so it is the default `python` it runs under.
+    # `smoke: false` marks the targets whose wheels cannot install on their
+    # own build host - musl wheels on a glibc runner - or where PyArrow, the
+    # hard runtime dependency, publishes no wheel to install against; the
+    # build is still shipped so the platform works the day its stack does.
     name: Wheel (${{ matrix.label }})
     needs: preflight
+    if: needs.preflight.outputs.publish == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - label: linux-x86_64
+          - label: manylinux-x86_64
             runner: ubuntu-latest
             target: x86_64
-          - label: linux-aarch64
+            manylinux: auto
+            interpreters: 3.10 3.11 3.12 3.13 3.14
+            pythons: |
+              3.10
+              3.11
+              3.13
+              3.14
+              3.12
+            smoke: true
+          - label: manylinux-aarch64
             runner: ubuntu-24.04-arm
             target: aarch64
+            manylinux: auto
+            interpreters: 3.10 3.11 3.12 3.13 3.14
+            pythons: |
+              3.10
+              3.11
+              3.13
+              3.14
+              3.12
+            smoke: true
+          - label: musllinux-x86_64
+            runner: ubuntu-latest
+            target: x86_64
+            manylinux: musllinux_1_2
+            interpreters: 3.10 3.11 3.12 3.13 3.14
+            pythons: |
+              3.12
+            smoke: false
+          - label: musllinux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64
+            manylinux: musllinux_1_2
+            interpreters: 3.10 3.11 3.12 3.13 3.14
+            pythons: |
+              3.12
+            smoke: false
           - label: macos-x86_64
             runner: macos-15-intel
             target: x86_64
+            manylinux: auto
+            interpreters: 3.10 3.11 3.12 3.13 3.14
+            pythons: |
+              3.10
+              3.11
+              3.13
+              3.14
+              3.12
+            smoke: true
           - label: macos-aarch64
             runner: macos-14
             target: aarch64
+            manylinux: auto
+            interpreters: 3.10 3.11 3.12 3.13 3.14
+            pythons: |
+              3.10
+              3.11
+              3.13
+              3.14
+              3.12
+            smoke: true
           - label: windows-x64
             runner: windows-latest
             target: x64
+            manylinux: auto
+            interpreters: 3.10 3.11 3.12 3.13 3.14
+            pythons: |
+              3.10
+              3.11
+              3.13
+              3.14
+              3.12
+            smoke: true
+          - label: windows-arm64
+            runner: windows-11-arm
+            target: aarch64
+            manylinux: auto
+            interpreters: 3.11 3.12 3.13 3.14
+            pythons: |
+              3.11
+              3.13
+              3.14
+              3.12
+            smoke: false
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: |
-            3.10
-            3.11
-            3.13
-            3.14
-            3.12
+          python-version: ${{ matrix.pythons }}
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          manylinux: auto
+          manylinux: ${{ matrix.manylinux }}
           args: >-
             --release --locked --manifest-path python/Cargo.toml --out dist
-            --interpreter 3.10 3.11 3.12 3.13 3.14
+            --interpreter ${{ matrix.interpreters }}
       - name: Smoke test the wheel
+        if: matrix.smoke
         shell: bash
         run: |
           python -m pip install "pyarrow>=18" --only-binary ":all:"
@@ -165,10 +285,11 @@ jobs:
 
   sdist:
     # The source distribution carries the whole workspace - maturin includes
-    # the core as a path dependency - so a platform without a wheel can still
-    # build from source.
+    # the core as a path dependency and prunes the Node member - so an
+    # architecture without a wheel can still build from source.
     name: Source distribution
     needs: preflight
+    if: needs.preflight.outputs.publish == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -185,8 +306,8 @@ jobs:
 
   publish-pypi:
     name: PyPI (yggdryl)
-    needs: [wheels, sdist]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [preflight, wheels, sdist]
+    if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -203,6 +324,8 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          # A repaired run re-uploads only what is missing.
+          skip-existing: true
 
   node:
     # Each platform builds and tests its own native module; the npm package
@@ -210,6 +333,7 @@ jobs:
     # binary at require time.
     name: Node binary (${{ matrix.label }})
     needs: preflight
+    if: needs.preflight.outputs.publish == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -247,8 +371,8 @@ jobs:
 
   publish-npm:
     name: npm (@yggdryl/node)
-    needs: node
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [preflight, node]
+    if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -276,4 +400,35 @@ jobs:
         working-directory: node
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: |
+          version="${{ needs.preflight.outputs.version }}"
+          if npm view "@yggdryl/node@$version" version >/dev/null 2>&1; then
+            echo "npm already has @yggdryl/node $version; skipping"
+          else
+            npm publish --access public
+          fi
+
+  release:
+    # The tag and the GitHub release land last, after every registry has the
+    # version: their existence is the statement that the release is complete,
+    # and their absence is what makes the next run on `main` finish a
+    # half-published one.
+    name: Tag and GitHub release
+    needs: [preflight, crate, publish-pypi, publish-npm]
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Create the tag and the release once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="v${{ needs.preflight.outputs.version }}"
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "$version is already released"
+          else
+            gh release create "$version" --target "$GITHUB_SHA" \
+              --title "$version" --generate-notes
+          fi
