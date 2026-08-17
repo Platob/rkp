@@ -11,6 +11,7 @@ mod limits;
 pub(crate) mod position;
 pub(crate) mod wire;
 
+pub use crate::generic::TypedValue;
 pub use crate::generic::value::{Children, Float, Value};
 pub use codec::{Json, Jsonl, Limited, TextCodec, Toml, Yaml};
 pub(crate) use display::{elide_display, elide_to, expected_got, stable_hash_display};

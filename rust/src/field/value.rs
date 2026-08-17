@@ -70,6 +70,29 @@ pub(crate) fn validate_row(root: &Field, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Validate one value against the datatype it claims, outside any row.
+///
+/// A [`crate::TypedValue`] is one value and one datatype with no field around
+/// them, so it validates through the same walk a column value takes and
+/// reports the same failures, rooted at the value itself. A null is accepted
+/// by every datatype, because nullability belongs to the field that holds the
+/// column rather than to the value in it.
+pub(crate) fn validate_data_type_value_for(data_type: &DataType, value: &Value) -> Result<()> {
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    validate_data_type_value(data_type, value, 0).map_err(|failure| {
+        let mut path = String::from("$");
+        for segment in failure.path {
+            push_path_segment(&mut path, segment);
+        }
+        Error::InvalidRecord {
+            path: SmolStr::from(path),
+            reason: failure.reason,
+        }
+    })
+}
+
 /// Rewrite one row value into the exact representation a root field declares.
 pub(crate) fn canonicalize_row(root: &Field, value: Value) -> Result<Value> {
     let Some(values) = value.as_sequence() else {

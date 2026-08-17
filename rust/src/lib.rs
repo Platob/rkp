@@ -49,7 +49,7 @@ pub use field::{
 };
 pub use metadata::{Metadata, MetadataIntoIter, MetadataIter, PropertyIter};
 pub(crate) use text::stable_hash_display;
-pub use text::{Children, Float, Format, Limits, Value, ValueIter};
+pub use text::{Children, Float, Format, Limits, TypedValue, Value, ValueIter};
 pub use uri::{
     Authority, Extensions, Parents, PathSegments, Uri, UriParents, UriPath, Url, UrlParents, Urn,
 };
