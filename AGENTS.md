@@ -1,1553 +1,1089 @@
 # Yggdryl implementation rules
 
-These rules apply to the entire repository. Yggdryl is a small schema,
-resource-identifier, and structured-codec core, not a trading engine or
-protocol stack. Keep the native public domain model centered on `DataType`,
-`Field`, `Uri`, `Url`, `Urn`, and the byte-oriented codec `Value`; Python and
-JavaScript are runtime views of those Rust values, never independent schema or
-codec implementations. Python records are a language-level convenience layer
-that compiles annotations into native values.
+Yggdryl is a schema, resource-identifier, and structured-codec core. The native
+public domain model is `DataType`, `Field`, `Uri`, `Url`, `Urn`, and the codec
+`Value`; Python and JavaScript are runtime views of those Rust values, never
+independent schema or codec implementations. Python records are a convenience
+layer compiling annotations into native values.
 
 ## Order of work
 
-- **A feature is validated fully in Rust first - implementation, edge-case
-  tests, documentation - and only then implemented in the Python and JavaScript
-  extensions. Never build a binding for a core surface that is not already
-  proven.** A binding written against an unsettled core encodes decisions the
-  core has not made yet, so it has to be rewritten when the core settles, and
-  its tests pin behavior the core never agreed to. "Proven" means the Rust
-  surface has its edge cases covered, its documentation page written with
-  running examples, and, where the feature is an exchange format, a check
-  against an outside implementation of that format. A stage that touches
-  `rust/` and stops there is complete work, not half of a change.
+- **Rust first, fully: implementation, edge-case tests, documentation with
+  running examples, and - for an exchange format - a check against an outside
+  implementation. Only then bindings.** A binding against an unsettled core
+  pins decisions the core never made. A change that touches `rust/` and stops
+  there is complete work, not half of one.
 
 ## Source layout and scope
 
-- The repository root owns the workspace manifest, the shared dependency pins,
-  and the shared lints. Its members are `rust/` (the core crate), `python/`,
-  and `node/`. Every member uses the same directory names: `src/`, `tests/`,
-  and `benchmarks/`. There are no per-language `examples/` directories -
-  runnable examples live in the documentation, where every language appears
-  side by side.
-- **A struct `Field` is the schema.** There is no separate record or schema
-  type: a non-null `Struct` field describes rows, and a row is one ordered
-  `Value::Sequence` with a value per child field. Everything that used to take
-  a schema object takes a `Field`, and everything that described one now
-  describes a field. Never reintroduce a parallel `Record`/`RecordSchema` pair.
-- Schema behavior belongs in the categorized `rust/src/datatype/` or
-  `rust/src/field/` module. Keep generic `Field` state and core mutation in
-  `field/mod.rs`, Arrow projection in `field/arrow.rs`, typed per-datatype
-  casting in `field/cast.rs`, recursive grammar in `field/parser.rs`,
-  structural serialization in `field/serde.rs`, comparison in `field/diff.rs`,
-  schema-directed row validation in `field/value.rs`, and the compile-time
-  markers in `field/typed.rs` with their per-family modules
-  (`scalar`, `integer`, `floating`, `temporal`, `decimal`, `binary`, `nested`).
-- Keep the immutable metadata value in `rust/src/metadata.rs`; all cache-aware
-  mutation stays on `Field`. Metadata is owned and validated by `Field` only -
-  never attach metadata to a bare `DataType` and never add a binding-side
-  metadata model.
-- Keep shared static value vocabularies below `rust/src/enums/`: `DataTypeId`,
-  `DataTypeKind`, `MimeType`, `MediaType`, `Scheme`, `TimeUnit`, `UnionMode`,
-  `Codec`, `Level`, and `IOKind`. Datatype, identifier, I/O, and binding
-  modules reuse these enums instead of defining local copies. One native
-  `TimeUnit` owns both temporal resolutions and Arrow interval layouts.
-  `MimeType`/`MediaType` own MIME spelling, suffix, content-coding, and
-  compound-filename inference for the whole workspace, including the
+- Root owns the workspace manifest, shared pins, and shared lints; members are
+  `rust/`, `python/`, `node/`, each with `src/`, `tests/`, `benchmarks/`. No
+  `examples/` directories - runnable examples live in the docs.
+- **A struct `Field` is the schema.** A non-null `Struct` field describes rows;
+  a row is one ordered `Value::Sequence` with a value per child. Never
+  reintroduce a `Record`/`RecordSchema` pair.
+- Schema behavior lives in categorized `rust/src/datatype/` and
+  `rust/src/field/`: generic state and mutation in `field/mod.rs`, Arrow in
+  `field/arrow.rs`, typed casting in `field/cast.rs`, grammar in
+  `field/parser.rs`, serialization in `field/serde.rs`, comparison in
+  `field/diff.rs`, row validation in `field/value.rs`, compile-time markers in
+  `field/typed.rs` with per-family modules (`scalar`, `integer`, `floating`,
+  `temporal`, `decimal`, `binary`, `nested`). Split `datatype/` the same way
+  (scalar/integer/floating/temporal/nested, parsing, Arrow, serialization);
+  modules own real implementation, never empty shells around a monolith.
+- Immutable metadata value in `rust/src/metadata.rs`; cache-aware mutation
+  stays on `Field`. Metadata is owned and validated by `Field` only - never on
+  a bare `DataType`, never a binding-side metadata model.
+- Shared enums below `rust/src/enums/`: `DataTypeId`, `DataTypeKind`,
+  `MimeType`, `MediaType`, `Scheme`, `TimeUnit`, `UnionMode`, `Codec`,
+  `Level`, `IOKind`. Reuse them; no local copies. One `TimeUnit` owns temporal
+  resolutions and Arrow interval layouts. `MimeType`/`MediaType` own MIME
+  spelling, suffixes, content-codings, compound-filename inference, and the
   file-system types `inode/directory` and `inode/file`.
-- Keep the generic enums - the ones that name every implementation of one
-  contract - below `rust/src/generic/`: `Holder` over every `IOBase`
-  implementation, `Media` over every record encoding bound to a handle, and
-  `RecordOptions` over every encoding's settings. A generic enum delegates the
-  whole contract to the variant it holds and adds no behavior of its own.
-- Keep byte storage below `rust/src/io/`: the `IOBase` trait, the in-memory
-  `Buffer`, and the transparent-compression `Coded` wrapper. Keep the shared
-  record settings in `generic/options.rs` as `IORecordOptions` and
-  `RecordSettings`.
-- Keep each content coding in its own top-level module: `rust/src/gzip/`,
-  `rust/src/zlib/`, `rust/src/zstd/`. Each exposes the same four operations -
-  `load`/`dump` for whole buffers, `reader`/`writer` for streams - plus a
-  transparent handle (`Gzip`, `Zlib`, `Zstd`) that implements `IOBase` by
-  decompressing reads and compressing writes. `Codec` in `enums/codec.rs`
-  dispatches across them; never add a fourth spelling of a coding.
-- Keep each file-system backend in one module folder supplying the same three
-  roles, and name them the same way in every backend:
-  - a generic `Path` that reports `IOKind` by looking at what is actually
-    there and runs every operation through the specialized implementation that
-    fits, so a caller who does not know what a location is can still use it;
-  - a `Folder` container that lists and resolves children;
-  - a `File` leaf that holds bytes.
-  `rust/src/local/` is the local implementation, whose `File` is a memory
-  mapping. A remote backend (S3, GCS, Azure) is a sibling module supplying the
-  same three roles - never a change to `io` or to `local`.
-- Keep Arrow interop in `rust/src/arrow/` (Struct scalars, StructArray,
-  RecordBatch, IPC readers and writers, and `schema_from_field`). Recursive
-  casting belongs with the schema it casts to, in `rust/src/field/cast/`: the
-  plan engine in `cast/plan.rs`, the typed per-datatype surface in
-  `cast/mod.rs`. There is no separate cast or media module. The `arrow` feature is default-enabled; callers
-  that need schema projection without Arrow arrays use `default-features =
-  false`. Never reintroduce a separate Arrow crate.
-- Keep record encodings in one module each: `rust/src/ipc/` for Arrow IPC and
-  `rust/src/parquet/` for Apache Parquet (behind the non-default `parquet`
-  feature). Each module owns free functions over any `IOBase` handle plus a
-  stateful type (`Ipc`, `Parquet`) that holds the handle, its options, and its
-  cache. `IOBase`'s record methods dispatch to those free functions, so a bare
-  handle can read and write records with no extra type.
-- Keep the Apache Iceberg table format below `rust/src/iceberg/` (behind the
-  non-default `iceberg` feature, which implies `parquet`), split by what each
-  file owns: the type vocabulary in `types.rs`, schema documents in `schema.rs`,
-  partition specs and transforms in `partition.rs`, snapshots and refs in
-  `snapshot.rs`, table metadata in `metadata.rs`, manifest lists and manifests
-  in `manifest.rs`, the Avro object container in `avro.rs`, Parquet footer
-  statistics in `statistics.rs`, Iceberg's two renderings of a scalar - its text
-  and its single-value bytes - in `value.rs`, scan planning and the reader it
-  produces in `scan.rs`, and the `Table` over one handle in `table.rs`. A table
-  format sits on top of the record encodings; it never becomes one.
-- There is no tabular descriptor, dataset, or in-memory table type. A handle
-  plus `RecordOptions` is the whole surface: an in-memory table is a `Buffer`
-  read and written through `IOBase`'s record methods.
-- URI, URL, URN, and resource-path behavior belongs in `rust/src/uri.rs`.
-  Shared structured-text values, formats, limits, wire envelopes, display
-  helpers, and byte-position utilities belong below `rust/src/text/`. JSON
-  implementation belongs below `rust/src/json/`, YAML below `rust/src/yaml/`,
-  and TOML below `rust/src/toml/`; all use the one shared `Value`. Keep
-  `rust/src/codec.rs` as a compatibility-only re-export facade.
-  `rust/src/lib.rs` may contain exports and shared error plumbing only.
-- Keep the native packages directly under `rust/python/` and `rust/node/`.
-  Mirror core domains in each package as
-  `src/{datatype,field,media,uri,codec}.rs`; keep its `lib.rs` for shared
-  boundary helpers, exports, and module registration only. Keep Python-only
+- Generic enums below `rust/src/generic/`: `Holder` over every `IOBase` impl,
+  `Media` over every bound record encoding, `RecordOptions` over every
+  encoding's settings. A generic enum delegates the whole contract to its
+  variant and adds no behavior.
+- Byte storage below `rust/src/io/`: the `IOBase` trait, in-memory `Buffer`,
+  transparent-compression `Coded`. Shared record settings in
+  `generic/options.rs` as `IORecordOptions` and `RecordSettings`.
+- One module per content coding - `rust/src/{gzip,zlib,zstd}/` - each with
+  `load`/`dump`, `reader`/`writer`, and a transparent `IOBase` handle (`Gzip`,
+  `Zlib`, `Zstd`). `Codec` in `enums/codec.rs` dispatches; never a fourth
+  spelling of a coding.
+- Each file-system backend is one module folder with the same three roles: a
+  generic `Path` that reports `IOKind` from what is actually there and routes
+  to the fitting implementation, a `Folder` container, a `File` leaf.
+  `rust/src/local/` is the local one (its `File` is a memory mapping). A
+  remote backend (S3, GCS, Azure) is a sibling module - never a change to `io`
+  or `local`.
+- Arrow interop in `rust/src/arrow/` (Struct scalars, StructArray,
+  RecordBatch, IPC, `schema_from_field`). Recursive casting lives with the
+  schema in `rust/src/field/cast/` (plan engine `cast/plan.rs`, typed surface
+  `cast/mod.rs`). `arrow` feature is default; schema-only callers use
+  `default-features = false`. Never a separate Arrow crate.
+- One module per record encoding: `rust/src/ipc/`, `rust/src/parquet/`
+  (non-default `parquet` feature). Each owns free functions over any `IOBase`
+  handle plus a stateful type (`Ipc`, `Parquet`) holding handle, options,
+  cache; `IOBase`'s record methods dispatch to those functions.
+- Apache Iceberg below `rust/src/iceberg/` (non-default `iceberg` feature,
+  implies `parquet`), one file per concern: `types.rs`, `schema.rs`,
+  `partition.rs`, `snapshot.rs` (snapshots and refs), `metadata.rs`,
+  `manifest.rs`, `avro.rs`, `statistics.rs`, `value.rs` (Iceberg's text and
+  single-value renderings of a scalar), `scan.rs`, `table.rs`, `options.rs`,
+  `catalog.rs`, `evolve.rs`, `inspect.rs`. A table format sits on the record
+  encodings; it never becomes one.
+- No tabular descriptor, dataset, or in-memory table type: a handle plus
+  `RecordOptions` is the whole surface; an in-memory table is a `Buffer`.
+- URI/URL/URN in `rust/src/uri.rs`. Shared structured-text values, formats,
+  limits, envelopes, display, byte positions below `rust/src/text/`; JSON,
+  YAML, TOML below `rust/src/{json,yaml,toml}/`, all on the one shared
+  `Value`. `rust/src/codec.rs` is a compatibility re-export facade only.
+  `lib.rs` holds exports and shared error plumbing only.
+- Bindings mirror core domains as `src/{datatype,field,media,uri,codec}.rs`;
+  each `lib.rs` is boundary helpers, exports, registration only. Python-only
   annotation behavior below `python/yggdryl/records/`.
-- Keep protocol-specific metadata as inert string properties named
-  `<scheme>:<property>`. Reuse `Scheme` for the prefix and one generic property
-  API; do not add protocol execution, network clients, or duplicate
-  per-protocol maps to the core. A per-protocol *view* is not a duplicate map:
-  it remembers the prefix and reads out of the one shared snapshot, which is
-  what keeps a `scheme:name` key from being spelled by hand at a call site. The
-  exact Arrow/Parquet compatibility key `PARQUET:field_id` is the reserved
-  exception: own it through Field's typed ID API rather than normalizing it as
-  a generic protocol property. A module that carries state in its own namespace
-  - Iceberg's `iceberg:doc`, `iceberg:transform`, `iceberg:spec-id` - reaches it
-  through that view rather than through a private key constant.
-- Store HTTP representation metadata under canonical lowercase `http:*`
-  property keys for both HTTP and HTTPS.
+- Protocol metadata is inert string properties `<scheme>:<property>`; reuse
+  `Scheme` for the prefix and one generic property API. No protocol
+  execution, network clients, or duplicate per-protocol maps. A per-protocol
+  *view* (remembers the prefix, reads the one shared snapshot) is not a
+  duplicate map; modules with namespaced state (`iceberg:doc`,
+  `iceberg:transform`, `iceberg:spec-id`) reach it through the view, not a
+  private key constant. `PARQUET:field_id` is the reserved exception, owned by
+  Field's typed ID API. HTTP representation metadata uses canonical lowercase
+  `http:*` keys for both HTTP and HTTPS.
 
 ## Storage and I/O contract
 
-- **`IOBase` is the one storage abstraction.** It is positional, not
-  cursor-based: `pread`/`pwrite` take an explicit offset, so a footer-first
-  container reads its index without seeking a shared cursor and two readers
-  share one handle without coordinating. Everything else - streaming adapters,
-  whole-value reads, compression, record reads and writes - is derived from
-  those two primitives. Never add a second storage trait.
-- **Handles are as lazy as possible.** Constructing a handle must not touch the
-  underlying resource: it is a description of where bytes would live, not proof
-  that they do. Non-existence is resolved at the operation:
-  - reads skip - `pread` on a missing resource yields `0` bytes and `size`
-    reports `0`, so absence is emptiness rather than an error;
-  - writes create - `pwrite`, `truncate`, and `reserve` create the resource and
-    any parent it needs on first use.
-  Metadata follows the same rule: `media_type` is computed on demand, from
-  content or from a location, and re-derived after the bytes change.
-- `IOKind` is how a handle says what it addresses (`Memory`, `File`,
-  `Directory`, `Unknown`). A generic location reads it to choose an
-  implementation; everything else uses it to tell a container from a leaf.
-  `is_container` derives from it - never re-answer the question independently.
-- A handle that wraps another handle mirrors it: implement `IOBase` with the
-  `delegate_iobase!` macro and override only what the wrapper changes (usually
-  `open`/`close`, which manage a cache). This is how `Coded`, `Gzip`, `Ipc`,
-  `Parquet`, and `Media` all expose their raw bytes.
-- `open`/`close` are the contextual pair: `open` materializes the handle and
-  caches whatever repeated calls would otherwise re-derive (a schema, a
-  footer), and `close` publishes and releases it. Bindings bind their scope
-  dunders to exactly these.
-- **The record surface is exactly three methods, named for what they do.**
-  `IOBase::read_arrow_batch_reader(options)` returns an `arrow::BatchReader`,
-  `IOBase::write_arrow_batch_reader(reader, options)` replaces or merges, and
-  `IOBase::append_arrow_batch_reader(reader, options)` adds after what is there.
-  Every other record operation is expressed through those three, so exactly one
-  place decodes an encoding and exactly one place encodes it. Never reintroduce
-  `overwrite_arrow_batches`, `append_arrow_batches`, `upsert_arrow_batches`, or a
-  partitioned spelling of any of them: a second entry point into an encoding is a
-  second place for the encodings to drift apart. A record read or write never
-  takes or returns a collected `Vec`, a slice, or a borrowed iterator of batches
-  - a shape that must be materialized first cannot describe a resource larger
-  than memory. `arrow::batch_reader` is the one constructor that turns batches a
-  caller already holds into a reader. Record access otherwise stays centralized
-  on `IOBase`: `record_options` and `read_arrow_field` complete the surface, and
-  both are answered through the three rather than beside them. The encoding is
-  never guessed - it comes from the handle's media type through
-  `RecordOptions::for_media_type`, and a container answers with the encoding of
-  the leaves beneath it - and the shared settings (schema, root name, cast
-  strictness, batch size, compression level, match key) are flattened fields on
-  each `IORecordOptions` implementation.
-- **A declared schema selects and casts during the read.** The columns
-  `IORecordOptions::schema` names that the resource stores are handed to the
-  encoding as its own projection - a Parquet `ProjectionMask` over root columns,
-  an Arrow IPC projection - and what comes back is cast to the declared shape one
-  batch at a time. Never emulate the projection by reading everything and
-  dropping columns after, and never emulate the cast by leaving a caller to do it
-  again. A projection can only drop columns, so reordering, converting, and a
-  column the resource does not hold are the cast's business; no declared schema
-  preserves the stored shape exactly. Say plainly what each encoding's projection
-  saves: Parquet skips locating and decoding a column chunk, while an Arrow IPC
-  record batch is one contiguous message, so its projection saves the decode and
-  the allocation but not the bytes.
-- **A write is a replacement or a key-matched merge, and nothing else.**
-  `IORecordOptions::merge_by` names the columns forming the match key. Empty
-  means overwrite: a declared schema is applied to the incoming rows, then the
-  result is safe-cast to the schema the resource already stores when it stores
-  one, so an overwrite replaces rows rather than redefining columns. Non-empty
-  means merge: the stored rows are read, the incoming reader is joined against
-  them one batch at a time, a row whose key is already stored updates it, a row
-  whose key is not appends, and the merged contents are rewritten. The join is
-  streamed over the incoming side, and whatever has to be held says so in a
-  comment with its reason. Positional batch upsert is gone: a position is not a
-  row identity, and a match key is.
-- A location may name a set rather than one resource. `Url::is_glob` decides
-  that, `glob_parts` splits the fixed root from the pattern, and `matches_glob`
-  applies the `.gitignore` rule: no separator matches the name at any depth, a
-  separator anchors at the path root. A glob is folder-like *before* the
-  backend is touched, so `IOKind` reports a container and `ls` expands the
-  pattern rather than looking for a directory named `**`. `IOBase::glob`
-  descends every fixed prefix segment before it lists anything.
-- A Hive path carries data, and the three record methods handle it themselves.
-  `Url::hive_partitions` reads `column=value` directories, `hive_partitions_under`
-  reads only the ones below an addressed root, and `IOBase::children_where`
-  yields the leaves carrying a set of them - never containers. A handle
-  addressing a container reads across every leaf holding its encoding and routes
-  each row of a write to the leaf its partition values name, so a caller never
-  has to know whether they addressed one file or a partitioned tree. A container
-  holding a *table format* is the one exception, and it is asked first: a folder
-  with an Iceberg metadata document is read and written through that table's
-  snapshots rather than through its leaves. The layout
-  is the authority on which columns are partition columns, because nothing in a
-  batch says which of its columns belong in a path: a folder whose leaves spell
-  out `column=value` partitions by those columns, and a folder whose leaves do
-  not takes the layout from the declared schema, whose partition-marked fields
-  say it - and a folder that has neither is one table in one leaf. A declaration
-  that contradicts a stored layout is refused naming both, because one write
-  cannot mean two trees. `io/partition.rs` moves those columns between the
-  path and the rows, typed as the schema declares, left alone when the data
-  already carries them, and spelled `null` when a value is absent - which is the
-  one thing a path cannot say for itself, so a declared nullable column is what
-  turns the text back into a null. A restored partition column carries the
-  marker, so a lake read back reports the layout it was stored in.
-- One renderer spells every partition value. `io::partition::partition_text`
-  renders one value the way `partition_values` renders a whole column - the
-  encoding's own display, `null` for the absence of one - so a table format
-  writing a directory name and a folder writing the same one cannot disagree
-  about how a date is spelled. Never add a second partition-text renderer.
-- Content coding belongs to the handle, not to the format. A handle named
-  `trades.arrows.gz` round-trips compressed with no extra argument, because
-  `IOBase::codec` recovers the coding from the media type. Parquet is the
-  documented exception: it compresses internally, so a handle declaring an
-  outer coding is rejected rather than double-compressed.
+- **`IOBase` is the one storage abstraction**, positional not cursor-based:
+  `pread`/`pwrite` take an offset; everything else (streams, whole-value
+  reads, compression, records) derives from those two. Never a second
+  storage trait.
+- **Handles are lazy.** Construction never touches the resource. Reads skip
+  (`pread` on a missing resource yields 0 bytes, `size` reports 0); writes
+  create (`pwrite`, `truncate`, `reserve` make the resource and parents on
+  first use). `media_type` is computed on demand and re-derived after bytes
+  change.
+- `IOKind` (`Memory`, `File`, `Directory`, `Unknown`) is how a handle says
+  what it addresses; `is_container` derives from it - never re-answer
+  independently.
+- A wrapping handle mirrors the inner one via `delegate_iobase!`, overriding
+  only what it changes (usually `open`/`close`) - so `Coded`, `Gzip`, `Ipc`,
+  `Parquet`, `Media` expose raw bytes.
+- `open` materializes and caches what repeated calls would re-derive (schema,
+  footer); `close` publishes and releases. Bindings bind scope dunders to
+  exactly these.
+- **The record surface is exactly three methods**:
+  `read_arrow_batch_reader(options)` -> `arrow::BatchReader`,
+  `write_arrow_batch_reader(reader, options)` (replace or merge),
+  `append_arrow_batch_reader(reader, options)`. Everything else routes through
+  them, so exactly one place decodes and one encodes each encoding. Never
+  reintroduce `overwrite_arrow_batches`, `append_arrow_batches`,
+  `upsert_arrow_batches`, or partitioned spellings. Record reads/writes never
+  take or return a `Vec`, slice, or borrowed iterator of batches - a shape
+  requiring materialization cannot describe a resource larger than memory;
+  `arrow::batch_reader` turns held batches into a reader. `record_options` and
+  `read_arrow_field` complete the surface, answered through the three. The
+  encoding is never guessed: it comes from the media type via
+  `RecordOptions::for_media_type`; a container answers with its leaves'
+  encoding. Shared settings (schema, root name, cast strictness, batch size,
+  compression level, match key) are flattened fields on each
+  `IORecordOptions` implementation.
+- **A declared schema selects and casts during the read.** Stored columns the
+  schema names become the encoding's own projection (Parquet
+  `ProjectionMask`, IPC projection); results are cast to the declared shape
+  per batch. Never read-everything-and-drop, never leave the cast to the
+  caller. A projection only drops columns; reorder, convert, and absent
+  columns are the cast's business. Parquet's projection skips locating and
+  decoding chunks; IPC's saves decode and allocation, not bytes - say so.
+- **A write is a replacement or a key-matched merge, nothing else.**
+  `merge_by` empty = overwrite (declared schema applied to incoming, then
+  safe-cast to the stored schema so rows are replaced, not columns
+  redefined). Non-empty = merge: stored rows read, incoming joined one batch
+  at a time, matched keys update, unmatched append, result rewritten. The
+  join streams over the incoming side; whatever must be held says why in a
+  comment. No positional upsert: a position is not a row identity.
+- Globs: `Url::is_glob`, `glob_parts`, `matches_glob` (`.gitignore` rule: no
+  separator matches at any depth, a separator anchors at the root). A glob is
+  folder-like before the backend is touched; `IOBase::glob` descends every
+  fixed prefix before listing.
+- Hive paths: `Url::hive_partitions`, `hive_partitions_under`, and
+  `IOBase::children_where` (yields leaves only). A container handle reads
+  across every leaf of its encoding and routes each written row to the leaf
+  its partition values name. A container holding a *table format* is asked
+  first: a folder with an Iceberg metadata document reads/writes through
+  snapshots, not leaves. The layout is the authority on partition columns:
+  `column=value` leaves partition by those; otherwise the declared schema's
+  partition-marked fields decide; neither means one table in one leaf. A
+  declaration contradicting a stored layout is refused naming both.
+  `io/partition.rs` moves partition columns between path and rows, typed as
+  declared, left alone when data already carries them, `null` for absence
+  (a declared nullable column is what turns that text back into null). A
+  restored partition column carries the partition marker.
+- One renderer spells every partition value: `io::partition::partition_text`
+  (the encoding's display, `null` for absence), used by tables and folders
+  alike. Never a second partition-text renderer.
+- Content coding belongs to the handle: `trades.arrows.gz` round-trips
+  compressed via `IOBase::codec`. Parquet compresses internally, so an outer
+  coding on it is rejected, not double-compressed.
 
 ## Table format contract
 
-- **A table is a folder, reached through `IOBase` and nothing else.**
-  `rust/src/iceberg/` constructs a `Table` from one container handle and finds
-  its metadata documents, manifest lists, manifests, and data files with
-  `child_by` and `ls` against that handle. No path is opened, `std::fs` is never
-  called, and a recorded absolute location is turned back into a relative name
-  before it is resolved - which is what makes the same code work over a local
-  directory today and over an object store the moment a backend for one exists.
-  A table without a catalog is located the way `HadoopTables` locates one:
-  `metadata/version-hint.text`, falling back to the highest-numbered
-  `*.metadata.json`.
-- **No dependency for the table format itself.** The metadata documents are
-  ordinary JSON and are read and written by `rust/src/json/` through the shared
-  `Value`; the manifests are Avro and the object container is implemented in
-  `rust/src/iceberg/avro.rs`, because it is a header and some blocks. Data files
-  are whatever `rust/src/parquet/` wrote, read back through
-  `read_arrow_batch_reader`'s column pushdown, and their manifest statistics come from
-  the footer that write already produced. Never add an Iceberg, Avro, or catalog
-  crate, and never let `serde_json` back into this module. The published
-  `iceberg` crate was evaluated against this design and does not fit it: it pins
-  arrow and parquet 55 against this workspace's 59, so a `RecordBatch` cannot
-  even cross the boundary; it reaches storage through an `opendal`-backed
-  `FileIO` whose backends are cargo features rather than an extension point, so
-  it cannot be driven through `IOBase`; and it is async throughout while `IOBase`
-  is sync and positional. Re-evaluate only if all three change.
-- **A scan is planned from the metadata, never from a listing.** The current
-  snapshot names the manifest list, the list's `FieldSummary` rows skip whole
-  manifests unopened, a manifest entry's partition tuple skips one file, and a
-  data file's column bounds and null counts skip one more. `Table::plan` reports
-  what it read and what it skipped, so pruning is a number a test asserts on.
-  A filter is a `(column, value)` text pair - the same vocabulary
-  `IOBase::children_where` uses - compared to the text the layout spells for an
-  `identity` partition column and to the value a cast from that text produces for
-  every other column; a statistic bounds a file and does not select a row, so the
-  surviving files are filtered row by row afterwards. Never answer a scan by
-  walking `data/`.
-- **A table is reached through the same three record methods as a folder.** A
-  container handle that holds a metadata document reads through its snapshot,
-  writes as one commit, and appends as one commit, so
-  `write_arrow_batch_reader`'s `merge_by` upserts an Iceberg table exactly as it
-  upserts a leaf. A handle addressing one of the table's `column=value`
-  directories addresses that partition of it. The merge reads only the data files
-  whose recorded bounds for the key columns overlap the incoming keys and carries
-  every other file into the new snapshot as an `existing` entry - same location,
-  same statistics, same commit order - which is correct however coarse the
-  statistics are, because a file that is not read keeps every row it had. The
-  incoming side is what a table merge holds, and the comment says why: a key range
-  cannot come from a reader that has not been read.
+- **A table is a folder, reached through `IOBase` only.** `Table` finds
+  metadata, manifest lists, manifests, and data files with `child_by`/`ls`;
+  no paths, no `std::fs`; recorded absolute locations become relative names
+  first. Catalog-free location works like `HadoopTables`:
+  `metadata/version-hint.text`, else highest-numbered `*.metadata.json`.
+- **No dependency for the format itself.** Metadata is JSON via
+  `rust/src/json/`; manifests are Avro via `iceberg/avro.rs`; data files are
+  what `rust/src/parquet/` wrote, with statistics from that footer. Never add
+  an Iceberg/Avro/catalog crate or `serde_json` here. The published `iceberg`
+  crate was rejected: it pins arrow/parquet 55 vs this workspace's 59, storage
+  goes through `opendal` features not `IOBase`, and it is async while `IOBase`
+  is sync; re-evaluate only if all three change.
+- **A scan is planned from metadata, never a listing.** Snapshot -> manifest
+  list -> `FieldSummary` skips manifests, partition tuples skip files, column
+  bounds/null counts skip more. `Table::plan` reports read vs skipped so
+  pruning is a testable number. A filter is a `(column, value)` text pair
+  (same vocabulary as `children_where`), compared as text for `identity`
+  partition columns and as the cast value elsewhere; statistics bound files,
+  rows are filtered afterwards. Never scan by walking `data/`.
+- **A table answers the same three record methods as a folder**: read through
+  the snapshot, write/append as one commit each; `merge_by` upserts a table
+  exactly as a leaf; a handle on a `column=value` directory addresses that
+  partition. Merge reads only files whose key-column bounds overlap incoming
+  keys; every other file is carried as an `existing` entry (same location,
+  statistics, order) - correct however coarse the statistics, since an unread
+  file keeps every row. The incoming side is held, and the comment says why.
 - **The manifest is the authority on a partition value; the path is layout.**
-  An Iceberg table writes the same `column=value` directories `hive_partitions`
-  reads - through the one renderer every partition value goes through, so a date
-  is `day=2024-01-01` in a table and in a lake alike - and a scan must still take
-  partition values from the manifest tuple: a null value is spelled `null` in a
-  path, and a path cannot say whether that is the string or the absence. A scan
-  compares the manifest's *value* to the filter's, with the text as a fallback,
-  because a value is what the manifest holds and text is what a path can say.
-- **A spec and a schema say the same thing, so neither is invented twice.**
-  `PartitionSpec::partition_field` stamps each tuple child with its transform,
-  its source column, and the partition marker, so `PartitionSpec::from_field`
-  reads the spec back off the tuple; `mark_partitions` marks the schema's own
-  columns, and `PartitionSpec::from_schema` builds an identity spec from a
-  schema that already carries them. A table's stored schema therefore reports
-  its layout whether it was just created or just opened.
+  Tables write the same `column=value` directories through the one renderer,
+  but scans take values from the manifest tuple: a path cannot distinguish
+  the string `null` from absence. Compare the manifest value first, text as
+  fallback.
+- **Spec and schema say the same thing once.** `PartitionSpec::partition_field`
+  stamps transform, source column, and the partition marker on tuple children;
+  `from_field` reads a spec back; `mark_partitions` marks schema columns;
+  `from_schema` builds an identity spec from them.
 - **A transform that cannot place a row is refused by name.** Only `identity`
-  and `void` are invertible here, so a write against a spec using `bucket`,
-  `truncate`, or a calendar transform reports which transform stopped it rather
-  than writing rows into the wrong partition. Reading such a table is
-  unaffected.
-- **Statistics are emitted only where the two encodings agree.** A manifest
-  bound travels as an encoded value; emit one only for the types whose Parquet
-  statistic bytes *are* the Iceberg single-value encoding, and emit counts alone
-  for the rest. A missing statistic costs a planner one file read; a wrong one
-  costs correctness.
-- **A column change is a new schema, built by `SchemaUpdate` and gated by
-  `can_promote`.** The legal promotions are exactly Int32→Int64,
-  Float32→Float64, and decimal(P,S)→decimal(P′,S) with P′≥P at the same scale;
-  everything else is refused naming both sides. Added columns are numbered
-  above `last-column-id` by the core walk, a dropped column's identifier is
-  never reused, and a renamed column keeps its identifier. `TableMetadata`
-  owns the update vocabulary (`set_property`, `set_location`, `assign_uuid`,
-  `upgrade_format_version`, `set_current_schema`, `add_spec`,
-  `set_default_spec`, `add_sort_order`, `set_default_sort_order`,
-  `set_snapshot_ref`, `remove_snapshot_ref`, `remove_snapshots`) and
-  `TableMetadata::validate` runs on load and before every commit, so a broken
-  document can be read but never written.
-- **Every retained snapshot is a complete table, and reading one is an
-  ordinary scan.** Time travel is `scan_at`/`plan_at` with a snapshot id and
-  `snapshot_by_ref` for a branch or tag; the snapshot is read as the schema it
-  was written under. A metadata-only change - a property, a ref, an evolved
-  schema - commits through `Table::commit_changes`, which writes one new
-  document and leaves the in-memory table unchanged on any failure. The
-  table's own record renders as record batches through `inspect_history`,
-  `inspect_snapshots`, and `inspect_files`, under PyIceberg's column names;
-  never add a second, struct-shaped spelling of the same report.
-- **A catalog is a warehouse folder, reached through `IOBase` and nothing
-  else.** `iceberg::Catalog` maps a dotted name (`nyc.taxis`) onto nested
-  folders, creates a table from a schema whose own partition marks supply the
-  spec, and answers create-or-append (`append`) and `overwrite` so a caller
-  who only has rows and a name needs nothing else. It holds no network code
-  and no transaction protocol; a REST catalog remains future work behind an
-  HTTP storage backend. Drop and rename are deliberately absent until the
-  storage contract gains delete and move primitives - name that reason, do not
-  emulate them.
-- **A data file has a target size, and one key names it.** The table property
-  `write.target-file-size-bytes` - falling back to the schema root's
-  `iceberg:write.target-file-size-bytes` protocol property, then Iceberg's 512
-  MiB default - rolls a partition's stream into multiple files at batch
-  boundaries, sized by Arrow in-memory bytes (so Parquet lands under the
-  target, and the docs say so). `Table::compact` rewrites the small-file
-  groups the same rolling way, commits as `replace` carrying every untouched
-  file, reports what it rewrote, and is a no-op that commits nothing when
-  there is nothing to do. A present-but-unparseable size is a typed error
-  naming key and value, never a silent default.
+  and `void` are invertible; `bucket`, `truncate`, calendar transforms reject
+  writes naming the transform. Reads are unaffected.
+- **Statistics only where the encodings agree**: emit a bound only for types
+  whose Parquet statistic bytes are the Iceberg single-value encoding, counts
+  alone otherwise. A missing statistic costs one file read; a wrong one costs
+  correctness.
+- **A column change is a new schema via `SchemaUpdate`, gated by
+  `can_promote`**: exactly Int32->Int64, Float32->Float64,
+  decimal(P,S)->decimal(P',S) with P'>=P; all else refused naming both sides.
+  New columns number above `last-column-id`, dropped ids never reused, renamed
+  columns keep ids. `TableMetadata` owns the update vocabulary
+  (`set_property`, `set_location`, `assign_uuid`, `upgrade_format_version`,
+  `set_current_schema`, `add_spec`, `set_default_spec`, `add_sort_order`,
+  `set_default_sort_order`, `set_snapshot_ref`, `remove_snapshot_ref`,
+  `remove_snapshots`); `validate` runs on load and before every commit, so a
+  broken document reads but never writes.
+- **Every retained snapshot is a complete table.** Time travel:
+  `scan_at`/`plan_at` by snapshot id, `snapshot_by_ref` for a ref, read under
+  the schema it was written with. Metadata-only changes commit through
+  `Table::commit_changes` (one new document; failure leaves memory
+  unchanged). Inspection is `inspect_history`/`inspect_snapshots`/
+  `inspect_files` as record batches under PyIceberg's column names; never a
+  second struct-shaped spelling.
+- **A catalog is a warehouse folder over `IOBase`.** `iceberg::Catalog` maps
+  dotted names to nested folders, creates tables from partition-marked
+  schemas, answers `append` (create-or-append) and `overwrite`. No network,
+  no transaction protocol; REST catalog is future work behind an HTTP
+  backend. Drop/rename are absent until the storage contract gains
+  delete/move - name that reason, do not emulate.
+- **One key names the file-size target**: `write.target-file-size-bytes`,
+  falling back to the schema root's `iceberg:` spelling, then 512 MiB. Rolls
+  a partition's stream at batch boundaries, sized by Arrow in-memory bytes
+  (Parquet lands under target; docs say so). `Table::compact` rewrites
+  small-file groups the same way, commits `replace` carrying untouched files,
+  reports counts, no-ops without a commit when there is nothing to do.
+  Unparseable size = typed error naming key and value, never a silent
+  default.
 - **Every knob is one field of `iceberg::IcebergOptions`, resolved
-  explicit-then-property-then-default.** The keys are Iceberg's own spellings
+  explicit -> table property -> default**, keys in Iceberg's spellings
   (`commit.retry.num-retries`, `commit.retry.min-wait-ms`,
   `commit.retry.max-wait-ms`, `write.target-file-size-bytes`,
   `read.parallelism`, `read.parallel.min-files`,
   `read.parallel.min-file-size-bytes`); the property layer falls back to the
-  schema root's `iceberg:` protocol spelling exactly as the target size always
-  has, and each field has exactly one resolver function - never a second
-  resolution path. An explicit option set with `Table::set_options` lives on
-  the handle alone, is never written to the table, and shadows its property
-  without parsing it, so a broken stored value can be shadowed first and
-  repaired after; each operation resolves only the keys it consults, so a
-  broken `read.*` property cannot block the metadata-only commit that fixes
-  it. Do not add a knob outside this value.
-- **Every commit goes through one retrying gate, and what a retry may do is
-  the operation's nature.** The gate re-checks the current version, counts
-  each newer version as being beaten once, and backs off with full jitter up
-  to `commit.retry.num-retries` times. `append`, `commit_changes`, and
-  everything routed through them *rebase*: data files and the added-entries
-  manifest are written once and reused, the intent re-applies on the winner's
-  document. `overwrite`, `merge`, and `compact` never rebase - they planned
-  against files the winner may have replaced and their input is consumed - so
+  schema root's `iceberg:` spelling; one resolver function per field. A
+  `Table::set_options` override lives on the handle, is never written, and
+  shadows its property without parsing it (broken values can be shadowed then
+  repaired); each operation resolves only the keys it consults. No knob
+  outside this value.
+- **One retrying commit gate; what a retry may do is the operation's
+  nature.** The gate re-checks the version, counts each newer one as beaten,
+  full-jitter backoff up to `commit.retry.num-retries`. `append` and
+  `commit_changes` *rebase* (data files and added-entries manifest written
+  once; intent re-applies on the winner's document). `overwrite`, `merge`,
+  `compact` never rebase (planned files may be replaced, input consumed):
   they wait, re-observe, and exhaust into a `CommitConflict` naming both
-  versions, with in-memory state restored. Say plainly, wherever this
-  surfaces, that `IOBase` has no compare-and-swap: the check is best-effort on
-  plain storage, retries shrink the undetected-race window and cannot close
-  it, and a failed commit leaves at worst orphan data files no snapshot names.
-- **Branches and tags are metadata, with retention per ref.** `SnapshotRef`
-  carries `min-snapshots-to-keep`, `max-snapshot-age-ms`, and
-  `max-ref-age-ms`; `expire_snapshots` honors every ref's own fields before
-  its age cutoff, `main` itself never expires, and a fast-forward must reach
-  the branch head by walking parent ids so it can never lose history. The
-  `Table` conveniences (`create_branch`, `create_tag`, `remove_ref`,
-  `fast_forward`, `expire_snapshots`, `scan_ref`) commit through the retrying
-  gate; writing *to* a non-`main` branch is future work (a commit's parent is
-  always the current snapshot) - name that limit, do not emulate branch
-  writes.
-- **A scan fans out only when the plan earns it, and in plan order always.**
-  Parallel decode starts when `read.parallelism` is at least 2 and at least
-  `read.parallel.min-files` planned files carry recorded sizes of at least
-  `read.parallel.min-file-size-bytes` (defaults 16 files, 4 MiB, parallelism
-  clamped to the host's 1..=8); below the thresholds the sequential
-  single-open path runs. Workers decode and refine whole files, at most
-  `read.parallelism` in flight, and a reorder buffer releases batches
-  strictly in plan order, so parallel and sequential scans are
-  indistinguishable but for speed - never let an optimization change what a
-  caller observes, and never hammer storage beyond the configured width.
-- **An exchange format is validated against an outside implementation.** Round
-  tripping through this crate's own reader proves only that the reader and the
-  writer agree with each other. `scripts/check_iceberg_interop.py` and the
-  `rust/tests/iceberg_interop.rs` target run the exchange with PyIceberg in both
-  directions and compare the actual rows; the Rust half announces on stdout when
-  the external table is absent, so a skipped half can never read as a pass.
+  versions, state restored. Say plainly wherever this surfaces: `IOBase` has
+  no compare-and-swap - retries shrink the race window, cannot close it; a
+  failed commit leaves at worst orphan data files no snapshot names.
+- **Branches and tags are metadata with per-ref retention.** `SnapshotRef`
+  carries `min-snapshots-to-keep`, `max-snapshot-age-ms`, `max-ref-age-ms`;
+  `expire_snapshots` honors them before its cutoff; `main` never expires;
+  fast-forward must reach the branch head by parent ids. Table conveniences
+  (`create_branch`, `create_tag`, `remove_ref`, `fast_forward`,
+  `expire_snapshots`, `scan_ref`) go through the retrying gate. Writing *to*
+  a non-`main` branch is future work (a commit's parent is always the current
+  snapshot) - name that limit, do not emulate.
+- **A scan fans out only when the plan earns it, in plan order always.**
+  Parallel decode requires `read.parallelism` >= 2 and >=
+  `read.parallel.min-files` files of >= `read.parallel.min-file-size-bytes`
+  (defaults 16, 4 MiB; parallelism = host clamped 1..=8); otherwise the
+  sequential path. Workers decode and refine whole files, at most
+  `read.parallelism` in flight; a reorder buffer releases in plan order, so
+  parallel and sequential differ only in speed. Never let an optimization
+  change what a caller observes; never exceed the configured width.
+- **Exchange formats are validated against an outside implementation.**
+  `scripts/check_iceberg_interop.py` + `rust/tests/iceberg_interop.rs` run
+  the exchange with PyIceberg both directions and compare rows; the Rust half
+  prints `SKIPPED` when the external table is absent (the driver fails on
+  that word), so a skipped half can never read as a pass.
 
 ## Documentation organization
 
-- Build the public site with the root `mkdocs.yml`; keep publishable pages
-  below `docs/` and keep the strict GitHub Pages build green. Every added,
-  removed, or renamed page must update the MkDocs navigation and all affected
-  links in the same change.
-- Write guides example-first: put the smallest runnable Rust, Python, or
-  JavaScript example before its explanation, then explain only the behavior,
-  invariants, and tradeoffs the example cannot show. Prefer several focused
-  examples over a long narrative or one oversized example.
-- When a concept is public in multiple runtimes, present equivalent examples
-  in linked Material tabs labeled `Rust`, `Python`, and `JavaScript`, in that
-  order. Keep a single-language example only for an intentional runtime
-  boundary and say why; never invent binding-side logic merely to fill a tab.
-- **One page per core module folder, named after it.** `docs/core/<module>.md`
-  documents `yggdryl::<module>` and nothing else, so the site tree and the source
-  tree are the same tree: `enums`, `datatype`, `field`, `arrow`, `io`, `generic`,
-  `local`, `gzip`, `zlib`, `zstd`, `ipc`, `parquet`, `iceberg`, `uri`, `text`,
-  `json`, `yaml`, `toml`. `docs/extensions/python.md` and
-  `docs/extensions/javascript.md` document only their language boundary, never a
-  second description of core behavior.
-- **Every page opens with one H1 and exactly one short sentence** saying what the
-  module is for, before any prose or example. That sentence is what a reader sees
-  in a search result.
-- **Every example appears in all three languages** - Rust, Python, JavaScript, in
-  that order - showing the same operation. A module the bindings do not expose
-  carries this note directly under its lead sentence instead, and shows Rust
-  alone: `!!! note "Rust only"` / `The Python and JavaScript packages do not
-  expose this module yet.` Never fabricate a binding tab.
-- **Each tab is idiomatic in its own language, not a transliteration.** The three
-  tabs perform the same operation; they do not perform it the same way.
-  - Rust shows the explicit typed call and the `?` on a `Result`.
-  - Python uses the language protocols the binding implements: `len(field)`,
-    `field["key"]`, `for name in field`, `"key" in field`, `field.get(...)`,
-    unpacking, f-strings, `with` for a scoped handle, and keyword arguments with
-    their real defaults (`safe=True`). Show a bare `str`, `bytes`, `pathlib.Path`,
-    or PyArrow value where the binding coerces one, because that is how the
-    binding is meant to be used.
-  - JavaScript uses the generic entry points and the JS protocols: `DataType.from`,
-    `Field.from`, `Url.fromPath`, `Map` iteration over metadata, spread and
-    destructuring, and `for...of`. Prefer the generic `from`/`fromX` constructor
-    over a longer explicit path when both exist.
-  - Never show a language doing something it cannot: check
-    `.api-bindings.txt` first.
-- Split the datatype implementation by responsibility under
-  `rust/src/datatype/` (scalar/integer/floating/temporal/nested, parsing,
-  Arrow interop, and serialization). Modules must own real implementation;
-  do not create empty category files around a monolithic `mod.rs`.
-- Keep Rust examples, tests, and benchmarks categorized like the core. The
-  datatype and field targets use small `datatype.rs`/`field.rs` dispatchers
-  with real cases below `rust/{tests,benches}/{datatype,field}/`. Mirror the
-  implementation responsibility (`generic`, `comparison`, `typed`, parser,
-  Arrow) and split typed cases further into scalar/integer/floating/temporal/
-  binary/decimal/nested only when each file owns meaningful cases; do not add
-  empty category shells. URI remains a focused domain file.
-  Structured-text, JSON, YAML, and TOML targets mirror `text/`, `json/`,
-  `yaml/`, and `toml/` ownership directly; retain stable benchmark group IDs when splitting a
-  Criterion target so measurements remain comparable. Core Arrow runtime
-  regressions are `rust/tests/{arrow_record,default_scalar,tabular,value_bounds}.rs`;
-  its examples are `rust/examples/{arrow_record,tabular}.rs`, and its benchmark
-  sources are `rust/benches/{record_arrow,tabular}.rs` while the stable Cargo
-  benchmark targets remain `record` and `tabular`.
-  Record I/O over a handle is the Cargo benchmark target `io`, dispatched from
-  `rust/benchmarks/io.rs` over `rust/benchmarks/io/{record,pushdown}.rs`. It
-  requires the `parquet` feature, because the column-pushdown comparison needs
-  the one encoding whose projection also skips reading. A pushdown benchmark
-  reports the bytes each read materializes as its Criterion throughput, so
-  "moves less data" is a measured number rather than an inference from elapsed
-  time.
-  The Iceberg exchange with an outside implementation is the Cargo test target
-  `iceberg_interop` (`rust/tests/iceberg_interop.rs`, requiring the `iceberg`
-  feature), driven by `python scripts/check_iceberg_interop.py`. It writes a
-  table for PyIceberg to read and reads one PyIceberg wrote; when the external
-  half is absent it prints `SKIPPED` rather than passing quietly, and the driver
-  fails on that word.
-  Keep extension-owned
-  examples, tests, and benchmarks inside that extension and group them by the
-  same feature named in its documentation. Do not create repository-root
-  extension examples or duplicate core examples in a binding.
-- Every example in the documentation must run, in every language it is shown in.
-  `python scripts/check_docs_examples.py` compiles the `rust` blocks as tests,
-  runs the `python` blocks under `python/.venv`, and runs the `javascript` blocks
-  under node with `@yggdryl/node` rewired to this repository. Each block is
-  self-contained - its own imports, no state carried from a previous block, and
-  at least one assertion proving what the prose claims. A block that genuinely
-  cannot stand alone is tagged `<lang>,ignore`, which the checker reports rather
-  than hides.
-- The notebooks under `docs/notebooks/` and the `Notebooks` section that links
-  them are generated from those same blocks by
-  `python scripts/build_docs_notebooks.py`, which the checker runs and then
-  re-runs to prove it settled. They are outputs, committed so the site can serve
-  them: edit the block, never the notebook or the text between the page's
-  `<!-- notebooks: ... -->` markers. The notebooks ship unexecuted and add no
-  dependency, because no kernel is installed here and a reader runs them
-  elsewhere.
-- Treat `https://platob.github.io/rkp/` as the canonical user guide. The root
-  README is a short landing page linking there; implementation details and
-  exhaustive examples belong in the categorized MkDocs pages.
-- Keep documentation tooling isolated in `requirements-docs.txt`; it must not
-  become a runtime dependency of the Rust core or either extension.
+- Site from root `mkdocs.yml`, pages below `docs/`, strict build stays green;
+  page adds/renames update the nav and links in the same change.
+- Example-first: smallest runnable example, then only what it cannot show.
+  Several focused examples over one oversized one.
+- **One page per core module folder**: `docs/core/<module>.md` documents
+  `yggdryl::<module>` and nothing else (`enums`, `datatype`, `field`,
+  `arrow`, `io`, `generic`, `local`, `gzip`, `zlib`, `zstd`, `ipc`,
+  `parquet`, `iceberg`, `uri`, `text`, `json`, `yaml`, `toml`).
+  `docs/extensions/{python,javascript}.md` document only their boundary.
+- Every page opens with one H1 and exactly one short sentence saying what the
+  module is for.
+- **Every example appears in Rust, Python, JavaScript tabs, in that order**,
+  same operation, each idiomatic - Rust shows typed calls and `?`; Python
+  uses its protocols (`len`, `in`, mapping dunders, `with`, real keyword
+  defaults, bare `str`/`bytes`/`Path`/PyArrow where coerced); JavaScript uses
+  `from` constructors, `Map` iteration, spread, `for...of`. Check
+  `.api-bindings.txt` before showing a language do anything. A module the
+  bindings do not expose shows Rust alone under `!!! note "Rust only"` (or
+  "Rust first" for a pending surface); never fabricate a binding tab.
+- Tests/benchmarks mirror core ownership: dispatchers
+  `rust/{tests,benches}/{datatype,field}.rs` over category files; split typed
+  cases only when each file owns real cases. Structured-text targets mirror
+  `text/`/`json/`/`yaml/`/`toml/`. Keep stable Criterion group IDs when
+  splitting. Arrow-runtime regressions:
+  `rust/tests/{arrow_record,default_scalar,tabular,value_bounds}.rs`;
+  benchmark targets stay `record`, `tabular`, `io` (io needs `parquet`;
+  pushdown benchmarks report materialized bytes as throughput). Iceberg
+  interop is test target `iceberg_interop` (needs `iceberg`). Extension
+  tests/benchmarks live in that extension; no root extension examples.
+- **Every doc example runs**: `python scripts/check_docs_examples.py`
+  compiles rust blocks as tests, runs python blocks under `python/.venv`,
+  runs javascript blocks with `@yggdryl/node` rewired to the repo. Each block
+  is self-contained with at least one assertion; a block that cannot stand
+  alone is tagged `<lang>,ignore` (reported, not hidden).
+- Notebooks under `docs/notebooks/` are generated by
+  `python scripts/build_docs_notebooks.py` from the same blocks, committed,
+  shipped unexecuted. Edit the block, never the notebook or the
+  `<!-- notebooks: ... -->` region.
+- `https://platob.github.io/rkp/` is the canonical guide; the README is a
+  short landing page. Docs tooling stays in `requirements-docs.txt`, never a
+  runtime dependency.
 
 ## Exact method vocabulary
 
-Use names according to ownership and cost. Do not add aliases with different
-verbs for the same operation.
+Names follow ownership and cost; no aliases with different verbs.
 
-- `new`: direct, obvious, infallible construction from native parts.
-- `from_*`: construct a new core value from a named representation or foreign
-  value. A `from_*` function returns `Result` when input needs validation.
-  Examples: `from_str`, `from_arrow`, `from_json`, `from_fields`.
-- `into_*`: consume `self` and produce another owned representation. Reuse
-  allocations or cached state when possible. Examples: `into_arrow`,
-  `into_json`, `into_fields`.
-- `to_*`: borrow `self` and produce an owned value, potentially allocating or
-  incrementing an `Arc`. Examples: `to_arrow`, `to_arrow_ref`, `to_json`.
-- `as_*`: return a borrowed view and never allocate. Examples: `as_str`,
-  `as_fields`, `as_metadata`.
-- `is_*` and `has_*`: side-effect-free predicates.
-- `get`/`get_*`: borrowed lookup with no allocation. Use `get_mut` only when
-  mutation cannot bypass validation or cache invalidation.
-- `set_*`: validated in-place replacement. An error must leave `self`
-  unchanged.
-- `with_*`: consuming persistent update returning the changed value. Prefix
-  with `try_` only when the sibling `set_*` is fallible.
-- `clear_*` removes all values in a named category; `remove_*` removes one
-  keyed/indexed value and returns the prior value when useful.
+- `new`: direct infallible construction from native parts.
+- `from_*`: construct from a named representation; `Result` when validating.
+- `into_*`: consume self into another owned representation, reusing
+  allocations/caches.
+- `to_*`: borrow self, produce an owned value (may allocate / bump an `Arc`).
+- `as_*`: borrowed view, never allocates.
+- `is_*`/`has_*`: side-effect-free predicates.
+- `get`/`get_*`: borrowed lookup, no allocation; `get_mut` only when mutation
+  cannot bypass validation or cache invalidation.
+- `set_*`: validated in-place replacement; error leaves self unchanged.
+- `with_*`: consuming persistent update; `try_` prefix only when the sibling
+  `set_*` is fallible.
+- `clear_*`: remove a category; `remove_*`: remove one keyed value, returning
+  the prior when useful.
 
-Implement standard conversion traits (`From`, `TryFrom`, `FromStr`, `AsRef`)
-in addition to discoverable inherent `from_*`/`into_*` methods. The inherent
-methods are the stable API used by bindings.
+Implement `From`/`TryFrom`/`FromStr`/`AsRef` alongside the inherent
+`from_*`/`into_*`; the inherent methods are the stable API bindings use.
 
 ### Stable core spellings
 
-Keep these conversion names exact; do not add alternate aliases:
+Keep exact; no alternate aliases:
 
-- `Scheme`: common protocol values are associated uppercase constants;
-  arbitrary valid schemes use `from_str`, while `as_str` is the borrowed
-  canonical view. `Scheme` also names the schema-compatibility targets listed
-  in `COMPATIBILITY_TARGETS`; a scheme that is not one parses normally and is
-  rejected by `to_scheme_compat`, never by the parser.
-- `DataTypeId` and `DataTypeKind` are distinct and must not be conflated.
-  `DataType::id` is the parameter-free identity of one variant (`int32`,
-  `decimal128`), `DataType::kind` is the coarse family that variant belongs to
-  (`integer`, `decimal`), and `DataType::name` is `id().as_str()`. Bindings
-  expose both as `id` and `kind` with those exact meanings. A comparison that
-  wants "which variant is this" uses `id`; only behavior that is uniform
-  across a whole family dispatches on `kind`.
-- `TimeUnit`: `from_str` and `FromStr` parse temporal and interval spellings;
-  `as_str` and `AsRef<str>` expose the same allocation-free canonical view;
-  `is_temporal` and `is_interval` distinguish its disjoint Arrow categories.
-  Arrow imports are `from_arrow_time` and `from_arrow_interval`; consuming,
-  category-safe exports are `into_arrow_time` and `into_arrow_interval`.
-  Mirror them with infallible `From<arrow_schema::{TimeUnit, IntervalUnit}>`
-  imports and fallible `TryFrom<TimeUnit>` exports. A temporal unit must never
-  silently project as an interval unit or the reverse. Serialize stable
-  snake_case full-name tokens; deserialize through `TimeUnit::from_str` so
-  documented parser aliases remain accepted.
-- `MimeType`: common values are associated uppercase constants and unknown
-  valid type/subtype values remain supported. Use `from_str`,
-  `from_extension`, `from_path`, `from_content_type`, and
-  `from_content_coding`; borrowed identity is `as_str`, `top_level`,
-  `subtype`, and `structured_suffix`. `extension`, `content_coding`, and
-  `format` are the one reverse-inference table. Category predicates include
-  top-level media classes plus `is_textual`, `is_structured`, `is_tabular`,
-  `is_encoding`, `is_archive`, and conservative `is_binary`.
-- `MediaType`: `new` supplies an unencoded base, `from_parts` validates an
-  ordered encoding sequence, and `from_str`, `from_extension`,
-  `from_extensions`, `from_path`, and `from_content_headers` perform the
-  matching compound inference. `base`, `encodings`, and `encoding` borrow its
-  state. Mutation is `set_base`, `set_encodings`, `push_encoding`, and
-  `clear_encodings`; persistent variants are `with_base` and
-  `try_with_encodings`. The default is `application/octet-stream` with no
-  encodings. Preserve encoding application order and repeated layers; only
-  MIME values classified by the one core table as encodings may occupy the
-  encoding sequence.
-- `Scheme` doubles as the compatibility vocabulary: `Scheme::ARROW`,
-  `SPARK`, `POLARS`, `PANDAS`, and `ICEBERG` are the targets
-  `to_scheme_compat` accepts, and `Scheme::COMPATIBILITY_TARGETS` lists them.
-  `is_compatibility_target` and `is_storage` classify a scheme; `default_port`
-  answers the network ones. Never add a second scheme-like enum. The Iceberg
-  target widens what widens losslessly; the Iceberg *codec* stays strict, so
-  `PrimitiveType::from_data_type` still refuses a datatype the format cannot
-  spell rather than widening it behind a writer's back.
-- `Codec`: the closed content codings are `Identity`, `Gzip`, `Zlib`,
-  `Deflate`, and `Zstd`; `from_str` accepts the legacy `x-` prefix,
-  `from_mime_type`/`from_media_type`/`from_url` recover a coding from a name,
-  and `load`/`dump`/`reader`/`writer` apply it. `Level` is one shared 0-to-9
-  scale mapped onto each codec's native range.
-- `IOKind`: the closed roles are `Memory`, `File`, `Directory`, and `Unknown`,
-  with `is_container`, `is_leaf`, and `is_known` as the derived predicates.
+- `Scheme`: uppercase constants for common protocols; `from_str` for
+  arbitrary valid schemes; `as_str` borrowed canonical. It doubles as the
+  compatibility vocabulary: `ARROW`, `SPARK`, `POLARS`, `PANDAS`, `ICEBERG`
+  in `COMPATIBILITY_TARGETS`, accepted by `to_scheme_compat` (a non-target
+  parses fine, is rejected there, never by the parser);
+  `is_compatibility_target`, `is_storage`, `default_port`. Never a second
+  scheme-like enum. The Iceberg target widens losslessly; the Iceberg codec
+  stays strict (`PrimitiveType::from_data_type` refuses what the format
+  cannot spell).
+- `DataTypeId` vs `DataTypeKind`: `id` is variant identity (`int32`,
+  `decimal128`), `kind` is the family (`integer`, `decimal`), `name` is
+  `id().as_str()`. "Which variant" uses `id`; only family-uniform behavior
+  dispatches on `kind`.
+- `TimeUnit`: `from_str`/`FromStr` parse temporal and interval spellings
+  (ASCII case-insensitive aliases; SQL `year(s)`/`day(s)` -> `YearMonth`/
+  `DayTime`); `as_str`/`AsRef<str>` allocation-free; `is_temporal`/
+  `is_interval` disjoint. Arrow: `from_arrow_time`, `from_arrow_interval`,
+  `into_arrow_time`, `into_arrow_interval`; infallible `From` imports,
+  fallible `TryFrom` exports; never silently cross temporal/interval.
+  Serialize snake_case full names; deserialize via `from_str`.
+- `MimeType`: uppercase constants plus unknown valid values; `from_str`,
+  `from_extension`, `from_path`, `from_content_type`, `from_content_coding`;
+  borrowed `as_str`, `top_level`, `subtype`, `structured_suffix`;
+  `extension`/`content_coding`/`format` are the one reverse table; category
+  predicates include top-level classes plus `is_textual`, `is_structured`,
+  `is_tabular`, `is_encoding`, `is_archive`, conservative `is_binary`.
+- `MediaType`: `new` (unencoded base), `from_parts` (validated encoding
+  sequence), `from_str`, `from_extension`, `from_extensions`, `from_path`,
+  `from_content_headers`; borrowed `base`, `encodings`, `encoding`; mutation
+  `set_base`, `set_encodings`, `push_encoding`, `clear_encodings`;
+  persistent `with_base`, `try_with_encodings`. Default
+  `application/octet-stream`, no encodings. Preserve encoding order and
+  repeats; only core-classified encodings may occupy the sequence.
+- `Codec`: closed set `Identity`, `Gzip`, `Zlib`, `Deflate`, `Zstd`;
+  `from_str` accepts legacy `x-`; `from_mime_type`/`from_media_type`/
+  `from_url`; `load`/`dump`/`reader`/`writer`. `Level` is one shared 0-9
+  scale mapped to each codec's native range.
+- `IOKind`: `Memory`, `File`, `Directory`, `Unknown`; derived
+  `is_container`, `is_leaf`, `is_known`.
 - `DataType`: `from_str`, `from_arrow`, `from_json`, `from_fields`,
   `to_arrow`, `into_arrow`, `to_json`, `into_json`, `as_fields`,
-  `default_value`, `is_default_value`, and `to_scheme_compat`. The generic
-  finite-variant constructor is exactly `variant`; it accepts Fields in
-  declaration order, assigns Arrow type IDs `0..`, and returns the canonical
-  dense `Union` representation rather than introducing a second logical
-  datatype. A variant therefore has `kind() == "union"`, serializes and
-  displays as a dense union, and retains lossless Arrow round trips. It accepts
-  at most 128 members. The `variant(...)` parser spelling is an input alias
-  for this constructor: it accepts only dense layout and sequential IDs from
-  zero, while canonical display remains `union(dense,...)`.
-  The generic wide-decimal constructor is exactly `decimal`; it selects `decimal128` for
-  precision 1..=38 and `decimal256` for precision 39..=76, then delegates all
-  validation to that explicit constructor. The generic time-of-day constructor
-  is exactly `time`; it selects `time32` for seconds/milliseconds and `time64`
-  for microseconds/nanoseconds, then delegates validation to that explicit
-  constructor. Interval layouts are rejected without selecting a physical
-  width.
+  `default_value`, `is_default_value`, `to_scheme_compat`. Generic
+  finite-variant constructor is exactly `variant`: Fields in declaration
+  order, Arrow type IDs `0..`, canonical dense `Union` (kind `union`, dense
+  display, lossless Arrow round trip, <=128 members); parser `variant(...)`
+  is input sugar accepting only dense sequential-from-zero, displaying as
+  `union(dense,...)`. Generic `decimal` selects decimal128 (P 1..=38) or
+  decimal256 (39..=76), then delegates validation; generic `time` selects
+  time32 (s/ms) or time64 (us/ns) likewise; intervals are rejected without
+  selecting a width.
 - `Field`: `from_parts`, `from_str`, `from_arrow`, `from_arrow_ref`,
   `from_json`, `to_arrow`, `to_arrow_ref`, `into_arrow`, `into_arrow_ref`,
-  `to_json`, `into_json`, `default_value`, and `to_scheme_compat`.
+  `to_json`, `into_json`, `default_value`, `to_scheme_compat`.
 - Field mutation: `set_name`, `set_data_type`, `set_nullable`,
   `set_dictionary_options`, `set_metadata`, `insert_metadata`,
-  `update_metadata`, `remove_metadata`, and `clear_metadata`.
-- Persistent Field updates: `with_name`, `try_with_data_type`,
-  `with_nullable`, `try_with_dictionary_options`, `try_with_metadata`,
-  `try_with_metadata_entries`, and `with_metadata_removed`.
+  `update_metadata`, `remove_metadata`, `clear_metadata`. Persistent:
+  `with_name`, `try_with_data_type`, `with_nullable`,
+  `try_with_dictionary_options`, `try_with_metadata`,
+  `try_with_metadata_entries`, `with_metadata_removed`.
 - Shared Field properties: borrowed `alias`, `catalog_name`, `schema_name`,
-  `table_name`; typed `location`; matching `set_*`, `remove_*`, and consuming
-  `try_with_*`/`with_location` methods. Protocol properties use only
-  `get_property`, `has_property`, `set_property`, `remove_property`,
-  `clear_properties`, `property_iter`, `try_with_property`, and
-  `with_properties_cleared`.
-- One protocol's properties also have a view that remembers the protocol:
-  `Metadata::protocol`, `Field::protocol`, and `Field::protocol_mut`, plus one
-  named accessor per well-known protocol generated from the single list in
-  `metadata.rs` (`field.iceberg()`, `field.iceberg_mut()`,
-  `metadata.postgres()`, ...; `https` is deliberately absent because it shares
-  the canonical `http:` namespace). A view is a borrow, never a copy. Its
-  vocabulary is the collection one - `get`, `contains_key`, `len`, `is_empty`,
-  `iter`, `next_entry`, `key`, `insert`, `update`, `set`, `remove`, `clear` -
-  where `set` replaces only that protocol's properties and leaves every other
-  key alone. Mutation still goes through Field's cache-aware methods; a view
-  never touches metadata storage itself. Bindings project the view as one live
-  mapping object (Python mapping dunders, JavaScript Map protocol), not as a
-  snapshot copy.
-- A Field can act as a partition column: the reserved `field:partition` marker,
-  read with `is_partition` and written with `set_partition`/`with_partition`,
-  says a path spells this column out. A struct root answers
-  `partition_fields`, `partition_field_names`, `partition_field_len`,
-  `has_partition_fields`, `only_partition_fields`, `without_partition_fields`,
-  and `with_partition_fields`. An unmarked field stores no marker at all, so
-  two schemas that partition the same way stay exactly equal.
-- Arrow/Parquet Field identity is exactly `parquet_field_id`,
-  `set_parquet_field_id`, `remove_parquet_field_id`, and
-  `with_parquet_field_id`, with the schema-tree walks
-  `assign_parquet_field_ids`, `max_parquet_field_id`, and
-  `field_by_parquet_field_id`. Store it under the exact Arrow convention
-  `PARQUET:field_id` as a canonical signed 32-bit decimal integer. Generic
-  metadata construction, import, parsing, and deserialization must apply the
-  same validation and canonicalization; do not introduce a second field-id
-  key, do not add a generically named `id` alias on `Field`, and do not
-  confuse it with an independent protocol property such as
-  `iceberg:field_id`.
-- HTTP Field reads expose raw `accept*`, `cache_control`, `content_*`, `etag`,
-  `expires`, `last_modified`, `range`, and `vary` values plus typed
-  `content_length`, `http_location`, `mime_type`, and `media_type` projections.
-  Raw mutation uses matching `set_*`/`remove_*` methods. `set_mime_type`
-  changes only Content-Type; `set_media_type` and `remove_media_type` update
-  Content-Type and Content-Encoding as one transaction. Unsupported HTTP
-  codings or malformed prior state must leave metadata and Arrow caches
-  unchanged. Keep the preexisting bare `location` distinct from
-  `http_location`.
+  `table_name`; typed `location`; matching `set_*`/`remove_*`/`try_with_*`/
+  `with_location`. Protocol properties: only `get_property`, `has_property`,
+  `set_property`, `remove_property`, `clear_properties`, `property_iter`,
+  `try_with_property`, `with_properties_cleared`.
+- Protocol views: `Metadata::protocol`, `Field::protocol`,
+  `Field::protocol_mut`, plus one named accessor per well-known protocol
+  generated from the single list in `metadata.rs` (`field.iceberg()`,
+  `field.iceberg_mut()`, `metadata.postgres()`, ...; `https` absent - it
+  shares `http:`). A view is a borrow, never a copy; vocabulary is `get`,
+  `contains_key`, `len`, `is_empty`, `iter`, `next_entry`, `key`, `insert`,
+  `update`, `set` (replaces only that protocol's properties), `remove`,
+  `clear`. Mutation goes through Field's cache-aware methods. Bindings
+  project the view as one live mapping (Python mapping dunders, JS Map
+  protocol), never a snapshot copy.
+- Partition marker: reserved `field:partition`, read `is_partition`, written
+  `set_partition`/`with_partition`. Struct roots answer `partition_fields`,
+  `partition_field_names`, `partition_field_len`, `has_partition_fields`,
+  `only_partition_fields`, `without_partition_fields`,
+  `with_partition_fields`. Unmarked fields store nothing, so equally
+  partitioned schemas stay exactly equal.
+- Arrow/Parquet field identity is exactly `parquet_field_id`,
+  `set_parquet_field_id`, `remove_parquet_field_id`, `with_parquet_field_id`,
+  and the walks `assign_parquet_field_ids`, `max_parquet_field_id`,
+  `field_by_parquet_field_id`; stored under `PARQUET:field_id` as canonical
+  signed 32-bit decimal, with the same validation on every construction and
+  import path. No second field-id key, no generic `id` alias on `Field`, no
+  confusion with e.g. `iceberg:field_id`.
+- HTTP Field reads: raw `accept*`, `cache_control`, `content_*`, `etag`,
+  `expires`, `last_modified`, `range`, `vary`; typed `content_length`,
+  `http_location`, `mime_type`, `media_type`. Raw mutation via matching
+  `set_*`/`remove_*`. `set_mime_type` changes Content-Type only;
+  `set_media_type`/`remove_media_type` update Content-Type and
+  Content-Encoding as one transaction; failures leave metadata and Arrow
+  caches unchanged. Bare `location` stays distinct from `http_location`.
 - `Metadata`: `new`, `from_entries`, `from_arrow`, `from_json`, `to_arrow`,
-  `into_arrow`, `to_json`, `into_json`, `get`, `contains_key`, `iter`, and
+  `into_arrow`, `to_json`, `into_json`, `get`, `contains_key`, `iter`,
   `protocol`.
-- `Uri`, `Url`, and `Urn`: `from_str`, `from_path`, `from_uri`, `to_json`,
-  `into_json`, `to_uri`, and `into_uri` where the conversion is meaningful.
-  `Uri` additionally uses `to_url`, `into_url`, `to_urn`, and `into_urn`;
-  file `Uri`/`Url` values use `to_path` and `into_path`. Component
-  access is spelled `scheme`, `authority`, `path`, `query`, `fragment`,
-  `namespace`, and `namespace_specific`. Component newtypes expose borrowed
-  strings through `as_str`; full identifiers use `Display`/`to_string` so the
-  canonical form is not duplicated in storage.
-- Resource-path access is spelled `path_segments`, `file_name`, `extension`,
-  `extensions`, and `stem`. Iterators borrow the identifier and must not
-  allocate. Filename mutation is `set_file_name`, `set_stem`,
-  `set_extension`, `set_extensions`, `remove_extension`, and
-  `clear_extensions`; it is atomic and preserves unrelated URI components.
-  MIME access is `mime_type` and `media_type`; matching setters rewrite only
-  the inferred filename suffix chain through the core preferred-extension
-  table and reject a type with no known extension without changing the value.
-- `Format`: `from_str`, `from_extension`, `from_path`, `as_str`, and
-  `extension`. The stable variants are `Json`, `JsonLines`, `Yaml`, and `Toml`;
-  extension inference recognizes `.json`, `.jsonl`, `.ndjson`, `.yaml`, and
-  `.yml`, and `.toml` without opening a file.
-- Structured text: generic format dispatch lives in `text::{from_str,
-  from_slice, from_reader, from_str_all, from_slice_all, from_reader_all,
-  from_reader_iter, from_str_inferred, from_slice_inferred, to_vec, into_vec,
-  to_writer, to_writer_all}`. First-class
-  `json`, `yaml`, and `toml` modules mirror the same borrowed-string, byte,
-  reader, and writer vocabulary without a format argument; JSON Lines additionally uses
-  `json::from_lines_str` for borrowed line-delimited text. `codec` re-exports
-  the complete generic surface for source compatibility only. A
-  `_with_limits` form is used only where caller limits differ from safe
-  defaults; do not duplicate string-first serializers. Redirected TOML output
-  calls `toml::validate_for_write_with_limits` before opening or truncating a
-  destination, using the runtime's decode limits, then streams through
-  `to_writer`. Rust callers using core defaults may use `validate_for_write`.
-- `TypedValue` is one value paired with the datatype it belongs to, validated
-  against it on construction. It carries the same compile-time markers a Field
-  does - `TypedValue<K>` where `K` is a `FieldType`, one alias per datatype
-  (`Int64Value`, `Utf8Value`, ...), and `AnyType` for a pairing that has not
-  been narrowed, which is the default. Narrowed construction is `try_from_parts`
-  and `try_from_value`, the dynamic pairing keeps `from_parts` and `from_value`,
-  and a statically known datatype adds `new`. Never add a second marker family:
-  a value and a field spell the same one.
-- Codec values: validated construction uses `Value::from_sequence` and
-  `Value::from_mapping`; `Float` exposes borrowed state through `as_f64` and
-  consumes through `into_f64`. There is no application-tag carrier: a name over
-  an untyped payload is not a type, because nothing checks that the payload
-  matches the name. Every kind a `Value` holds is a variant that carries its own
-  parts, and a name a format spells that no variant holds is ordinary data.
-  Never reintroduce `Tag`, `TaggedValue`, or a `Value::Tagged` variant.
+- `Uri`/`Url`/`Urn`: `from_str`, `from_path`, `from_uri`, `to_json`,
+  `into_json`, `to_uri`, `into_uri` where meaningful; `Uri` adds `to_url`,
+  `into_url`, `to_urn`, `into_urn`; file values add `to_path`, `into_path`.
+  Components: `scheme`, `authority`, `path`, `query`, `fragment`,
+  `namespace`, `namespace_specific`; component newtypes expose `as_str`;
+  full identifiers use `Display`.
+- Resource paths: `path_segments`, `file_name`, `extension`, `extensions`,
+  `stem`; iterators borrow without allocating. Filename mutation:
+  `set_file_name`, `set_stem`, `set_extension`, `set_extensions`,
+  `remove_extension`, `clear_extensions` - atomic, preserving unrelated
+  components. MIME access `mime_type`/`media_type`; setters rewrite only the
+  inferred suffix chain via the core preferred-extension table and reject a
+  type with no known extension unchanged.
+- `Format`: `from_str`, `from_extension`, `from_path`, `as_str`,
+  `extension`; variants `Json`, `JsonLines`, `Yaml`, `Toml`; extensions
+  `.json`, `.jsonl`, `.ndjson`, `.yaml`, `.yml`, `.toml` without opening the
+  file.
+- Structured text: generic dispatch in `text::{from_str, from_slice,
+  from_reader, from_str_all, from_slice_all, from_reader_all,
+  from_reader_iter, from_str_inferred, from_slice_inferred, to_vec,
+  into_vec, to_writer, to_writer_all}`; `json`/`yaml`/`toml` mirror the same
+  vocabulary without a format argument; `json::from_lines_str` for JSON
+  Lines. `codec` re-exports for compatibility only. `_with_limits` forms only
+  where caller limits differ; no duplicate string-first serializers.
+  Redirected TOML output calls `toml::validate_for_write_with_limits`
+  (runtime decode limits) before opening a destination, then streams via
+  `to_writer`; core-default callers may use `validate_for_write`.
+- `TypedValue`: one value paired with its datatype, validated on
+  construction, sharing Field's marker family - `TypedValue<K: FieldType>`,
+  one alias per datatype (`Int64Value`, `Utf8Value`, ...), `AnyType` default.
+  Narrowed: `try_from_parts`, `try_from_value`; dynamic: `from_parts`,
+  `from_value`; static datatypes add `new`. Never a second marker family.
+- Codec values: `Value::from_sequence`, `Value::from_mapping`; `Float` has
+  `as_f64`/`into_f64`. No application-tag carrier: a name over an untyped
+  payload is not a type. Never reintroduce `Tag`, `TaggedValue`, or
+  `Value::Tagged`.
 
-Python mirrors these names in `snake_case`. JavaScript exposes the same native
-operations in conventional casing (`from_str` maps to `fromString`, other
-underscores map to camelCase); generic `from`/`from_value` inference belongs only
-at the extension boundary and must immediately dispatch to the matching core
-`from_*` or conversion trait.
+Python mirrors these in `snake_case`; JavaScript maps `from_str` ->
+`fromString` and other underscores to camelCase. Generic `from`/`from_value`
+inference exists only at the extension boundary and dispatches immediately to
+the matching core method.
 
 ## Error message contract
 
-An error must let a caller fix the input without reading the source. State
-what was expected, what was actually observed, and where. A message that only
-names a rule is incomplete.
+An error lets the caller fix the input without reading source: expected,
+actual, where.
 
-- Always show the offending value next to the expectation. Prefer the
-  `expected X, got Y` shape and render both sides with the same formatter so a
-  reader can diff them by eye. Write
-  `temporal precision must be between 0 and 9, got 12`, never
-  `temporal precision must be between 0 and 9`. Write
-  `dictionary key must be an integer datatype, got utf8`, never
-  `dictionary key is not an integer`.
-- Locate the failure. Nested schema, record, and value errors carry the
-  dot/bracket path to the failing node; parser and codec errors carry the byte
-  position; tabular errors carry the batch index or resource URL. A path is
-  required whenever recursion can reach more than one node.
-- When two structured values disagree, reuse the shared diff vocabulary rather
-  than hand-writing a comparison sentence. Schema mismatches must render
-  through the same `show_diff`/`show_diffs` symbols (`≠`, `−`, `+`, `→`, `↳`,
-  `✓`) used by value comparison so one display grammar covers both, and must
-  report every differing node rather than only the first.
-- Prefer a typed variant with named fields over an interpolated catch-all
-  string. A variant that carries `expected`, `actual`, and `path` as fields can
-  be inspected and localized by bindings; a formatted `String` cannot. Do not
-  widen a catch-all variant to cover a case that deserves its own fields.
-- Quote user-supplied names and string values with `{value:?}` so empty
-  strings, trailing spaces, and control characters are visible. Render
-  datatypes and fields through their canonical `Display`, not `Debug`.
-- Truncate unbounded values with the shared text limits before interpolating
-  them; an error message must never allocate proportionally to an input
-  payload.
-- Errors must leave the receiver unchanged, and the message must not imply a
-  partial write occurred.
-- Keep one layered error family: `yggdryl::Error` owns schema, identifier, and
-  codec failures, and `yggdryl::arrow::Error` wraps it for runtime boundaries.
-  Do not introduce a third parallel enum; a downstream backend reports through
-  `Error::external` and preserves its source chain.
-- Bindings surface the native message unchanged and map variants to idiomatic
-  exception types. Never rewrite, re-prefix, or re-translate a core message in
-  Python or JavaScript.
+- Show the offending value next to the expectation, `expected X, got Y`
+  shape, both sides through the same formatter. `temporal precision must be
+  between 0 and 9, got 12`, never the rule alone.
+- Locate the failure: dot/bracket path for nested schema/record/value
+  errors, byte position for parser/codec, batch index or URL for tabular. A
+  path is required wherever recursion reaches more than one node.
+- Structured disagreements render through the shared `show_diff`/`show_diffs`
+  vocabulary (`≠`, `−`, `+`, `→`, `↳`, `✓`), reporting every differing node.
+- Prefer typed variants with `expected`/`actual`/`path` fields over
+  interpolated strings; do not widen a catch-all for a case deserving fields.
+- Quote user strings with `{value:?}`; render datatypes/fields via canonical
+  `Display`. Truncate unbounded values with the shared text limits - never
+  allocate proportionally to the payload.
+- Errors leave the receiver unchanged and must not imply a partial write.
+- One layered family: `yggdryl::Error` owns schema/identifier/codec
+  failures; `yggdryl::arrow::Error` wraps it at runtime boundaries; no third
+  enum; downstream backends report via `Error::external` preserving the
+  chain.
+- Bindings surface the native message unchanged, mapped to idiomatic
+  exception types; never rewrite or re-prefix it.
 
 ## Native value behavior
 
-- Implement `Clone`, `Debug`, `Display`, `Eq`, `Ord`, `Hash`, `Serialize`, and
-  `Deserialize` wherever the value semantics permit it. Ignore caches in
-  equality, ordering, hashing, and serialization.
-- Field and datatype comparison uses `equals(other, with_metadata)`,
-  `show_diffs(other, with_metadata)`, and `show_diff(other, with_metadata)`.
-  `with_metadata=false` ignores only Field metadata recursively. Keep
-  `show_diffs` lazy and make terminal output stable UTF-8 without ANSI escape
-  sequences: prefer compact symbols such as `≠`, `−`, `+`, `→`, `↳`, and `✓`
-  with an unambiguous path on every line. `show_diff` joins the iterator with
-  newlines and returns `✓ equal` when it is empty. FFI runtimes must store the
-  core owning difference cursor; never collect the native iterator into a
-  list merely to satisfy host-language lifetime rules.
-- `Display` is canonical and must round-trip through `FromStr` without loss.
-  `Debug` is diagnostic and must not be the serialization format.
-- Collections expose deterministic iteration, length, indexed lookup, named
-  lookup where names exist, `IntoIterator`, and `Index` only when panic-on-
-  missing is normal Rust collection behavior. Mutation must preserve ordering,
-  uniqueness, validation, and Arrow-cache correctness.
-- Serialization is version-independent structural data. Deserialization routes
-  through the same validation used by constructors and parsers.
-- Never panic, unwrap, or rely on unsafe code for caller-controlled input.
-- `Scheme`, `Authority`, and `UriPath` are validated, owned, non-null values.
-  RFC-permitted absence is represented by an empty component, never `Option` or
-  a binding-language null; query and fragment are optional components.
+- Implement `Clone`, `Debug`, `Display`, `Eq`, `Ord`, `Hash`, `Serialize`,
+  `Deserialize` where semantics permit; caches are ignored by all of them.
+- Comparison: `equals(other, with_metadata)`, `show_diffs`, `show_diff`;
+  `with_metadata=false` ignores Field metadata recursively. `show_diffs` is
+  lazy; output is stable UTF-8 without ANSI, symbols as above, unambiguous
+  path per line; `show_diff` joins with newlines, `✓ equal` when empty. FFI
+  runtimes store the core difference cursor, never collect the iterator to
+  satisfy lifetimes.
+- `Display` is canonical and round-trips through `FromStr`; `Debug` is
+  diagnostic, never the serialization format.
+- Collections: deterministic iteration, length, indexed and named lookup,
+  `IntoIterator`; `Index` only where panic-on-missing is normal. Mutation
+  preserves ordering, uniqueness, validation, Arrow-cache correctness.
+- Serialization is version-independent structural data; deserialization
+  routes through constructor/parser validation.
+- Never panic, unwrap, or use unsafe for caller-controlled input.
+- `Scheme`, `Authority`, `UriPath` are validated owned non-null values;
+  RFC-permitted absence is an empty component, never `Option`/null; query
+  and fragment are optional components.
 
 ## Parser contract
 
 - `DataType::from_str` and `Field::from_str` are the only recursive schema
-  grammar engines. Bindings must call them rather than pre-parsing type
-  expressions.
-- `TimeUnit::from_str` is the one flat unit-value parser. It accepts canonical
-  unit display plus documented, ASCII case-insensitive temporal and interval
-  aliases; datatype parsing must reuse it rather than keep a second unit-word
-  table. Direct SQL `year`/`years` and `day`/`days` aliases map to `YearMonth`
-  and `DayTime`. A bare datatype `interval` defaults to `MonthDayNano`; its
-  canonical display must make that layout explicit.
-- Accept canonical Yggdryl output plus common Arrow, SQL, Hive, and Spark forms.
-  Matching of type keywords is ASCII case-insensitive; field names and quoted
-  values retain case and Unicode.
-- Support arbitrarily nested lists/arrays, structs/rows, maps, dictionaries,
-  unions, run-end encoding, decimals, fixed-size values, and temporal
-  parameters up to an explicit recursion limit.
-- Treat `variant(...)` as finite dense-union input sugar, not a new logical
-  datatype. Assign omitted member IDs sequentially from zero, reject sparse
-  mode and non-sequential explicit IDs, enforce Arrow's 128-member type-ID
-  limit while consuming input, and canonicalize display to `union(dense,...)`.
-- Generic `decimal` and `numeric` syntax must call `DataType::decimal` so the
-  parser and programmatic constructor select the same physical width. Explicit
-  `decimal128` and `decimal256` spellings retain their exact width limits.
-- Generic `time` syntax must call `DataType::time` so SQL precision and unit
-  spellings select the same physical width as programmatic construction.
-  Explicit `time32` and `time64` spellings retain their exact unit limits.
-- Accept balanced optional outer `()`, `[]`, `{}`, single quotes, or double
-  quotes. Never strip unmatched or interior delimiters heuristically.
-- Split only at top-level separators, honor quoting and escapes, reject trailing
-  tokens, duplicate field names/type IDs, invalid nullability, and malformed
-  numeric parameters, and return errors with a byte position and context.
-- Add round-trip and adversarial tests for every new grammar branch. Benchmark
-  cold scalar parsing, deeply nested parsing, and parse/display round trips.
+  grammars; bindings never pre-parse type expressions. `TimeUnit::from_str`
+  is the one flat unit parser; datatype parsing reuses it. Bare `interval`
+  defaults to `MonthDayNano`, displayed explicitly.
+- Accept canonical output plus common Arrow, SQL, Hive, Spark forms; type
+  keywords ASCII case-insensitive, names and quoted values keep case and
+  Unicode.
+- Support arbitrarily nested lists, structs, maps, dictionaries, unions,
+  run-end encoding, decimals, fixed-size, and temporal parameters up to an
+  explicit recursion limit.
+- `variant(...)` is dense-union sugar (sequential IDs from zero, 128-member
+  cap enforced while consuming, sparse rejected, canonical display
+  `union(dense,...)`). Generic `decimal`/`numeric` syntax calls
+  `DataType::decimal`; generic `time` calls `DataType::time`; explicit
+  `decimal128`/`decimal256`/`time32`/`time64` keep exact limits.
+- Accept balanced optional outer `()`, `[]`, `{}`, single or double quotes;
+  never strip unmatched or interior delimiters heuristically.
+- Split only at top-level separators, honor quoting/escapes, reject trailing
+  tokens, duplicate names/type IDs, invalid nullability, malformed numbers;
+  errors carry byte position and context.
+- Every new grammar branch gets round-trip and adversarial tests; benchmark
+  cold scalar parsing, deep nesting, parse/display round trips.
 
 ## JSON, YAML, and TOML codec contract
 
-- The Rust boundary is UTF-8 byte-first: parse borrowed byte slices or `Read`,
-  and emit `Vec<u8>` or `Write`. Borrowed `&str` conveniences use the same
-  parser directly and must not allocate an intermediate UTF-8/byte input
-  buffer or repeat UTF-8 validation. Parsing still allocates the owned strings and
-  containers required by the resulting `Value`; never describe construction
-  of an owned value tree as allocation-free parsing.
-- One native `Value` is the lossless superset for all three formats. It preserves
-  signed and unsigned 64/128-bit integers, total-order floating values, bytes,
-  sequences, and ordered arbitrary-key mappings. Shared nested
-  values use immutable `Arc` storage and empty values avoid backing allocation.
-- Plain JSON remains plain JSON. Values outside JSON's data model use one
-  exact, versioned `$yggdryl` envelope. An ordinary mapping that has the same
-  shape must be escaped through the mapping envelope so user data can never be
-  mistaken for a typed value.
-- The `!yggdryl/*` YAML machine tags name kinds the value model has, and each
-  one selects the payload it names. Every other YAML tag is the annotation YAML
-  defines it to be: no value can hold a free-form name, so the node decodes as
-  the plain value it annotates rather than failing a readable document. Nothing
-  on the write path emits a non-core YAML tag. Comments are never consulted for
-  decoding because parsers may discard them; never make type safety or
-  reconstruction depend on comments.
-- TOML implements TOML 1.1 with the newest pinned `toml` release that retains
-  the Rust 1.85 floor. Decode its borrowed, spanned `DeTable`/`DeValue` tree so
-  user keys cannot collide with Serde's private datetime marker and syntax,
-  duplicate-key, budget, and envelope errors retain original byte positions.
-  The root is always a table: empty and comment-only explicit TOML documents
-  decode as an empty mapping. Native date/time values decode to the temporal
-  they name: an offset or local date-time to a timestamp whose count is UTC and
-  whose zone is the offset or absent, a local date to a date, a local time to a
-  time, each at the coarsest unit that keeps every digit its spelling carries. A
-  temporal projects back as native TOML date/time syntax exactly when TOML can
-  spell it, meaning a four-digit year, a zone that is a fixed offset rather than
-  a place, and a clock reading inside one day; every other temporal, and every
-  decimal, uses the typed envelope so a round trip never changes a value.
-- TOML has no multi-document stream. Its `from_*_all` forms return exactly one
-  value, including the empty root table, and its `to_writer_all` form rejects
-  zero values or a second value before writing. Root-scalar, null, bytes,
-  unsigned/wide integer, decimal, arbitrary-key mapping, and unspellable
-  temporal values use a versioned `$yggdryl` envelope carrying the same
-  payload JSON and YAML carry; escape user mappings that would collide with
-  that envelope. Every envelope kind names a `Value` variant, so a `type` that
-  names nothing the value model holds is not an envelope and its table decodes
-  as the ordinary mapping it is. Native TOML integers decode as signed 64-bit values and
-  overflow is rejected; preserve each non-native integer storage variant in
-  its typed envelope. Count the root table as depth one and preflight the exact
-  wire projection before writing so every emitted value is accepted by the
-  same published hard depth cap.
-- A decoded document never names a class. A binding constructs a class only from
-  a target the caller passed in, and must never import a module, evaluate a
-  name, invoke a constructor, or mutate globals because of anything an untrusted
-  document contains.
-- Default limits bound input bytes, nesting depth, produced nodes, document
-  count, aliases, and other expansion work. Limits apply while reading, not
-  after materializing an unbounded tree. Depth and node budgets apply per
-  document; byte and document budgets apply to the complete stream. Errors
-  identify the format and the original byte position when the parser provides
-  it. Recursive implementations also publish and enforce a conservative hard
-  parser depth; a caller-supplied `Limits` value must never be able to turn
-  nesting into stack exhaustion.
-- Multi-document streaming iterators consume one JSON Lines row/YAML document
-  at a time and surface an error at the failing item; streaming writers encode
-  directly to the caller's sink with backpressure. A single-document async
-  convenience may use one explicitly bounded byte buffer when the language
-  runtime cannot bridge its async reader into Rust `Read`; document that
-  distinction and never describe the bounded single-document helper as
-  incremental parsing.
-- Format inference is deterministic. Real path suffixes select JSON, JSON
-  Lines, YAML, or TOML. Bindings treat a path-like object as a path, byte-like input
-  as content, and a string as a path only when it names an existing file;
-  otherwise the string is UTF-8 document content. An explicit format wins.
-- Content inference uses core `text::from_{str,slice}_inferred` so a successful
-  document is not parsed twice. JSON wins, empty/comment-only input retains its
-  YAML interpretation, a complete nonempty TOML document wins next, and all
-  remaining input is YAML. JSON Lines is never content-inferred. Use
-  `text::infer_format(&[u8])` only when the decoded `Value` is not needed.
-  Empty/comment-only inference returns `Format::Yaml`; the combined inferred
-  decode then preserves YAML's existing zero-document error.
-- Benchmark slice parsing, reader streaming, vector emission, writer emission,
-  enveloped/exotic values, wide mappings, and deep structures. Retain a baseline
-  for allocation-sensitive hot paths and report throughput rather than calling
-  unmeasured code optimized.
+- Byte-first boundary: parse borrowed slices or `Read`, emit `Vec<u8>` or
+  `Write`. `&str` conveniences use the same parser without an intermediate
+  buffer or repeated UTF-8 validation. Parsing still allocates the owned
+  `Value` tree - never call it allocation-free.
+- One `Value` is the lossless superset: signed/unsigned 64/128-bit integers,
+  total-order floats, bytes, sequences, ordered arbitrary-key mappings;
+  shared nesting via immutable `Arc`; empty values without backing
+  allocation.
+- Plain JSON stays plain. Values outside JSON's model use the one versioned
+  `$yggdryl` envelope; an ordinary mapping with that shape is escaped so user
+  data is never mistaken for a typed value.
+- `!yggdryl/*` YAML tags name kinds the value model has and select their
+  payloads; every other tag is an annotation whose node decodes as its plain
+  value. The write path emits no non-core tag. Comments are never consulted.
+- TOML: TOML 1.1 on the newest pinned `toml` keeping the 1.85 floor; decode
+  the borrowed spanned `DeTable`/`DeValue` tree (no Serde datetime-marker
+  collisions; byte positions retained). Root is always a table; empty
+  documents decode as empty mappings. Native date/times decode to the
+  temporal they name at the coarsest unit keeping every digit; a temporal
+  projects back as native TOML syntax exactly when TOML can spell it
+  (four-digit year, fixed offset, within one day) - otherwise, and for every
+  decimal, the typed envelope. No multi-document stream: `from_*_all`
+  returns exactly one value; `to_writer_all` rejects zero or two.
+  Root-scalar/null/bytes/unsigned-or-wide-integer/decimal/arbitrary-key/
+  unspellable-temporal use the envelope (same payloads as JSON/YAML);
+  colliding user mappings are escaped; a `type` naming nothing the model
+  holds decodes as the mapping it is. Native integers are signed 64-bit,
+  overflow rejected; non-native storage variants keep typed envelopes. Root
+  table counts as depth one; preflight the exact wire projection against the
+  published hard depth cap before writing.
+- A decoded document never names a class: bindings construct classes only
+  from caller-passed targets; never import, evaluate, construct, or mutate
+  globals from untrusted content.
+- Default limits bound bytes, depth, nodes, documents, aliases, applied
+  while reading, per document for depth/nodes and per stream for
+  bytes/documents; errors name format and byte position. Recursive parsers
+  publish and enforce a conservative hard depth a caller-supplied `Limits`
+  cannot exceed.
+- Streaming iterators consume one row/document at a time and fail at the
+  failing item; streaming writers encode to the sink with backpressure. An
+  async single-document convenience may use one bounded buffer - documented,
+  never called incremental parsing.
+- Inference is deterministic. Path suffixes select the format; bindings
+  treat path-likes as paths, byte-likes as content, strings as paths only
+  when naming an existing file; explicit format wins. Content inference uses
+  `text::from_{str,slice}_inferred` (parse once): JSON wins, empty or
+  comment-only stays YAML, complete nonempty TOML next, remainder YAML;
+  JSON Lines is never content-inferred; `text::infer_format(&[u8])` only
+  when the value is not needed.
+- Benchmark slice parsing, reader streaming, vector and writer emission,
+  enveloped values, wide mappings, deep structures; keep allocation
+  baselines; report throughput rather than calling unmeasured code
+  optimized.
 
 ## Arrow and allocation contract
 
-- Represent every `DataType` variant with one sealed, zero-sized marker and a
-  discoverable `*Field` alias over `TypedField<K>`. `TypedField<K>` contains
-  exactly one generic `Field`; `TypedFieldRef<'_, K>` contains exactly one
-  borrowed Field pointer. Never duplicate datatype parameters, metadata,
-  caches, or child state in the typed layer. Generic-to-typed owned and
-  borrowed conversions validate the complete Field before proving the marker.
-  Do not expose `DerefMut`, `as_field_mut`, or another unchecked route that can
-  replace the datatype behind `K`; marker-safe mutation must retain the same
-  variant and leave the value unchanged on error.
-- Preserve lossless Arrow schema parity. Validate at construction/import and
-  at a cold projection boundary; do not validate again per record or cache hit.
-- Project Arrow C Data Interface schemas only through
-  `DataType::to_arrow_ffi` and `Field::to_arrow_ffi`. These core methods own
-  recursive child, dictionary, nullability, ordering, metadata, and datatype
-  flag repair for the pinned Arrow version. Bindings must import that schema
-  directly and must not maintain another recursive FFI-schema builder.
-- Import both Arrow unit enums into the unified `TimeUnit` without failure.
-  Export through the matching fallible category conversion and return an error
-  for temporal-to-interval or interval-to-temporal requests; never coerce.
-- Borrowed `to_arrow*` methods may clone shared references; consuming
-  `into_arrow*` methods should move strings, metadata, and uniquely owned child
-  state when Arrow permits it.
-- Cache complete Arrow field projections. No-op mutations retain the cache;
-  effective mutations invalidate exactly once. Cache state never affects value
-  traits or serialized output.
-- Treat Arrow dictionary ID and ordering flags as owned Field value state until
-  the pinned Arrow version removes them; never rely on a cached foreign Field
-  to preserve state that the core model cannot rebuild.
-- Core scalar `DataType` construction, getters, metadata lookup, iteration
-  setup, and cloning shared nested values must not allocate. Constructing a
-  foreign runtime object such as `pyarrow.Scalar` is a projection and is not
-  covered by that claim. Empty collections have no per-value backing
-  allocation. Bulk metadata updates validate once, then mutate a unique map or
-  perform one copy-on-write detachment. Runtime adapters must first accumulate
-  a wide metadata overlay in one ordered or hashed map (last write wins), then
-  cross the core mutation boundary once; never resolve duplicate keys with a
-  repeated linear scan.
-- Do not build per-record maps or schemas. Measure before claiming an
-  optimization and keep Criterion out of production dependency graphs.
-- Canonical defaults are `DataType::default_value` and
-  `Field::default_value`. A datatype prefers a present zero/empty value;
-  `Null` and transparent logical wrappers with only a null default are the
-  intrinsic exceptions. A nullable Field prefers logical null, including the
-  required physical Union tag or RunEndEncoded values layout.
-  Struct and fixed-list datatype defaults delegate each child slot to its
-  Field default. Preflight recursion, node expansion, and byte allocation
-  before materializing; caller-built public enum variants must not bypass
-  those caps.
-- Schema compatibility targets are the shared `Scheme` values
-  (`arrow`, `spark`, `polars`, `pandas`, `iceberg`);
-  `Scheme::COMPATIBILITY_TARGETS` is the list. Arrow is a validated cache-preserving no-op, and every other target
-  runs the one generic recursive walker with a per-target scalar matrix. A
-  rewrite must preserve Field name/nullability/metadata, invalidate a populated
-  Arrow cache exactly once, and reject extension storage rather than relabeling
-  it. Never fork a per-target walker.
-- A root `Field` validates once (`validate_struct_root`), caches its Arrow
-  projection, and stays cheap to clone; a row is one canonical ordered
-  `Value::Sequence` validated against it with `validate_value` and normalized
-  with `canonicalize_value`. Named materialization uses the field's own index
-  (`index_of`, `get_field_by_name`) and rejects missing, unknown, duplicate, or
-  non-string keys before committing.
-- Arrow runtime materialization belongs in `yggdryl::arrow`. `StructScalar`
-  pairs the exact root Field with a real one-row StructArray and
-  exposes zero-copy indexed and named child slices. Batch and IPC readers
-  validate a stream schema once, decode rows lazily, retain at most one batch,
-  and stop after the first failing row. Conversion is exhaustive and
-  schema-directed; never use JSON as an Arrow value bridge.
-- `yggdryl::arrow::ArrowScalar` owns an exact Field and one immutable one-row
-  `ArrayRef`. `from_parts` validates foreign arrays and `from_value` validates
-  caller values. The `DefaultArrowScalar` extension trait is implemented for
-  `DataType` and `Field` and must use the bounded core default planner without
-  a binding-side placeholder table or redundant trusted-value validation.
-- Keep recursive casting in `yggdryl::cast`. `ArrowCast` owns schema-directed
-  array and RecordBatch casts for core `DataType` and `Field`; a typed field
-  additionally casts to its own array type
-  (`Int64Field::cast_arrow_array -> Int64Array`) through
-  `field::ArrowFieldType`, so per-datatype logic stays with the datatype. Keep
-  the runtime behind the default-enabled `arrow` feature and never duplicate
-  its recursive cast table in either binding. Struct reconciliation is
-  ASCII-case-insensitive, rejects ambiguous folded names, follows target
-  order, drops extra columns, and fills missing nullable/required columns with
-  null/canonical defaults respectively. Recurse before an outer layout cast so
-  nested Struct names are never matched positionally. Exact inputs must still
-  pass logical-null and Map validation, then retain their owned arrays/batch.
-- Propagate wrapper exposure when validating or casting nested Arrow values.
-  Null Struct/list/map parents, inactive union members, unreferenced
-  dictionary values, and unused run-end values must not make hidden child
-  nulls or conversion failures observable. Physically required hidden slots
-  use schema-valid placeholders, never an invented logical default.
-- Preflight every newly materialized Arrow array before allocation with the
-  shared one-million-slot and 64-MiB fixed-buffer budgets. Missing columns are
-  charged in one aggregate plan, repeated Dictionary defaults retain one
-  vocabulary value, and nullable variable-list/map/dictionary columns do not
-  charge child payloads that `new_null_array` never creates. Exact borrowed
-  arrays are not charged as new allocations.
-- `MediaDescriptor` owns one URL, a media type, the exact non-null Struct root
-  Field, and the cached Arrow Schema. `ArrowTable` owns the batch protocol
-  directly - validated cursor reads, a non-consuming snapshot, atomic
-  overwrite-all, lazy batch and record readers, and an eager immutable
-  `ArrowDataset` - as inherent methods. There is no media trait layered over
-  `IOBase`: an encoded resource is read and written through `IOBase`'s record
-  methods or through `Media`. Do not retain a parallel `write` alias:
-  whole-resource replacement is spelled `overwrite` in every runtime.
-- Append, positional upsert, and indexed setter operations update the
-  shallow-cloned `RecordBatch` vector transactionally: an error leaves the
-  table exactly as it was. Batch upsert replaces an
-  existing index, appends only at `index == len`, and rejects gaps; it never
-  invents row primary-key or conflict semantics. `BatchSelector` accepts an
-  index or a canonical string/path/URL location. An exact descriptor location
-  selects the whole resource, while the same URL with a numeric fragment
-  selects one batch; a mismatched location fails before backend I/O. Indexed
-  setters replace an existing batch, and an omitted/whole-resource setter
-  overwrites all. Cursor reads never define snapshot contents, and successful
-  mutation resets an in-memory reader cursor.
-- `ArrowTable` is the growable in-memory table. It owns a `Vec<RecordBatch>`,
-  shallow-clones buffers for snapshots and indexed reads, implements direct
-  replace/append/overwrite without a storage adapter, and remains subject to
-  the same descriptor, cast, logical-value, row-count, slot, and fixed-buffer
-  bounds as every other reader. Its `IOBase` byte view is the Arrow IPC
-  encoding of its batches, produced on demand and dropped on every mutation. `ArrowDataset` remains
-  the immutable validated holder; do not conflate it with `ArrowTable`.
-- A read target is an optional non-null Struct Field. No target means validate
-  and preserve the declared source layout; a target builds one reusable
-  recursive cast plan. Schema discovery for a not-yet-initialized sink belongs at the
-  lower optional-target cast boundary, not in a dishonest optional `field()`
-  accessor. `safe` follows Arrow's cast-failure policy and never bypasses
-  physical validity, logical nullability, Map invariants, or descriptor checks.
-- Record adapters must bulk-materialize and consume through the existing
-  native Field-directed Arrow paths. Keep readers batch- and row-lazy,
-  retain at most one source batch for row iteration, reuse one cast plan per
-  fixed input schema, and do not allocate row maps or use JSON as an Arrow
-  bridge. Python exposes PyArrow holders; JavaScript uses its standard copied
-  IPC boundary and must not claim zero-copy interop.
-- Arrow IPC dictionary IDs are transport-local. `yggdryl::arrow` preserves native
-  Field IDs through one reserved, versioned root-Schema metadata sidecar keyed
-  by logical Field path, accepting duplicate canonical IDs and removing the
-  sidecar on import. Explicit reads without it keep caller IDs authoritative
-  while remaining strict about ordering, key/value layout, nullability, and
-  extension identity. Reject a direct Dictionary-of-Dictionary before IPC
-  output because Arrow IPC 59 cannot represent the inner encoding.
+- One sealed zero-sized marker per `DataType` variant with a `*Field` alias
+  over `TypedField<K>`; `TypedField<K>` holds exactly one generic `Field`,
+  `TypedFieldRef<'_, K>` one borrowed pointer. No duplicated parameters,
+  metadata, caches, or children in the typed layer; conversions validate the
+  full Field before proving the marker; no `DerefMut`/`as_field_mut`/other
+  unchecked route that could swap the datatype behind `K`.
+- Lossless Arrow schema parity; validate at construction/import and cold
+  projection boundaries, not per record or cache hit.
+- C Data Interface schemas go only through `DataType::to_arrow_ffi` and
+  `Field::to_arrow_ffi`, which own recursive child/dictionary/nullability/
+  ordering/metadata/flag repair; bindings import that schema and keep no
+  second recursive FFI builder.
+- Both Arrow unit enums import infallibly into `TimeUnit`; exports are the
+  fallible category conversions; never coerce across temporal/interval.
+- `to_arrow*` may clone shared refs; `into_arrow*` moves what Arrow permits.
+- Cache complete Arrow projections; no-op mutations retain the cache,
+  effective ones invalidate exactly once; cache state never affects value
+  traits or serialization. Arrow dictionary ID and ordering flags are owned
+  Field state until the pinned Arrow removes them.
+- Core scalar construction, getters, metadata lookup, iteration setup, and
+  cloning shared nesting must not allocate (foreign projections like
+  `pyarrow.Scalar` excepted). Empty collections have no backing allocation.
+  Bulk metadata updates validate once then mutate uniquely or copy-on-write
+  once; runtime adapters accumulate one ordered/hashed overlay (last write
+  wins) and cross the mutation boundary once.
+- No per-record maps or schemas. Measure before claiming optimization; keep
+  Criterion out of production graphs.
+- Defaults are `DataType::default_value`/`Field::default_value`: a datatype
+  prefers a present zero/empty value (`Null` and transparent null-only
+  wrappers excepted); a nullable Field prefers logical null including
+  required Union tags and RunEndEncoded layouts; struct and fixed-list
+  defaults delegate per child. Preflight recursion, node, and byte budgets
+  before materializing; public enum variants cannot bypass the caps.
+- Compatibility targets run the one generic recursive walker with a
+  per-target scalar matrix (Arrow is a validated cache-preserving no-op).
+  Rewrites preserve name/nullability/metadata, invalidate a populated cache
+  exactly once, and reject extension storage rather than relabeling. Never
+  fork a per-target walker.
+- A root `Field` validates once (`validate_struct_root`), caches its
+  projection, stays cheap to clone; rows validate with `validate_value`,
+  normalize with `canonicalize_value`; named materialization uses `index_of`/
+  `get_field_by_name` and rejects missing/unknown/duplicate/non-string keys
+  before committing.
+- Runtime materialization is `yggdryl::arrow`: `StructScalar` pairs the
+  exact root Field with a real one-row StructArray, zero-copy child slices;
+  batch and IPC readers validate the stream schema once, decode lazily,
+  retain at most one batch, stop at the first failing row; conversion is
+  exhaustive and schema-directed - never JSON as an Arrow bridge.
+- `ArrowScalar` owns an exact Field and one immutable one-row `ArrayRef`;
+  `from_parts` validates foreign arrays, `from_value` caller values.
+  `DefaultArrowScalar` (on `DataType` and `Field`) uses the bounded core
+  default planner - no binding-side placeholder table or redundant
+  validation.
+- Casting: `ArrowCast` owns schema-directed array and RecordBatch casts;
+  typed fields cast to their own array type
+  (`Int64Field::cast_arrow_array -> Int64Array`) via `field::ArrowFieldType`.
+  Behind the default `arrow` feature; never duplicated in a binding. Struct
+  reconciliation is ASCII-case-insensitive, rejects ambiguous folds, follows
+  target order, drops extras, fills missing nullable/required with
+  null/defaults; recurse before the outer layout cast so nested names are
+  never positional. Exact inputs still pass logical-null and Map validation,
+  then keep their arrays.
+- Wrapper exposure propagates: null parents, inactive union members,
+  unreferenced dictionary values, unused run-ends must not make hidden child
+  nulls or failures observable; physically required hidden slots use
+  schema-valid placeholders, never invented logical defaults.
+- Preflight every new Arrow array against the shared one-million-slot and
+  64-MiB fixed-buffer budgets; missing columns charge one aggregate plan;
+  repeated dictionary defaults keep one vocabulary value; nullable
+  variable-size children `new_null_array` never creates are not charged;
+  exact borrowed arrays are not charged.
+- `MediaDescriptor` owns one URL, media type, exact Struct root, cached
+  Schema. `ArrowTable` owns the batch protocol as inherent methods
+  (validated cursor reads, non-consuming snapshot, atomic overwrite-all,
+  lazy readers, eager immutable `ArrowDataset`); no media trait over
+  `IOBase`; whole-resource replacement is spelled `overwrite` everywhere, no
+  `write` alias. Mutations are transactional (error leaves the table
+  unchanged); batch upsert replaces an index, appends only at `index ==
+  len`, rejects gaps, invents no key semantics. `BatchSelector` takes an
+  index or canonical location; a descriptor location selects the resource, a
+  numeric fragment one batch; mismatches fail before I/O; successful
+  mutation resets in-memory cursors. `ArrowTable` is the growable in-memory
+  table over `Vec<RecordBatch>` under the same budgets; its `IOBase` view is
+  its IPC encoding, produced on demand, dropped on mutation; `ArrowDataset`
+  stays the immutable holder.
+- A read target is an optional non-null Struct Field: none = validate and
+  preserve the source layout; some = one reusable recursive cast plan.
+  Discovery for an uninitialized sink belongs at the optional-target cast
+  boundary, not a dishonest optional accessor. `safe` follows Arrow's
+  cast-failure policy and never bypasses physical validity, logical
+  nullability, Map invariants, or descriptor checks.
+- Record adapters bulk-materialize through the native Field-directed paths:
+  batch- and row-lazy, one retained source batch, one cast plan per input
+  schema, no row maps, no JSON bridge. Python exposes PyArrow holders; JS
+  uses its standard copied IPC boundary and never claims zero-copy.
+- IPC dictionary IDs are transport-local: native Field IDs travel in one
+  reserved versioned root-Schema sidecar keyed by field path, removed on
+  import; explicit reads without it keep caller IDs authoritative. Reject
+  direct Dictionary-of-Dictionary before IPC output (Arrow IPC 59 cannot
+  represent it).
 
 ## Resource identifier contract
 
-- Parse URI syntax once in Rust. Bindings must never split schemes,
-  authorities, paths, queries, fragments, URN namespaces, or suffixes.
-- Canonical output lowercases schemes and uses forward slashes for file paths.
-  Windows drive paths normalize to `file:///C:/...`; UNC paths normalize to
-  `file://server/share/...`. The result must be independent of the host OS.
-- Validate schemes, authority delimiters, percent escapes, URN namespace IDs,
-  and namespace-specific strings at construction. Errors report the original
-  byte offset and identifier context.
-- Path-segment, file-name, and extension lookup borrows the canonical path.
-  Cloning compact identifiers and reading components must not allocate.
-- Compound media inference walks filename suffixes from right to left, then
-  reports encodings in application order. Unknown or missing base suffixes
-  use `application/octet-stream`; archive formats are base representations,
-  not transparent content encodings. URI-family bindings call these native
-  operations and never split or rewrite filename strings themselves.
-- Filename/stem/extension changes validate a complete replacement path before
-  committing. Preserve scheme, authority, query, fragment, leading path
-  syntax, URL constraints, and URN namespace constraints; invalid input must
-  leave the original identifier unchanged.
-- File URI/path conversion must preserve every accepted component. Reject
-  queries, fragments, unsafe decoded controls, encoded separators, percent
-  escapes that create a Windows drive prefix, and escaped authority syntax
-  that a decoded UNC path would reinterpret. UTF-8, spaces, tabs, and literal
-  percent signs in UNC servers must round-trip through `from_path`.
-- `Display` is canonical and losslessly parseable for all identifier values.
-  Serde uses structural objects rather than a platform path or debug format.
+- Parse URI syntax once, in Rust; bindings never split schemes, authorities,
+  paths, queries, fragments, namespaces, or suffixes.
+- Canonical output lowercases schemes, forward slashes for files; Windows
+  drives -> `file:///C:/...`, UNC -> `file://server/share/...`;
+  host-OS-independent.
+- Validate schemes, authority delimiters, percent escapes, URN namespace IDs
+  and strings at construction; errors carry byte offset and context.
+- Segment/file-name/extension lookup borrows the canonical path; cloning and
+  component reads do not allocate.
+- Compound media inference walks suffixes right to left, reports encodings
+  in application order; unknown bases -> `application/octet-stream`;
+  archives are base representations, not transparent codings. Bindings call
+  these natively, never split filenames themselves.
+- Filename/stem/extension changes validate the complete replacement first;
+  preserve scheme, authority, query, fragment, leading syntax, URL and URN
+  constraints; invalid input leaves the value unchanged.
+- File URI/path conversion preserves every accepted component; reject
+  queries, fragments, unsafe decoded controls, encoded separators, escapes
+  creating drive prefixes, and escaped authority a UNC decode would
+  reinterpret; UTF-8, spaces, tabs, literal `%` in UNC servers round-trip.
+- `Display` is canonical and losslessly parseable; Serde uses structural
+  objects, never a platform path or debug format.
 
 ## Binding boundary contract
 
-These rules apply to both the Python and JavaScript extensions.
+Both extensions:
 
-- **Rust proves a feature before any binding exposes it.** A feature is
-  validated fully in Rust first - implementation, edge-case tests, and
-  documentation - and only then implemented in the Python and JavaScript
-  extensions. Never build a binding for a core surface that is not already
-  proven. A binding written against an unsettled core encodes decisions the
-  core has not made yet, so it has to be rewritten when the core settles, and
-  its tests pin behavior the core never agreed to.
-- **Parity is the goal.** Every core module a caller can reach from Rust should
-  be reachable from Python and JavaScript: the enums, the value tree, the
-  compression codings, the storage handles, and the record media. A module that
-  is Rust-only is a gap to close, not a boundary to defend, and its
-  documentation page says so with the `Rust only` note until it closes.
-- **Cross-language interop goes through Arrow.** When two runtimes exchange
-  columnar data, they exchange Arrow: PyArrow arrays, batches, and schemas on
-  the Python side, Apache Arrow JS on the JavaScript side, and the C Data
-  Interface or IPC in between. Do not invent a second wire format, and do not
-  claim zero-copy where the binding copies.
-- **Values cross through one canonical spelling.** A temporal crosses as the
-  `Value` variant that names an Arrow datatype - `Timestamp`, `Date`, `Time`,
-  `Duration` - so a value written in one runtime reads back as the native
-  temporal type in the others. There is no language-specific fallback spelling:
-  a runtime value with no canonical `Value` variant crosses as the plain shape
-  it has, never as a name a document could carry.
-- **Each binding exposes the conversion pair explicitly.** Python has
-  `as_py`/`from_py` and JavaScript has `asJs`/`fromJs`, and every `load`/`dump`
-  entry point routes through them rather than reimplementing conversion inline.
-- **Infer at the boundary, compute in Rust.** A binding may look at what it was
-  handed and pick the right core call; it may never reimplement the operation.
-  Provide the generic entry points a dynamic language expects - `from_arrow`,
-  `from_str`, `from_dict`, `from_path`, and a single `from_`/`from` that
-  inspects its argument - and have each redirect immediately to the optimized
-  core method for that input.
-- **Coerce convenient argument types.** Anywhere the core takes a native value,
-  the binding also accepts the obvious spelling of it and converts once at the
-  boundary: a `str` where a `MediaType`, `MimeType`, `Url`, `Codec`, `IOKind`,
-  or `DataType` is expected; a path-like where a `Url` is expected; a mapping
-  where `Metadata` is expected; a PyArrow or Arrow-JS value where an Arrow value
-  is expected. Conversion happens through the core `from_*` method, never by
-  stringifying an arbitrary object.
-- **Stay idiomatic.** Python uses its protocols - mapping dunders, `len`,
-  iteration, `in`, context managers for scoped handles, keyword arguments with
-  real defaults. JavaScript uses its own - `Map` protocols, iterables, spread,
-  and the generic `from` constructors. The same operation, not the same syntax.
-- Keep the argument name and meaning identical across languages. A parameter
-  called `media_type` accepts the same set of spellings everywhere.
-- **Every binding feature carries its own tests and benchmarks.** A capability
-  added to a binding is not done until it has edge-case tests in that language's
-  suite and a benchmark measuring the boundary it crosses.
-- Surface the native error message unchanged and map variants to idiomatic
-  exception types. Never rewrite, re-prefix, or re-translate a core message.
-- Bind scope constructs (`with`, `using`, `Symbol.dispose`) to `IOBase::open`
-  and `IOBase::close` rather than inventing a binding-side cache.
+- **Rust proves a feature first** (see Order of work).
+- **Parity is the goal**: every reachable core module should be reachable
+  from both languages; a Rust-only module is a gap with a `Rust only` docs
+  note until closed.
+- **Interop goes through Arrow**: PyArrow, Arrow JS, C Data Interface or IPC
+  between. No second wire format; no zero-copy claims where a copy happens.
+- **Values cross through one canonical spelling**: temporals cross as the
+  `Value` variant naming an Arrow datatype (`Timestamp`, `Date`, `Time`,
+  `Duration`); a runtime value with no variant crosses as its plain shape,
+  never as a name a document could carry.
+- Conversion pairs are explicit - Python `as_py`/`from_py`, JS
+  `asJs`/`fromJs` - and every `load`/`dump` routes through them.
+- **Infer at the boundary, compute in Rust**: generic entry points
+  (`from_arrow`, `from_str`, `from_dict`, `from_path`, one `from_`/`from`)
+  redirect immediately to the optimized core call, never reimplement it.
+- **Coerce convenient arguments** once at the boundary via core `from_*`
+  (a `str` where a `MediaType`/`MimeType`/`Url`/`Codec`/`IOKind`/`DataType`
+  is expected; path-likes as `Url`; mappings as `Metadata`; Arrow values as
+  Arrow) - never by stringifying arbitrary objects.
+- **Stay idiomatic** (Python protocols; JS `Map`/iterables/spread/`from`):
+  same operation, not same syntax. Argument names and meanings are identical
+  across languages.
+- Every binding feature ships with its own tests and a benchmark of the
+  boundary it crosses.
+- Surface native error messages unchanged, mapped to idiomatic exception
+  types.
+- Bind scope constructs (`with`, `using`, `Symbol.dispose`) to
+  `IOBase::open`/`close`; no binding-side cache.
 
 ## Python extension
 
-- `IOBase` and `Url` are `pathlib`-shaped. Anything `pathlib.Path` or
-  `PurePath` answers, they answer under the same name, backed by the core:
-  `name`, `stem`, `suffix`, `suffixes`, `parts`, `parent`, `parents`,
-  `joinpath`, `/`, `with_name`, `with_stem`, `with_suffix`, `match`,
-  `relative_to`, `is_relative_to`, `exists`, `is_dir`, `is_file`, `iterdir`,
-  `glob`, `rglob`, `read_bytes`, `read_text`, `write_bytes`, `write_text`,
-  `mkdir`, `touch`, `unlink`. There are no modes and no cursor - the core is
-  fully random-access - and failures raise what `pathlib` raises for the same
-  mistake. Never reimplement a rule in Python that the core already decides.
-- Infer inputs at the boundary: accept the native wrapper, strings, PyArrow
-  schema values, and Python type/typing annotations where meaningful, then
-  redirect immediately to core `from_*` methods or `from_pyhint`. A Python
-  string instance remains a datatype expression; the Python `str` type infers
-  native UTF-8. Never stringify arbitrary objects as an inference fallback.
-- Expose `DataType.decimal(precision, scale=0)` as a thin call to the core
-  selector. Accept exact integer-like arguments and base-10 integer strings,
-  reject booleans and floats, and do not implement decimal-width rules again
-  in the binding.
-- Provide idiomatic `__str__`, `__repr__`, rich comparison, `__hash__`, pickle,
-  and JSON behavior. `DataType` acts like a read-only child collection;
-  `Field` exposes metadata through mapping dunders (`len`, iteration,
-  containment, get/set/delete) and `get`, `keys`, `values`, `items`, `update`.
-- Keep conversion work in Rust, use the Arrow C Data Interface, and never
-  duplicate recursive parsing, validation, comparison, or hashing in Python.
-- Python Arrow scalar construction is exactly
-  `DataType.arrow_scalar(value, *, safe=True)` and
-  `Field.arrow_scalar(value, *, safe=True)`. Both return a `pyarrow.Scalar` of
-  the projected physical datatype. Preserve an exact-type input Scalar by
-  identity; cast a mismatched Scalar with PyArrow's matching `safe` policy.
-  For non-Scalar input, `safe=True` uses typed scalar construction and
-  `safe=False` infers once, reusing an exact inferred Scalar or applying one
-  unsafe cast; when standalone inference cannot represent a target-shaped
-  value such as map pairs, fall back to typed construction. A bare `DataType`
-  permits a typed null, while a non-nullable `Field` rejects Python `None` and
-  every resulting top-level null Scalar. Nested child nullability belongs to
-  record/schema builders. This is a Python runtime adapter over the core Arrow
-  module, not a second scalar implementation. Both packages delegate real
-  StructArray, RecordBatch, and IPC materialization to `yggdryl::arrow`; neither
-  may maintain a second binding-only schema or value model.
-- Mirror identifier components as read-only properties and path segments as a
-  read-only sequence. Python path-like/string inference must immediately call
-  the corresponding Rust `from_*` method. `MimeType` is an immutable, hashable
-  native value; `MediaType` is a native copy-on-write value whose explicit
-  mutations make its Python wrapper unhashable. Both are shared by identifier
-  and Field APIs. Python must not infer suffixes, content codings, or media
-  categories in Python code.
-- Keep `yggdryl.json`, `yggdryl.toml`, and `yggdryl.yaml` as thin byte-oriented
-  facades over the native codec adapter. Recursive conversion between Python
-  objects and core `Value` happens in Rust; Python orchestration may resolve I/O, record targets,
-  and explicit registries but must not serialize through `dict -> str -> Rust`.
-- Support Python scalar, bytes-like, temporal, decimal, UUID, enum, path,
-  collection, mapping, dataclass, and Yggdryl record values by converting each
-  into the `Value` variant that holds its parts. An object with no such variant
-  crosses as the plain shape it has and never as a name: an integer wider than
-  the native 128-bit range keeps its magnitude as decimal text and loses its
-  type, because the magnitude is the part a value can hold.
+- `IOBase` and `Url` are `pathlib`-shaped: everything `Path`/`PurePath`
+  answers, same names, core-backed (`name`, `stem`, `suffix`, `suffixes`,
+  `parts`, `parent`, `parents`, `joinpath`, `/`, `with_name`, `with_stem`,
+  `with_suffix`, `match`, `relative_to`, `is_relative_to`, `exists`,
+  `is_dir`, `is_file`, `iterdir`, `glob`, `rglob`, `read_bytes`,
+  `read_text`, `write_bytes`, `write_text`, `mkdir`, `touch`, `unlink`). No
+  modes, no cursor; failures raise what `pathlib` raises. Never reimplement
+  a core rule in Python.
+- Boundary inference accepts wrappers, strings, PyArrow schema values, and
+  typing annotations, redirecting to core `from_*`/`from_pyhint`. A string
+  instance is a datatype expression; the `str` type infers native UTF-8.
+  Never stringify arbitrary objects as fallback.
+- `DataType.decimal(precision, scale=0)` is a thin call to the core
+  selector: exact integer-likes and base-10 integer strings, reject bools
+  and floats, no re-implemented width rules.
+- Idiomatic `__str__`, `__repr__`, rich comparison, `__hash__`, pickle,
+  JSON. `DataType` acts as a read-only child collection; `Field` metadata
+  uses mapping dunders plus `get`, `keys`, `values`, `items`, `update`.
+- Conversion work stays in Rust over the C Data Interface; no duplicated
+  parsing, validation, comparison, hashing.
+- Arrow scalars: exactly `DataType.arrow_scalar(value, *, safe=True)` and
+  `Field.arrow_scalar(value, *, safe=True)` -> `pyarrow.Scalar` of the
+  projected physical type. Exact input Scalars pass by identity; mismatched
+  Scalars cast with PyArrow's matching `safe` policy; non-Scalar input uses
+  typed construction when `safe=True`, single inference or one unsafe cast
+  when `safe=False`, falling back to typed construction where inference
+  cannot shape the target (e.g. map pairs). A bare `DataType` permits typed
+  null; a non-nullable `Field` rejects `None` and null Scalars; child
+  nullability belongs to record builders. Both packages delegate
+  StructArray/RecordBatch/IPC materialization to `yggdryl::arrow`; neither
+  keeps a second schema or value model.
+- Identifier components are read-only properties, segments a read-only
+  sequence; path-like/string inference calls Rust `from_*` immediately.
+  `MimeType` is immutable and hashable; `MediaType` copy-on-write (mutated
+  wrappers unhashable); both shared by identifier and Field APIs; no suffix,
+  coding, or category inference in Python code.
+- `yggdryl.{json,toml,yaml}` are thin byte-oriented facades; recursive
+  conversion happens in Rust; orchestration may resolve I/O, record targets,
+  registries, but never serializes `dict -> str -> Rust`.
+- Python values (scalars, bytes-likes, temporals, decimal, UUID, enum, path,
+  collections, mappings, dataclasses, records) convert to the `Value`
+  variant holding their parts; a value with no variant crosses as its plain
+  shape (an over-wide integer keeps magnitude as decimal text, losing type).
 - Records expose exact `from_json`, `from_toml`, `from_yaml`, `from_`,
-  `into_json`, `into_toml`, `into_yaml`, and `into_` methods. They delegate
-  decoded mappings to the same safe conversion/error policy as `from_dict`
-  and delegate output to `to_dict`;
-  do not fork a second record caster. Encoders return bytes when no destination
-  is supplied and never close caller-owned streams.
-- **`pyarrow.RecordBatchReader` is the record shape in Python.** Every record
-  read returns one and every record write consumes one, across the Arrow C
-  Stream interface and nothing else, so neither side copies or rebuilds a batch.
-  A write accepts anything PyArrow exports a stream from - a reader, a `Table`, a
-  `RecordBatch`, any `__arrow_c_stream__` exporter - plus a sequence of batches,
-  because that is what a caller who built rows batch by batch is holding. Never
-  add a row-level read or write, and never return a `Table` where the core
-  returns a reader: a resource larger than memory must stay readable from Python.
-- The record methods keep the core's names and argument order exactly -
-  `record_options`, `read_arrow_field`, `read_arrow_batch_reader`,
-  `write_arrow_batch_reader`, and `append_arrow_batch_reader`. There is no read
-  target argument: the schema lives on the options, because it selects and casts
-  in one pass. `options` is the one keyword argument, it accepts the settings
-  value or anything that names an encoding, and omitting it derives the encoding
-  from the handle's media type. `IOBase.media_type` is settable so an in-memory
-  handle can say what it holds, and `with` binds `open`/`close`, which is what
-  publishes a written file at its exact length for another reader.
-- `RecordOptions` is the core settings value, never a Python model of one. A
-  setting one encoding has reads as `None` on an encoding that has none rather
-  than being invented, and setting it there raises naming the encoding that was
-  found. A foreign codec name crosses as the text that format's own parser
-  accepts, never as its `Display` when the two disagree.
-- **A table format is a module, not a pile of top-level names.**
-  `yggdryl::iceberg` is `yggdryl.iceberg`, holding `Table`, `Catalog`,
-  `Compaction`, `SchemaUpdate`, `PartitionField`, `PartitionSpec`, `Snapshot`,
-  `ManifestFile`, `DataFile`, `assign_field_ids`, `can_promote`,
-  `schema_from_json`, and `schema_to_json` and nothing else. A table is built
-  from an `IOBase` handle and from nothing else, a scan is a
-  `pyarrow.RecordBatchReader`, and the metadata values are read-only views of
-  the core structs that only a commit can produce. Both bindings take the same
-  arguments in the same order - a spec or the column names, then the format
-  version - so a table written from one language reads the same call from the
-  other.
-- **The bindings commit granularly, never through a closure.** Core
-  `commit_changes` takes a function; across FFI the same intent is
-  `update_properties(updates, removes)` (one commit, nothing when both are
-  empty) and `update_schema()` - a builder that records `add_column`,
-  `drop_column`, `rename_column`, `update_doc`, `make_nullable`, and
-  `update_type` calls, then `commit` replays them onto a fresh core
-  `SchemaUpdate`, adds and selects the schema, and writes one document. In
-  Python the builder is a context manager that commits on clean exit and
-  discards on exception; a spent builder refuses further use. Time travel is
-  `scan_at(snapshot_id, filters, schema)`, refs resolve with
-  `snapshot_by_ref`, compaction is `compact()` returning the counts, and the
-  inspection tables come back as the language's record-reader shape under the
-  same column names as the core.
-- **The catalog crosses with its inference.** `Catalog(warehouse)` accepts a
-  handle or anything that names a folder; `create_table` accepts a native
-  Field, an expression, an Arrow schema, or an iterable of Fields;
-  `append`/`overwrite` accept exactly what `Table.append` accepts and return
-  the table. Names stay dotted in both languages.
+  `into_json`, `into_toml`, `into_yaml`, `into_`, delegating to
+  `from_dict`/`to_dict` policy - no second record caster. Encoders return
+  bytes without a destination and never close caller streams.
+- **`pyarrow.RecordBatchReader` is the record shape**: every read returns
+  one, every write consumes one, over the C Stream interface only. Writes
+  accept anything PyArrow exports a stream from (reader, `Table`,
+  `RecordBatch`, `__arrow_c_stream__`, sequence of batches). Never a
+  row-level read/write; never a `Table` where the core returns a reader.
+- Record methods keep core names and order: `record_options`,
+  `read_arrow_field`, `read_arrow_batch_reader`, `write_arrow_batch_reader`,
+  `append_arrow_batch_reader`. No read-target argument (the schema lives on
+  the options). `options` is the one keyword, accepting the settings value
+  or anything naming an encoding; omitted, the media type decides.
+  `IOBase.media_type` is settable; `with` binds `open`/`close` (which
+  publishes a written file at exact length).
+- `RecordOptions` is the core value, never a Python model. A setting another
+  encoding lacks reads `None` and raises naming the encoding when set.
+  Foreign codec names cross as the text that format's parser accepts, never
+  a diverging `Display`.
+- **A table format is a module**: `yggdryl.iceberg` holds `Table`,
+  `Catalog`, `Compaction`, `SchemaUpdate`, `PartitionField`,
+  `PartitionSpec`, `Snapshot`, `ManifestFile`, `DataFile`,
+  `assign_field_ids`, `can_promote`, `schema_from_json`, `schema_to_json`,
+  nothing else. Tables build from an `IOBase` handle only; scans are
+  `pyarrow.RecordBatchReader`; metadata values are read-only views only a
+  commit can produce. Both bindings take the same arguments in the same
+  order (spec or column names, then format version).
+- **Bindings commit granularly, never through a closure**:
+  `update_properties(updates, removes)` (one commit; nothing when both
+  empty) and `update_schema()` - a builder recording `add_column`,
+  `drop_column`, `rename_column`, `update_doc`, `make_nullable`,
+  `update_type`, whose `commit` replays onto a fresh core `SchemaUpdate` and
+  writes one document; in Python it is a context manager (commit on clean
+  exit, discard on exception, spent builder refuses reuse). Time travel is
+  `scan_at(snapshot_id, filters, schema)`; refs via `snapshot_by_ref`;
+  `compact()` returns the counts; inspection tables come back as the
+  record-reader shape under core column names.
+- **The catalog crosses with its inference**: `Catalog(warehouse)` accepts a
+  handle or anything naming a folder; `create_table` accepts a native Field,
+  expression, Arrow schema, or iterable of Fields; `append`/`overwrite`
+  accept what `Table.append` accepts and return the table. Names stay
+  dotted.
 
 ### Python records and annotations
 
-- Keep annotation inference and record conversion below
-  `rust/python/yggdryl/records/`. It may inspect Python typing
-  objects, but must construct and expose the native `DataType` and `Field`
-  wrappers; never create a parallel schema representation. Nested list, map,
-  union, tuple/items-view, dataclass, and record hints must use native datatype
-  and field builders directly. Do not create PyArrow types merely to import
-  them back into Yggdryl during annotation inference.
-- Expose annotation entry points as `DataType.from_pyhint` and
-  `Field.from_pyhint`. `Optional[T]`, `T | None`, or a union containing `None`
-  supplies the default Field nullability; an `Annotated` `nullable` option
-  explicitly overrides that default and governs safe record input/output at
-  every nested Field boundary. A default value of `None` alone never changes
-  schema nullability and must still satisfy the cached Field when selected.
-- Annotation Field options are exactly `arrow_type`, `nullable`, `metadata`,
-  `id`, `dictionary_id`, and `dictionary_is_ordered`, accepted as `(key,
-  value)` extras or entries in an options mapping. Reserved-leading tuples
-  must contain exactly two items. Resolve structural options left-to-right,
-  validate only the final winner, merge metadata entry-wise in the same
-  order, then overlay explicit caller/dataclass metadata. Each mapping that
-  mentions a dictionary option must contain both dictionary keys; tuple
-  extras may supply the pair separately. A sole physical member promoted
-  through Optional, NewType, TypeVar, or an alias supplies the Field baseline;
-  outer options overlay it. A parent `arrow_type` instead owns and shadows its
-  complete physical subtree.
-- `arrow_type` accepts only an actual PyArrow datatype. Preserve an explicit
-  ExtensionType through one native Field import, reject conflicting
-  `ARROW:extension:*` overlays, and require its serialized extension metadata
-  to be UTF-8. Bare `DataType.from_pyhint` applies only `arrow_type`, rejects
-  ExtensionType (directing callers to Field/records), and rejects all
-  recognized Field-only options; legacy all-string metadata-only mappings
-  remain ignored there.
-- `@record` must produce a genuine standard-library dataclass. Cache one tuple
-  of native child Fields and one native root Field per decorated class. Never
-  rebuild a schema per instance or conversion. Persist `python.module`,
-  `python.class`, `python.qualname`, and `python.kind` as Field metadata so
-  Arrow remains the central interchange representation. Freeze published
-  cached Fields: metadata mutation must raise instead of allowing a child
-  singleton to diverge from its enclosing root Struct projection.
-- The records module should re-export the useful standard `dataclasses`
-  surface. Its `to_dict` and `from_dict` functions must support both Yggdryl
-  records and ordinary dataclass types. Generated record methods delegate to
-  those functions rather than duplicating conversion logic.
-- `safe=False` is the explicit shallow fast path. `safe=True` recursively
-  validates and casts annotations with path-aware errors. Boolean casting is
-  exact and must reject ambiguous truthiness. It enforces fixed-size-list
-  arity and rejects temporal values that Arrow would truncate at the target
-  unit. A naive datetime is interpreted as UTC only for an exact `UTC`
-  timestamp target; other zoned timestamps require aware datetimes,
-  timezone-less timestamps require naive datetimes, and Arrow time values
-  reject aware times. The only error policies are
-  `errors="raise"` and `errors="default"`; the latter uses a declared default
-  or default factory and still raises when neither exists.
-- Resolve inherited and forward annotations once per class. Detect recursive
-  type graphs, preserve declaration order, avoid shared mutable defaults, and
-  benchmark cached schema access plus safe and shallow conversion separately.
-- Never retain an entire decorator frame: pending records keep only
-  annotation-reachable bindings, and completed schemas keep resolved nested
-  hint maps. Parameterized aliases use a per-conversion binding context; do
-  not publish a specialization as the singleton schema of its generic origin.
-- Safe output validates existing dataclass instances without reconstructing
-  them or invoking `__init__`/`__post_init__`. Thread declared generic hints
-  through nested collection/export traversal instead of using runtime
-  re-instantiation as validation.
-- Arrow-to-record class factories are exactly
+- Annotation inference and record conversion live below
+  `python/yggdryl/records/`; they may inspect typing objects but construct
+  native `DataType`/`Field` wrappers - never a parallel schema, never
+  PyArrow types created merely to re-import.
+- Entry points: `DataType.from_pyhint`, `Field.from_pyhint`.
+  `Optional[T]`/`T | None`/unions with `None` supply default nullability; an
+  `Annotated` `nullable` option overrides and governs safe input/output at
+  every nested boundary; a bare `None` default never changes schema
+  nullability and must satisfy the cached Field.
+- Field options are exactly `arrow_type`, `nullable`, `metadata`, `id`,
+  `dictionary_id`, `dictionary_is_ordered`, as `(key, value)` extras or an
+  options mapping (reserved-leading tuples exactly two items). Resolve
+  left-to-right, validate the final winner, merge metadata entry-wise, then
+  overlay caller/dataclass metadata. A mapping naming one dictionary option
+  must name both; tuple extras may split them. A sole physical member
+  through Optional/NewType/TypeVar/alias supplies the baseline; outer
+  options overlay; a parent `arrow_type` owns its whole subtree.
+- `arrow_type` accepts only an actual PyArrow datatype; preserve explicit
+  ExtensionTypes through one native Field import; reject conflicting
+  `ARROW:extension:*` overlays; extension metadata must be UTF-8. Bare
+  `DataType.from_pyhint` applies only `arrow_type`, rejects ExtensionType
+  and Field-only options; legacy all-string metadata-only mappings stay
+  ignored there.
+- `@record` produces a genuine stdlib dataclass; cache one tuple of child
+  Fields and one root Field per class, never per instance. Persist
+  `python.module`, `python.class`, `python.qualname`, `python.kind` as Field
+  metadata. Freeze published cached Fields: metadata mutation raises.
+- The records module re-exports the useful `dataclasses` surface; `to_dict`
+  and `from_dict` support records and plain dataclasses; generated methods
+  delegate to them.
+- `safe=False` is the explicit shallow path; `safe=True` recursively
+  validates and casts with path-aware errors: exact boolean casting,
+  fixed-size-list arity, no temporal truncation. Naive datetimes are UTC
+  only for exact `UTC` targets; other zoned targets need aware, zoneless
+  need naive; Arrow times reject aware. Error policies are exactly
+  `errors="raise"` and `errors="default"` (declared default or factory,
+  else raise).
+- Resolve inherited/forward annotations once per class; detect recursive
+  graphs, preserve declaration order, avoid shared mutable defaults;
+  benchmark cached schema access and safe vs shallow separately. Never
+  retain a decorator frame: pending records keep annotation-reachable
+  bindings only; parameterized aliases use per-conversion binding contexts
+  and never publish a specialization as its generic origin's schema.
+- Safe output validates existing instances without reconstruction or
+  `__init__`/`__post_init__`; thread declared generic hints through nested
+  traversal.
+- Class factories are exactly
   `Record.from_arrow_field(field, *, class_name=None, module=None)` and
-  `Record.from_arrow_schema(schema, *, class_name=None, module=None)`. Import
-  every Arrow field through the native
-  `Field.from_arrow` boundary once, cache those exact native Fields on the
-  generated dataclass, and derive Python casting annotations from the cached
-  `Field`/`DataType` graph. The derived annotations are a language view only;
-  never regenerate an imported schema through `from_pyhint`, because doing so
-  can erase integer widths, nested layout, dictionary state, or metadata.
-  Assemble every record root through native `DataType.from_fields`; never
-  round-trip child Fields through `pa.struct` merely to rebuild a native
-  datatype and never keep a second Arrow-to-Python type table.
-  A struct root contributes its children and a scalar root becomes one column.
-  Require unique Arrow column names that are already valid non-keyword Python
-  identifiers; never silently rename the physical schema. Explicit
-  `class_name`/`module` win, then valid `python.class`/`python.module` metadata,
-  then the documented root-name/`ArrowRecord` and `__main__` fallbacks. Replace
-  only the four generated Python identity keys and retain other imported root
-  and child metadata. Preserve Arrow Schema metadata on the generated root and
-  project it back through `into_arrow_schema`; accept UTF-8 byte key/value
-  pairs and reject non-UTF-8 metadata explicitly instead of decoding lossily.
-  The reserved `yggdryl:ipc:dictionary-ids` Schema key is transport state, not
-  imported root metadata: route whole-Schema import and transport projection
-  through `yggdryl::arrow`, restore nested canonical IDs once, and keep the key
-  out of the native root and public `into_arrow_schema` projection. Collection
-  Arrow outputs may use one separately cached transport Schema so subsequent
-  IPC retains those IDs; never parse or rebuild this sidecar in Python.
-- Record collection imports are exactly `from_dicts`,
-  `from_arrow_record_batch`, `from_arrow_record_batch_reader`,
-  `from_arrow_table`, and `from_arrow`. They return lazy iterators and
-  reuse the internal `from_dict` caster with the same `safe` and `errors`
-  contract, without rebuilding schemas or materializing a new dictionary per
-  Arrow row solely as conversion glue. Generic
-  `from_arrow` accepts a PyArrow RecordBatch, Table, RecordBatchReader, Arrow C
-  stream exporter through `__arrow_c_stream__`, or iterable of RecordBatch
-  values; never invoke an arbitrary `to_arrow` method as inference. Validate a
-  physical schema at its batch/source boundary, never per row; compatibility
-  compares names, order, datatypes, and nullability recursively while
-  deliberately ignoring transport metadata.
-  When schema validation is disabled but safe input needs a physical mismatch
-  cast, cache the projected target Arrow type once and call `Scalar.cast`
-  directly; calling `Field.arrow_scalar` there would reproject a C Field per
-  mismatched cell. On output, normalize only an explicit Scalar whose type
-  differs from the cached target through `Field.arrow_scalar`; exact Scalars
-  and ordinary values remain on the bulk path. Use the same helper for
-  one-cell error localization after a bulk Arrow array builder fails. Record
-  output `safe=False` skips annotation validation only; it must still enforce Arrow
-  physical validity and must never enable unsafe overflow casts.
-  Keep the Python package floor at PyArrow 18 for C-stream import. 15 supplied
-  the generic C-stream reader, but the run-end-encoded map and extension-type
-  scalar paths this adapter relies on were only correct from 18. Do not use
-  newer `maps_as_pydicts` conveniences: normalize Arrow map pair sequences in
-  the adapter and reject duplicate keys before the shared mapping caster.
-- Record Arrow exports are exactly `into_arrow_field`, `into_arrow_schema`,
+  `Record.from_arrow_schema(...)`: import each Arrow field once through
+  `Field.from_arrow`, cache those exact Fields, derive casting annotations
+  from the cached graph (a language view only - never regenerate through
+  `from_pyhint`, which can erase widths, layout, dictionary state,
+  metadata). Assemble roots with `DataType.from_fields`, never via
+  `pa.struct` round trips or a second type table. Struct roots contribute
+  children; scalar roots one column. Require unique, valid, non-keyword
+  Python identifiers; never rename silently. Naming: explicit args, then
+  valid `python.class`/`python.module` metadata, then root-name/
+  `ArrowRecord` and `__main__`. Replace only the four generated identity
+  keys; keep other metadata. Preserve Schema metadata on the root and
+  project back via `into_arrow_schema`; accept UTF-8 byte pairs, reject
+  non-UTF-8 explicitly. The reserved `yggdryl:ipc:dictionary-ids` key is
+  transport state: route through `yggdryl::arrow`, restore IDs once, keep it
+  out of root metadata and `into_arrow_schema`; collection outputs may cache
+  one transport Schema; never parse the sidecar in Python.
+- Collection imports are exactly `from_dicts`, `from_arrow_record_batch`,
+  `from_arrow_record_batch_reader`, `from_arrow_table`, `from_arrow`: lazy
+  iterators reusing `from_dict` with the same `safe`/`errors` contract, no
+  per-row schemas or dictionaries as glue. `from_arrow` accepts RecordBatch,
+  Table, RecordBatchReader, `__arrow_c_stream__` exporters, or iterables of
+  batches; never invoke arbitrary `to_arrow` methods. Validate schemas at
+  the batch/source boundary (names, order, datatypes, nullability
+  recursively; transport metadata ignored). When validation is off but a
+  mismatch cast is needed, cache the target Arrow type once and call
+  `Scalar.cast` directly (not `Field.arrow_scalar` per cell); on output
+  normalize only explicit mismatched Scalars through `Field.arrow_scalar`;
+  use the same helper for one-cell error localization after a bulk builder
+  fails. Output `safe=False` skips annotation validation only - physical
+  validity always holds, unsafe overflow never enabled. PyArrow floor is 18
+  (correct run-end map and extension scalar paths); do not use
+  `maps_as_pydicts` - normalize map pairs in the adapter and reject
+  duplicate keys first.
+- Exports are exactly `into_arrow_field`, `into_arrow_schema`,
   `into_arrow_record_batch`, `into_arrow_record_batches`,
-  `into_arrow_table`, and `into_arrow_record_batch_reader`. The collection
-  forms are classmethods over record iterables; `into_arrow_record_batches`
-  and `into_arrow_record_batch_reader` use a positive `batch_size` that
-  defaults to 65,536. Batch iteration stays lazy and bounded, and empty eager
-  outputs use the class's cached schema. Reuse
-  the internal `to_dict` projection and its `safe` behavior rather than
-  maintaining a second row exporter, but append projected values directly to
-  Arrow columns instead of allocating a temporary row map. Resolve and
-  validate the cached native schema once, not once per row or output batch.
-  Output iterables accept instances of the receiving record class only and
-  expose `safe` but not `errors`; mapping rows must first pass explicitly
-  through `from_dicts`, where defaults and failure policy belong.
-- Arrow/tabular regressions must cover empty and one-shot iterables, failing
-  rows after a successful batch, schema metadata differences, incompatible
-  nested schemas, nullability, dictionary and exact numeric widths, deep
-  structs/lists/maps, temporal and decimal values, and safe versus shallow
-  conversion. Benchmarks separate class materialization, schema validation,
-  row casting, batch/table construction, and bounded reader iteration; prepare
-  fixtures outside measured loops and do not claim allocation improvements
-  from timings alone.
+  `into_arrow_table`, `into_arrow_record_batch_reader`; collection forms are
+  classmethods over record iterables; batched forms take positive
+  `batch_size` default 65,536, stay lazy and bounded; empty eager outputs
+  use the cached schema. Reuse `to_dict`'s projection and `safe` behavior
+  but append values directly to Arrow columns (no temporary row map);
+  resolve the cached schema once. Output iterables accept only instances of
+  the receiving class, expose `safe` not `errors` (mapping rows go through
+  `from_dicts` first, where defaults and failure policy belong).
+- Regressions must cover empty/one-shot iterables, failures after a
+  successful batch, schema-metadata differences, incompatible nesting,
+  nullability, dictionary and exact widths, deep structs/lists/maps,
+  temporal and decimal values, safe vs shallow. Benchmarks separate class
+  materialization, schema validation, row casting, batch/table construction,
+  bounded reader iteration; fixtures outside measured loops; no allocation
+  claims from timings alone.
 
 ## JavaScript extension
 
-- Accept native wrappers and strings through small inferred factories, then
-  delegate to core. Use camelCase only at the JavaScript boundary while mapping
-  directly to the Rust vocabulary.
-- Expose `DataType.fromFields(iterable)` as the public native Struct assembly
-  boundary. Typed-field factories may retain private native constructor
-  handles inside the loader, but those handles must not remain on the public
-  runtime class or in published TypeScript declarations.
-- Provide `toString`, `toJSON`, equality, comparison, stable hashing, cloning,
-  child access/iteration, and Map-like field metadata operations (`size`,
-  `get`, `set`, `delete`, `has`, `keys`, `values`, `entries`, `update`).
-- Implement convenience protocols in the JavaScript loader when Node-API
-  cannot expose a language symbol cleanly; the native module remains the source
-  of values and validation.
-- JavaScript record helpers close over one native struct `Field`, define
-  collision-safe getters once, and materializes rows through direct
-  schema-guided Node-API conversion. Nested Struct values remain native
-  Records and reuse cached child layouts; never build a per-row schema, name
-  map, JSON object bridge, or parallel JavaScript value model.
-- Apache Arrow JS interop uses the standard copied IPC boundary because Arrow
-  JS has no C Data consumer. Parse and validate the native schema before
-  consuming a one-shot output iterable, cache the resulting Arrow JS Schema,
-  validate input source schemas once, and keep IPC row cursors bounded and
-  lazy. Public Arrow JS objects expose transport-local dictionary IDs; the
-  native Record and reserved IPC sidecar retain canonical Field IDs exactly.
-- **`BatchReader` is the record shape in JavaScript too.** A read returns one, a
-  write consumes one, and it is one-shot: reading it or handing it to a write
-  consumes it, and a second consumer is told so rather than seeing an empty
-  stream. One batch crosses as one self-contained Arrow IPC stream, so its
-  schema travels with it; say that per-batch header is what a copied boundary
-  costs rather than implying a shared handshake. `BatchReader.from` is the one
-  inference point - another reader, an Arrow JS `Table` or `RecordBatch`, an
-  array of batches, or Arrow IPC bytes - and `toIpc`/`toTable` are the two ways
-  to drain one. Never add a row-level read or write.
-- Record and table calls take the native settings value or anything that names
-  an encoding, and the encoding is never an argument: `recordOptions()` derives
-  it from the handle's media type, and `mediaType` is settable so an in-memory
-  handle can say what it holds. A setting one encoding has reads as `null` on
-  an encoding that has none rather than being invented, and a foreign codec name
-  crosses as the text that format's own parser accepts, never as its `Display`
-  when the two disagree.
-- **A table format is a namespace, not a pile of top-level classes.**
-  `yggdryl::iceberg` is `iceberg` in the loader, holding `Table`, `Catalog`,
-  `PartitionSpec`, `DataFile`, `assignFieldIds`, `canPromote`,
-  `schemaFromJson`, and `schemaToJson` and nothing else, and those names
-  appear nowhere else on the package. The schema-update builder is reached
-  only through `table.updateSchema()`, and a compaction report is a plain
-  object, because it records what happened rather than carrying behavior. A snapshot and a manifest arrive as plain objects, because they
-  record what happened rather than carry behavior; a 64-bit identifier crosses
-  as a `bigint`, because a snapshot id past 2^53 is exact and a number is not.
-  Both bindings take the same arguments in the same order - a spec or the
-  column names, then the format version - so a table written from one language
-  reads the same call from the other.
-- Expose identifier components as read-only properties and path segments as an
-  iterable array/view. Windows normalization, suffix mutation, MIME/media
-  inference, and preferred-extension selection remain core-only. Export the
-  same native `MimeType` and `MediaType` objects used by Field metadata rather
-  than JavaScript string-union lookalikes or a second lookup table.
-- Keep JavaScript JSON/TOML/YAML facades byte-first (`Buffer`/typed bytes) and route
-  recursive object conversion through native `Value`. Support exact `bigint`,
-  byte, Date, Array, plain object, Map, and Set semantics; a class is
-  constructed only from a target the caller passed in, never from a name a
-  document carries. Generic operations follow core vocabulary in camel case and
-  infer only from real path suffixes when no format is given.
-- When Node-API has already decoded a structured JSON value, pass the
-  `serde_json::Value` directly through the core type's Serde implementation.
-  Never serialize it to a temporary string and invoke a second parser; retain
-  the same core validation and error mapping on the direct path.
-- Before a Node-API `serde_json::Value` argument sees caller-owned JavaScript,
-  build one iterative bounded plain-data snapshot. Reject cycles, proxies,
-  accessors, symbols, and over-limit depth/nodes before NAPI's recursive value
-  conversion, then pass only the detached snapshot; a validate-then-revisit
-  boundary is vulnerable to getters and proxy time-of-check/time-of-use changes.
-- Reserve `javascript:builtins.<Name>` for genuine JavaScript built-ins,
-  `javascript:<yggdrylType-or-name>` for application classes, and `yggdryl:<Name>`
-  for native wrappers. Detect built-ins and wrappers by native identity, never
-  by `constructor.name`; reject application identities that enter a reserved
-  namespace.
-- Keep the Node `maxDepth` default and ceiling at 48 while recursive N-API
-  traversal is used. Raising it requires an iterative traversal plus an
-  isolated subprocess regression proving over-limit caller data cannot abort
-  Node. Generic JSON Lines `from` returns rows and `into` consumes a row
-  iterable; never type it as a scalar-shaped round trip.
+- Small inferred factories accept wrappers and strings, then delegate to
+  core; camelCase only at the boundary, mapping directly to Rust names.
+- `DataType.fromFields(iterable)` is the public Struct assembly boundary;
+  typed-field factories may hold private native constructors inside the
+  loader, never on public classes or published declarations.
+- Provide `toString`, `toJSON`, equality, comparison, stable hashing,
+  cloning, child access/iteration, and Map-like metadata (`size`, `get`,
+  `set`, `delete`, `has`, `keys`, `values`, `entries`, `update`).
+  Convenience protocols live in the loader when Node-API cannot express a
+  symbol; the native module stays the source of values and validation.
+- Record helpers close over one native struct `Field`, define collision-safe
+  getters once, materialize rows through schema-guided Node-API conversion;
+  nested Structs stay native Records reusing cached layouts; no per-row
+  schemas, name maps, JSON bridges, or a parallel JS value model.
+- Arrow JS interop is the standard copied IPC boundary (no C Data consumer):
+  parse and validate the native schema before consuming one-shot outputs,
+  cache the Arrow JS Schema, validate input schemas once, keep IPC cursors
+  bounded and lazy. Public Arrow JS objects show transport-local dictionary
+  IDs; the native Record and reserved sidecar keep canonical IDs.
+- **`BatchReader` is the record shape**: reads return one, writes consume
+  one, one-shot (a second consumer is told, not shown an empty stream). One
+  batch crosses as one self-contained IPC stream (schema travels; say that
+  per-batch header is the copied boundary's cost). `BatchReader.from` is the
+  one inference point (reader, Arrow JS `Table`/`RecordBatch`, array of
+  batches, IPC bytes); `toIpc`/`toTable` drain. Never a row-level
+  read/write.
+- Record and table calls take the settings value or anything naming an
+  encoding; the encoding is never an argument (`recordOptions()` derives it;
+  `mediaType` is settable). Settings another encoding lacks read `null`;
+  foreign codec names cross as parser-accepted text.
+- **A table format is a namespace**: `iceberg` in the loader holds `Table`,
+  `Catalog`, `PartitionSpec`, `DataFile`, `assignFieldIds`, `canPromote`,
+  `schemaFromJson`, `schemaToJson`, nothing else, nowhere else. The
+  schema-update builder is reached only through `table.updateSchema()`.
+  Compaction reports, snapshots, and manifests arrive as plain objects (they
+  record, not behave); 64-bit identifiers cross as `bigint`. Same argument
+  order as Python.
+- Identifier components are read-only properties, segments an iterable view;
+  Windows normalization, suffix mutation, MIME inference, preferred
+  extensions stay core-only. Export the same native `MimeType`/`MediaType`
+  objects Field metadata uses - no string-union lookalikes or second tables.
+- JSON/TOML/YAML facades stay byte-first (`Buffer`/typed bytes), recursive
+  conversion through native `Value`; exact `bigint`, bytes, Date, Array,
+  plain object, Map, Set semantics; classes only from caller-passed targets.
+  Generic operations follow core vocabulary in camelCase and infer only from
+  real path suffixes.
+- A Node-API-decoded `serde_json::Value` passes directly through the core
+  Serde implementation - never re-serialized to a string for a second parse.
+  Before such a value sees caller-owned JS, build one iterative bounded
+  plain-data snapshot: reject cycles, proxies, accessors, symbols,
+  over-limit depth/nodes before NAPI's recursive conversion, and pass only
+  the detached snapshot (validate-then-revisit is TOCTOU-vulnerable).
+- Reserve `javascript:builtins.<Name>` for genuine built-ins,
+  `javascript:<type-or-name>` for application classes, `yggdryl:<Name>` for
+  native wrappers; detect by native identity, never `constructor.name`;
+  reject application identities entering reserved namespaces.
+- Node `maxDepth` default and ceiling stay 48 while recursive N-API
+  traversal is used; raising it requires iterative traversal plus a
+  subprocess regression proving over-limit data cannot abort Node. Generic
+  JSON Lines `from` returns rows, `into` consumes a row iterable - never
+  typed as a scalar round trip.
 
 ## Required checks
 
-Run formatting, warning-free Clippy, workspace tests, parser/interop/text,
-JSON, YAML, and TOML benchmarks, Rustdoc with warnings denied, the Rust 1.85
-core check, Python native and codec tests, Node native/codec/type tests, and
-`python -m mkdocs build --strict` before handoff.
-Run the test and Clippy passes twice: once with default features and once with
-`--features "parquet iceberg"`, because the Parquet encoding and the table
-format over it are behind non-default features and are otherwise never
-compiled. Both extensions build the core with `arrow`, `parquet`, and
-`iceberg`, so `maturin develop` and `npm run build` compile that combination
-too.
-The Rust 1.85 check covers `yggdryl` with its default Arrow runtime and a
-`--no-default-features --lib` build of the explicit runtime opt-out.
-Remove generated targets, the MkDocs `site/`, virtual environments, native
-binaries, caches, and `node_modules` after validation.
+Before handoff run: formatting; warning-free Clippy; workspace tests;
+parser/interop/text and JSON/YAML/TOML benchmarks; Rustdoc with warnings
+denied; the Rust 1.85 core check (`yggdryl` default features and
+`--no-default-features --lib`); Python native and codec tests; Node
+native/codec/type tests; `python -m mkdocs build --strict`. Run tests and
+Clippy twice - default features and `--features "parquet iceberg"` -
+because those features are otherwise never compiled; both extensions build
+the core with `arrow`+`parquet`+`iceberg`, so `maturin develop` and
+`npm run build` cover that combination. Remove generated targets, `site/`,
+virtual environments, native binaries, caches, and `node_modules` after
+validation.
 
 ## Releases
 
-- **`main` is the release trigger, and the tag is the receipt.**
-  `.github/workflows/release.yml` runs on every push to `main`: a version
-  whose `v<version>` tag already exists costs one preflight job and nothing
-  else, and a version without one builds, publishes to all three registries,
-  and only then creates the tag and the GitHub release. Releasing is
-  therefore committing a version bump to `main`; pushing a `v*` tag by hand
-  releases the same way, and a hand-run of the workflow builds and verifies
-  everything without publishing - use that to rehearse.
-- **Every publish is idempotent, and the tag lands last.** A registry that
-  already has the version is skipped, never failed - the crates sparse
-  index, PyPI's `skip-existing`, and an `npm view` probe decide - so a run
-  that died halfway is repaired by re-running it or by the next push to
-  `main`: only the missing registries publish. Never create the tag before
-  the registries have the version.
-- **One version, spelled three times.** The workspace `Cargo.toml`,
-  `python/pyproject.toml`, and `node/package.json` must agree, and a pushed
-  tag must be `v` plus that version - the preflight job refuses anything
-  else. Bump all three in the same commit; nothing else carries a version.
-  A version a registry has already taken can never be re-released; bump
-  forward instead.
-- **The surfaces**: the `yggdryl` crate to crates.io; wheels for every
-  CPython the project supports (3.10 through 3.14 today) across manylinux
-  and musllinux x86_64 and aarch64, macOS x86_64 and arm64, and Windows x64
-  and arm64 (from 3.11, the first CPython published there), plus the sdist,
-  to PyPI; and `@yggdryl/node` to npm carrying every platform's native
-  module in one package - the generated loader picks the binary at require
-  time.
-- **Credentials are repository configuration, never workflow content**: the
-  `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN` secrets, and PyPI trusted
-  publishing (OIDC) bound to the `pypi` environment. The workflow names no
-  repository, so it survives a migration - but the PyPI trusted-publisher
-  binding does name one and must be re-registered after migrating. Do not
-  add a fourth registry or a stored PyPI password.
-- **Nothing publishes untested.** A wheel is smoke tested on its build
-  platform by an end-to-end table round trip wherever its wheel can install
-  there (musl wheels cannot install on the glibc runner that builds them,
-  and a platform PyArrow ships no wheel for has nothing to install against -
-  those build-only targets are marked in the workflow, not silently
-  skipped); a native module passes the full Node suite on its own platform;
-  and the npm publish refuses a package missing any platform binary. An
-  artifact that was never imported is not released.
+- **`main` is the trigger, the tag is the receipt.**
+  `.github/workflows/release.yml` runs on every push to `main`: an
+  already-tagged version costs one preflight job; an untagged one builds,
+  publishes to all three registries, then creates the `v<version>` tag and
+  GitHub release. Releasing = committing a version bump to `main`. A
+  hand-pushed `v*` tag releases the same way; a hand-run of the workflow
+  builds and verifies without publishing (rehearsal).
+- **Publishes are idempotent; the tag lands last.** A registry that already
+  has the version is skipped (crates sparse index, PyPI `skip-existing`,
+  `npm view` probe), so a half-dead run is repaired by re-running or by the
+  next `main` push. Never create the tag before the registries have the
+  version.
+- **One version, three manifests**: workspace `Cargo.toml`,
+  `python/pyproject.toml`, `node/package.json` must agree, and a pushed tag
+  must be `v` plus it; preflight refuses anything else. Bump all three in
+  one commit; a taken version is never re-released - bump forward.
+- **Surfaces**: `yggdryl` to crates.io; wheels for CPython 3.10-3.14 across
+  manylinux/musllinux x86_64+aarch64, macOS x86_64+arm64, Windows x64+arm64
+  (arm64 from 3.11, the first CPython there), plus sdist, to PyPI;
+  `@yggdryl/node` to npm with every platform's native module in one package
+  (the generated loader picks by triple at require time).
+- **Credentials are repository configuration**: `CARGO_REGISTRY_TOKEN` and
+  `NPM_TOKEN` secrets, PyPI trusted publishing (OIDC) bound to the `pypi`
+  environment. The workflow names no repository and survives migration; the
+  PyPI trusted-publisher binding names one and must be re-registered after
+  migrating. No fourth registry, no stored PyPI password.
+- **Nothing publishes untested**: wheels smoke-test an end-to-end table
+  round trip on their build platform wherever installable (musl wheels
+  cannot install on their glibc builder; platforms without PyArrow wheels
+  have nothing to install against - those are marked build-only in the
+  workflow, never silently skipped); native modules pass the full Node suite
+  on their platform; the npm publish refuses a package missing any binary.
+  An artifact that was never imported is not released.
