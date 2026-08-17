@@ -310,6 +310,194 @@ with parsing accessors on top - `content_type`, `content_length`, `mime_type`, `
 Setting `field:init` has named methods in Rust only (`set_init`, `is_init`, `with_init`); Python and
 JavaScript write the reserved key through the mapping, which validates it exactly the same way.
 
+## One protocol at a time
+
+Spelling `scheme:name` at a call site means spelling it right in every branch it appears in. A
+protocol view remembers the protocol instead, so the caller writes the bare name:
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::{DataType, Field, Scheme};
+
+    let mut field = Field::new("price", DataType::Int64, false);
+
+    field.iceberg_mut().insert("doc", "closing price")?;
+    field.iceberg_mut().update([("schema-id", "3"), ("field-id", "7")])?;
+    field.postgres_mut().insert("type", "numeric")?;
+
+    assert_eq!(field.iceberg().get("doc"), Some("closing price"));
+    assert_eq!(field.iceberg().key("doc"), "iceberg:doc");
+    assert_eq!(field.iceberg().len(), 3);
+    assert!(field.mysql().is_empty());
+
+    // It is a view of the one metadata map, not a copy of part of it.
+    assert_eq!(field.get_metadata("iceberg:doc"), Some("closing price"));
+    assert_eq!(field.metadata_len(), 4);
+
+    // A protocol-scoped replacement leaves every other protocol alone.
+    field.iceberg_mut().set([("doc", "close")])?;
+    assert_eq!(field.iceberg().iter().collect::<Vec<_>>(), [("doc", "close")]);
+    assert_eq!(field.postgres().get("type"), Some("numeric"));
+
+    // The protocol can also come from a value rather than from the code.
+    assert_eq!(field.protocol(&Scheme::POSTGRES).get("type"), Some("numeric"));
+    ```
+
+=== "Python"
+
+    ```python
+    from yggdryl import Field
+
+    field = Field("price", "int64", nullable=False)
+
+    field.iceberg["doc"] = "closing price"
+    field.iceberg.update({"schema-id": "3", "field-id": "7"})
+    field.postgres["type"] = "numeric"
+
+    assert field.iceberg["doc"] == "closing price"
+    assert field.iceberg.key("doc") == "iceberg:doc"
+    assert len(field.iceberg) == 3
+    assert not field.mysql
+
+    # It is a view of the one metadata mapping, not a copy of part of it.
+    assert field["iceberg:doc"] == "closing price"
+    assert len(field) == 4
+    assert dict(field.iceberg.items())["field-id"] == "7"
+
+    del field.iceberg["field-id"]
+    assert "field-id" not in field.iceberg
+    assert field.protocol("postgres")["type"] == "numeric"
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const { Field } = require('@yggdryl/node')
+
+    const field = new Field('price', 'int64', false)
+
+    field.iceberg.set('doc', 'closing price')
+    field.iceberg.update({ 'schema-id': '3', 'field-id': '7' })
+    field.postgres.set('type', 'numeric')
+
+    assert.equal(field.iceberg.get('doc'), 'closing price')
+    assert.equal(field.iceberg.key('doc'), 'iceberg:doc')
+    assert.equal(field.iceberg.size, 3)
+    assert.equal(field.mysql.size, 0)
+
+    // It is a view of the one metadata map, not a copy of part of it.
+    assert.equal(field.get('iceberg:doc'), 'closing price')
+    assert.equal(field.size, 4)
+    assert.deepEqual([...field.iceberg].sort(), [['doc', 'closing price'], ['field-id', '7'], ['schema-id', '3']])
+
+    assert.equal(field.iceberg.delete('field-id'), true)
+    assert.equal(field.iceberg.has('field-id'), false)
+    assert.equal(field.protocol('postgres').get('type'), 'numeric')
+    ```
+
+The view is a borrow, not a snapshot: it reads out of the field's own metadata and writes through the
+field's own cache-aware mutation, so two views of one field see each other's writes and a protocol
+write invalidates a populated Arrow projection exactly as a direct metadata write does. Every
+well-known protocol has a named accessor - `iceberg`, `postgres`, `http`, `arrow`, `spark`, `s3`, and
+the rest of the [`Scheme`](enums.md) vocabulary - and `protocol` takes one that is only known at
+runtime. There is no `https` accessor, because HTTPS shares the canonical `http:` namespace; the view
+for either scheme reports `http` as its prefix.
+
+`set` is the one operation that is not a plain map write: it replaces exactly this protocol's
+properties and leaves every other key untouched, which is what a protocol-scoped assignment has to
+mean when one map holds them all.
+
+## A field can be a partition column
+
+Nothing in a batch says which of its columns belong in a directory name, so a schema that means to be
+stored partitioned says so on the columns themselves:
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::DataType;
+
+    let schema = DataType::from_fields([
+        DataType::Int32.required_field("year"),
+        DataType::Utf8.required_field("venue"),
+        DataType::Int64.required_field("price"),
+    ])?
+    .required_field("row")
+    .with_partition_fields(&["year", "venue"])?;
+
+    assert!(schema.has_partition_fields());
+    assert_eq!(schema.partition_field_names().collect::<Vec<_>>(), ["year", "venue"]);
+    assert!(schema.get_field_by_name("year").expect("the column").is_partition());
+
+    // The two halves of the layout: what a path spells, and what a leaf stores.
+    assert_eq!(schema.without_partition_fields()?.field_len(), 1);
+    assert_eq!(schema.only_partition_fields()?.field_len(), 2);
+
+    // The mark is reserved metadata, so it round-trips like any other.
+    assert_eq!(
+        schema.get_field_by_name("year").expect("the column").get_metadata("field:partition"),
+        Some("true")
+    );
+    ```
+
+=== "Python"
+
+    ```python
+    from yggdryl import DataType, Field
+
+    schema = Field(
+        "row",
+        DataType.from_fields([
+            Field("year", "int32", nullable=False),
+            Field("venue", "string", nullable=False),
+            Field("price", "int64", nullable=False),
+        ]),
+        nullable=False,
+    ).with_partition_fields(["year", "venue"])
+
+    assert schema.has_partition_fields
+    assert list(schema.partition_field_names()) == ["year", "venue"]
+    assert schema.data_type["year"].is_partition
+    assert not schema.data_type["price"].is_partition
+
+    assert len(schema.without_partition_fields().data_type) == 1
+    assert len(schema.only_partition_fields().data_type) == 2
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const { DataType, Field } = require('@yggdryl/node')
+
+    const schema = new Field(
+      'row',
+      DataType.fromFields([
+        new Field('year', 'int32', false),
+        new Field('venue', 'string', false),
+        new Field('price', 'int64', false),
+      ]),
+      false,
+    ).withPartitionFields(['year', 'venue'])
+
+    assert.equal(schema.hasPartitionFields, true)
+    assert.deepEqual(schema.partitionFieldNames(), ['year', 'venue'])
+    assert.equal(schema.dataType.getByName('year').isPartition, true)
+    assert.equal(schema.dataType.getByName('price').isPartition, false)
+
+    assert.equal(schema.withoutPartitionFields().dataType.length, 1)
+    assert.equal(schema.onlyPartitionFields().dataType.length, 2)
+    ```
+
+The mark is the reserved `field:partition` key, so it travels wherever field metadata travels - into
+Arrow, into a Parquet footer, through a JSON round trip - and a field that is not a partition column
+carries no marker at all, which keeps two schemas that partition the same way exactly equal. A folder
+write reads the marks to lay an empty tree out, a folder read puts them back on the columns it
+restored from the path, and Iceberg builds an identity spec from them; that whole story is in
+[storage](io.md#partition-columns-in-the-data) and [Iceberg](iceberg.md#partition-specs-and-the-hive-layout).
+
 ## Typed field aliases
 
 === "Rust"

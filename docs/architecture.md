@@ -91,10 +91,10 @@ recursive parsing, validation, comparison, hashing, and conversion never happen 
 | --- | --- |
 | `enums` | [Shared vocabulary](core/enums.md): datatype ids and kinds, MIME and media types, schemes, codecs, I/O kinds |
 | `datatype` | [The logical type tree](core/datatype.md) |
-| `field` | [Names, nullability, metadata, validation, casting](core/field.md) |
+| `field` | [Names, nullability, metadata, protocol views, partition marks, validation, casting](core/field.md) |
 | `arrow` | [Scalars, schema projection, batch readers](core/arrow.md) |
 | `io` | [`IOBase`, `Buffer`, `Coded`, the role traits](core/io.md) |
-| `generic` | [`Holder`, `Media`, `Codec`, `RecordOptions`, `Value`](core/generic.md) |
+| `generic` | [`Holder`, `Media`, `Codec`, `RecordOptions`, `Value`, `TypedValue`](core/generic.md) |
 | `local` | [`Path`, `Folder`, `File`](core/local.md) |
 | `gzip`, `zlib`, `zstd` | [Content codings and transparent handles](core/gzip.md) |
 | `ipc`, `parquet`, `iceberg` | [Batches and tables on disk](core/ipc.md) |
