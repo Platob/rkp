@@ -73,6 +73,24 @@ benchmark('records/read_parquet_pushdown', () => parquet.readArrowBatchReader(pa
 benchmark('records/write_ipc', () => memory.writeArrowBatchReader(ipc))
 benchmark('records/write_parquet', () => parquet.writeArrowBatchReader(ipc, parquet.recordOptions().withSchema(schema)))
 
+// The generic entry points cross a wider boundary: each infers what it was
+// handed before the same native write runs. Comparing `write_arrow_ipc` with
+// `write_ipc` above is what says how much the inference itself costs, and the
+// other rows say what it costs to build Arrow out of something that is not
+// Arrow yet.
+const records = new Array(rows)
+for (let index = 0; index < rows; index += 1) {
+  records[index] = { id: ids[index], symbol: symbols[index], venue: venues[index] }
+}
+const columns = { id: ids, symbol: symbols, venue: venues }
+
+benchmark('records/write_arrow_ipc', () => memory.writeArrow(ipc))
+benchmark('records/write_arrow_table', () => memory.writeArrow(table))
+benchmark('records/write_arrow_batches', () => memory.writeArrow(table.batches))
+benchmark('records/write_arrow_columns', () => memory.writeArrow(columns))
+benchmark('records/write_arrow_records', () => memory.writeArrow(records))
+benchmark('records/read_arrow_to_arrow', () => memory.readArrow().toTable())
+
 // One commit writes a data file, a manifest, a manifest list, and a metadata
 // document, so an Iceberg append is measured separately from a plain write.
 const iced = iceberg.assignFieldIds(schema)

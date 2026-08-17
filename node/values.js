@@ -8,8 +8,19 @@ let arrowRuntime
 
 function arrow() {
   // Keep startup cheap. Apache Arrow is loaded only when a caller actually
-  // asks for an Arrow value.
-  return (arrowRuntime ??= require('apache-arrow'))
+  // asks for an Arrow value, and its absence is reported as the missing
+  // package it is rather than as whatever the failing `require` said.
+  if (arrowRuntime === undefined) {
+    try {
+      arrowRuntime = require('apache-arrow')
+    } catch (cause) {
+      throw new Error(
+        'materializing Arrow values needs apache-arrow installed, and loading it failed',
+        { cause },
+      )
+    }
+  }
+  return arrowRuntime
 }
 
 function ipcBytes(value, label = 'Arrow IPC input') {

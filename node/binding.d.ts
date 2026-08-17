@@ -987,6 +987,26 @@ declare module './index' {
       batches: BatchSource,
       options?: RecordOptionsInput | null,
     ): void
+
+    /** Read this resource's rows, as `readArrowBatchReader` does. */
+    readArrow(options?: RecordOptionsInput | null): BatchReader
+    /**
+     * Replace or merge this resource's rows with whatever `rows` holds.
+     *
+     * An async source returns a promise, because its rows do not exist until
+     * they are awaited; every synchronous source returns nothing.
+     */
+    writeArrow(rows: RowSource, options?: RecordOptionsInput | null): void
+    writeArrow(
+      rows: AsyncIterable<RowSource>,
+      options?: RecordOptionsInput | null,
+    ): Promise<void>
+    /** Add whatever `rows` holds after the rows this resource holds. */
+    appendArrow(rows: RowSource, options?: RecordOptionsInput | null): void
+    appendArrow(
+      rows: AsyncIterable<RowSource>,
+      options?: RecordOptionsInput | null,
+    ): Promise<void>
   }
 
   /** Iterating a reader yields one Apache Arrow JS record batch at a time. */
@@ -1025,6 +1045,17 @@ export type BatchSource =
   | Buffer
   | Uint8Array
   | ArrayBuffer
+/**
+ * Anything the generic entry points build a reader from: everything
+ * `BatchSource` covers, plus an Arrow JS `RecordBatchReader`, a `Vector` a
+ * one-column schema names, an object of named columns, plain records, and any
+ * iterable of those.
+ */
+export type RowSource =
+  | BatchSource
+  | { readAll(): ArrowRecordBatch[] }
+  | { readonly [column: string]: unknown }
+  | Iterable<unknown>
 /** Native record settings, or the media type naming the encoding. */
 export type RecordOptionsInput = RecordOptions | MediaTypeInput
 /** A partition spec, or the column names one would be built from. */

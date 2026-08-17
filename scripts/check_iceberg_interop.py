@@ -46,6 +46,8 @@ INTEROP = REPO / "target" / "iceberg-interop"
 FROM_RUST = INTEROP / "from-rust"
 FROM_PYICEBERG = INTEROP / "from-pyiceberg"
 VENV_PYTHON = REPO / "python" / ".venv" / "Scripts" / "python.exe"
+if not VENV_PYTHON.exists():
+    VENV_PYTHON = REPO / "python" / ".venv" / "bin" / "python"
 
 # What PyIceberg writes, and what the Rust side reads back from it.
 APPENDED = [

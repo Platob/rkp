@@ -9,12 +9,20 @@ becomes a core batch reader on the way in and a core batch reader becomes a
 PyArrow reader on the way out. Fixtures are written before timing, and the
 column-pushdown pair reports the bytes each read materializes so "moves less
 data" is a measured number rather than an inference from elapsed time.
+
+The ``generic``, ``pandas``, and ``polars`` rows measure the wider boundary the
+inferring entry points cross. Comparing ``generic write table`` against ``ipc
+write reader`` is what says how much the inference itself costs, and the row
+and frame cases say what it costs to build Arrow out of something that is not
+Arrow yet. A frame library that is not installed is left out of the table
+rather than reported as a zero.
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import importlib
 import pathlib
 import platform
 import shutil
@@ -120,15 +128,90 @@ def _pyarrow_ipc_baseline() -> object:
     return (ROOT / "baseline.arrows").stat().st_size
 
 
-BENCHMARKS = (
-    Benchmark("ipc write reader", _write_stream, ROW_COUNT, "row"),
-    Benchmark("ipc read whole", _read_stream_whole, ROW_COUNT, "row"),
-    Benchmark("ipc read subset", _read_stream_subset, ROW_COUNT, "row"),
-    Benchmark("ipc read to table", _read_stream_table, ROW_COUNT, "row"),
-    Benchmark("parquet write reader", _write_file, ROW_COUNT, "row"),
-    Benchmark("parquet read whole", _read_file_whole, ROW_COUNT, "row"),
-    Benchmark("parquet read subset", _read_file_subset, ROW_COUNT, "row"),
-    Benchmark("PyArrow IPC write baseline", _pyarrow_ipc_baseline, ROW_COUNT, "row"),
+# The generic entry points cross a wider boundary than the reader pair above:
+# each one infers what it was handed before the same three core methods run, so
+# these numbers say what that inference costs on top of the write itself.
+def _write_generic_table() -> object:
+    SINK_STREAM.write_arrow(TABLE)
+    return SINK_STREAM.size
+
+
+def _write_generic_generator() -> object:
+    # A generator of tables is chained rather than collected, so this measures
+    # the per-item pull as well as the write.
+    SINK_STREAM.write_arrow(batch for batch in BATCHES)
+    return SINK_STREAM.size
+
+
+def _write_generic_rows() -> object:
+    SINK_STREAM.write_arrow(iter(ROW_MAPPINGS))
+    return SINK_STREAM.size
+
+
+def _optional_frame(package: str) -> object | None:
+    """Build one frame of the fixture rows, or report the library's absence."""
+    try:
+        library = importlib.import_module(package)
+    except ImportError:
+        return None
+    if package == "pandas":
+        return TABLE.to_pandas()
+    return library.from_arrow(TABLE)
+
+
+PANDAS_FRAME = _optional_frame("pandas")
+POLARS_FRAME = _optional_frame("polars")
+ROW_MAPPINGS = TABLE.to_pylist()
+
+
+def _write_pandas_frame() -> object:
+    SINK_FILE.write_pandas_frame(PANDAS_FRAME)
+    return SINK_FILE.size
+
+
+def _read_pandas_frame() -> object:
+    return len(FILE.read_pandas_frame())
+
+
+def _write_polars_frame() -> object:
+    SINK_FILE.write_polars_frame(POLARS_FRAME)
+    return SINK_FILE.size
+
+
+def _read_polars_frame() -> object:
+    return FILE.read_polars_frame().height
+
+
+BENCHMARKS = tuple(
+    benchmark
+    for benchmark in (
+        Benchmark("ipc write reader", _write_stream, ROW_COUNT, "row"),
+        Benchmark("ipc read whole", _read_stream_whole, ROW_COUNT, "row"),
+        Benchmark("ipc read subset", _read_stream_subset, ROW_COUNT, "row"),
+        Benchmark("ipc read to table", _read_stream_table, ROW_COUNT, "row"),
+        Benchmark("parquet write reader", _write_file, ROW_COUNT, "row"),
+        Benchmark("parquet read whole", _read_file_whole, ROW_COUNT, "row"),
+        Benchmark("parquet read subset", _read_file_subset, ROW_COUNT, "row"),
+        Benchmark("PyArrow IPC write baseline", _pyarrow_ipc_baseline, ROW_COUNT, "row"),
+        Benchmark("generic write table", _write_generic_table, ROW_COUNT, "row"),
+        Benchmark("generic write generator", _write_generic_generator, ROW_COUNT, "row"),
+        Benchmark("generic write mappings", _write_generic_rows, ROW_COUNT, "row"),
+        Benchmark("pandas write frame", _write_pandas_frame, ROW_COUNT, "row")
+        if PANDAS_FRAME is not None
+        else None,
+        Benchmark("pandas read frame", _read_pandas_frame, ROW_COUNT, "row")
+        if PANDAS_FRAME is not None
+        else None,
+        Benchmark("polars write frame", _write_polars_frame, ROW_COUNT, "row")
+        if POLARS_FRAME is not None
+        else None,
+        Benchmark("polars read frame", _read_polars_frame, ROW_COUNT, "row")
+        if POLARS_FRAME is not None
+        else None,
+    )
+    # A frame library nobody installed is a benchmark that is not run, never a
+    # zero that reads as a measurement.
+    if benchmark is not None
 )
 
 

@@ -17,8 +17,9 @@ use yggdryl::io::IOBase as _;
 
 use crate::field::PyField;
 use crate::record::{
-    PyRecordOptions, batch_reader_from_value, batch_reader_to_pyarrow,
-    core_record_options_from_value,
+    Frames, PyRecordOptions, batch_reader_from_any, batch_reader_from_value,
+    batch_reader_to_pyarrow, core_record_options_from_value, frame_batch_reader, frame_from_reader,
+    frames_batch_reader, frames_from_reader,
 };
 use crate::uri::{PyUrl, core_url_from_value};
 use crate::value_error;
@@ -491,6 +492,198 @@ impl PyIOBase {
         let batches = batch_reader_from_value(batches)?;
         self.inner
             .append_arrow_batch_reader(batches, &options)
+            .map_err(value_error)
+    }
+
+    /// Read this resource's rows, as `read_arrow_batch_reader` does.
+    ///
+    /// This is the short name for the same call: the reader is the record shape
+    /// in Python, so the generic read has nothing to infer and nothing to
+    /// choose between.
+    #[pyo3(signature = (*, options = None))]
+    fn read_arrow<'py>(
+        &self,
+        py: Python<'py>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.read_arrow_batch_reader(py, options)
+    }
+
+    /// Replace or merge this resource's rows with whatever `data` holds.
+    ///
+    /// This is [`write_arrow_batch_reader`](Self::write_arrow_batch_reader)
+    /// with the argument widened to everything a Python caller is likely to be
+    /// holding: a `pyarrow` `RecordBatchReader`, `Table`, `RecordBatch`,
+    /// `Dataset`, or `Scanner`, a `pandas` or `polars` frame, a list or
+    /// generator of any of those, or an iterable of plain rows. Whatever
+    /// arrives becomes one reader and is handed to the same core method, so the
+    /// widening is inference and never a second way to write.
+    ///
+    /// Nothing that could stream is collected: a generator is pulled one item
+    /// at a time, so a sequence of tables larger than memory writes exactly as
+    /// a reader would. Rows arriving as mappings are grouped into batches and
+    /// typed by the schema on the options, or by the first batch when no schema
+    /// was declared.
+    #[pyo3(signature = (data, *, options = None))]
+    fn write_arrow(
+        &mut self,
+        data: &Bound<'_, PyAny>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let options = self.resolve_options(options)?;
+        let batches = batch_reader_from_any(data, &options)?;
+        self.inner
+            .write_arrow_batch_reader(batches, &options)
+            .map_err(value_error)
+    }
+
+    /// Add whatever `data` holds after the rows this resource holds.
+    ///
+    /// The argument is inferred exactly as [`write_arrow`](Self::write_arrow)
+    /// infers it.
+    #[pyo3(signature = (data, *, options = None))]
+    fn append_arrow(
+        &mut self,
+        data: &Bound<'_, PyAny>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let options = self.resolve_options(options)?;
+        let batches = batch_reader_from_any(data, &options)?;
+        self.inner
+            .append_arrow_batch_reader(batches, &options)
+            .map_err(value_error)
+    }
+
+    /// Read this resource's rows as a lazy iterator of `pandas` frames.
+    ///
+    /// One frame per batch, converted when it is asked for, so a resource
+    /// larger than memory reads frame by frame. `read_pandas_frame` is the one
+    /// that returns every row in a single frame.
+    ///
+    /// `pandas` is imported here and nowhere else in this package, so a caller
+    /// who does not use it never pays for it.
+    #[pyo3(signature = (*, options = None))]
+    fn read_pandas<'py>(
+        &self,
+        py: Python<'py>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = self.resolve_options(options)?;
+        let reader = self
+            .inner
+            .read_arrow_batch_reader(&options)
+            .map_err(value_error)?;
+        frames_from_reader(py, reader, Frames::Pandas)
+    }
+
+    /// Read every row of this resource as one `pandas` frame.
+    #[pyo3(signature = (*, options = None))]
+    fn read_pandas_frame<'py>(
+        &self,
+        py: Python<'py>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = self.resolve_options(options)?;
+        let reader = self
+            .inner
+            .read_arrow_batch_reader(&options)
+            .map_err(value_error)?;
+        frame_from_reader(py, reader, Frames::Pandas)
+    }
+
+    /// Replace or merge this resource's rows with a stream of `pandas` frames.
+    ///
+    /// `frames` is one frame or any iterable of them, and an iterable is
+    /// consumed one frame at a time. Anything that is not a `pandas` frame is
+    /// refused by name, because `write_arrow` already accepts everything else.
+    #[pyo3(signature = (frames, *, options = None))]
+    fn write_pandas(
+        &mut self,
+        frames: &Bound<'_, PyAny>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let options = self.resolve_options(options)?;
+        let batches = frames_batch_reader(frames, Frames::Pandas, &options)?;
+        self.inner
+            .write_arrow_batch_reader(batches, &options)
+            .map_err(value_error)
+    }
+
+    /// Replace or merge this resource's rows with exactly one `pandas` frame.
+    #[pyo3(signature = (frame, *, options = None))]
+    fn write_pandas_frame(
+        &mut self,
+        frame: &Bound<'_, PyAny>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let options = self.resolve_options(options)?;
+        let batches = frame_batch_reader(frame, Frames::Pandas)?;
+        self.inner
+            .write_arrow_batch_reader(batches, &options)
+            .map_err(value_error)
+    }
+
+    /// Read this resource's rows as a lazy iterator of `polars` frames.
+    ///
+    /// One frame per batch, exactly as `read_pandas` yields one pandas frame
+    /// per batch. `polars` is imported here and nowhere else.
+    #[pyo3(signature = (*, options = None))]
+    fn read_polars<'py>(
+        &self,
+        py: Python<'py>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = self.resolve_options(options)?;
+        let reader = self
+            .inner
+            .read_arrow_batch_reader(&options)
+            .map_err(value_error)?;
+        frames_from_reader(py, reader, Frames::Polars)
+    }
+
+    /// Read every row of this resource as one `polars` frame.
+    #[pyo3(signature = (*, options = None))]
+    fn read_polars_frame<'py>(
+        &self,
+        py: Python<'py>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = self.resolve_options(options)?;
+        let reader = self
+            .inner
+            .read_arrow_batch_reader(&options)
+            .map_err(value_error)?;
+        frame_from_reader(py, reader, Frames::Polars)
+    }
+
+    /// Replace or merge this resource's rows with a stream of `polars` frames.
+    ///
+    /// A `polars.LazyFrame` is accepted and collected, because polars offers no
+    /// way to hand its rows over a batch at a time.
+    #[pyo3(signature = (frames, *, options = None))]
+    fn write_polars(
+        &mut self,
+        frames: &Bound<'_, PyAny>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let options = self.resolve_options(options)?;
+        let batches = frames_batch_reader(frames, Frames::Polars, &options)?;
+        self.inner
+            .write_arrow_batch_reader(batches, &options)
+            .map_err(value_error)
+    }
+
+    /// Replace or merge this resource's rows with exactly one `polars` frame.
+    #[pyo3(signature = (frame, *, options = None))]
+    fn write_polars_frame(
+        &mut self,
+        frame: &Bound<'_, PyAny>,
+        options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let options = self.resolve_options(options)?;
+        let batches = frame_batch_reader(frame, Frames::Polars)?;
+        self.inner
+            .write_arrow_batch_reader(batches, &options)
             .map_err(value_error)
     }
 

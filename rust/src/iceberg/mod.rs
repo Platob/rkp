@@ -1,13 +1,11 @@
-//! Apache Iceberg tables, read and written through one
-//! [`IOBase`](crate::io::IOBase) handle.
+//! Apache Iceberg tables, read and written through one [`IOBase`] handle.
 //!
 //! **An Iceberg table is a folder.** `metadata/` holds the JSON documents and
 //! the Avro manifests, `data/` holds the Parquet files, and this module reaches
-//! every one of them with [`IOBase::child_by`](crate::io::IOBase::child_by) and
-//! [`IOBase::ls`](crate::io::IOBase::ls) against the handle a [`Table`] was
-//! constructed from. Nothing here opens a path or calls the file system, so the
-//! same code works over a local directory today and over an object store the
-//! moment a backend for one exists.
+//! every one of them with [`IOBase::child_by`] and [`IOBase::ls`] against the
+//! handle a [`Table`] was constructed from. Nothing here opens a path or calls
+//! the file system, so the same code works over a local directory today and
+//! over an object store the moment a backend for one exists.
 //!
 //! The vocabulary is the crate's own. A schema is a non-null struct
 //! [`Field`](crate::Field) whose children carry `PARQUET:field_id`, a metadata
@@ -79,11 +77,11 @@
 //!
 //! It holds no catalog client, no network code, and no transaction protocol.
 //! Committing a snapshot means writing metadata somewhere, and *where* is the
-//! [`IOBase`](crate::io::IOBase) handle the caller supplies, so the format and
-//! the transport stay separate. A table found by [`Table::open`] is located the
-//! way `HadoopTables` locates one - `metadata/version-hint.text`, falling back
-//! to the highest-numbered document - because that is the only way to find a
-//! table without a catalog.
+//! [`IOBase`] handle the caller supplies, so the format and the transport stay
+//! separate. A table found by [`Table::open`] is located the way `HadoopTables`
+//! locates one - `metadata/version-hint.text`, falling back to the
+//! highest-numbered document - because that is the only way to find a table
+//! without a catalog.
 //!
 //! Two transforms can place a row: `identity` and `void`. A write against a
 //! spec using `bucket`, `truncate`, or a calendar transform is refused by name

@@ -23,7 +23,7 @@ converts what you hand it. The behaviour itself is documented once, on the
 ```console
 cd python
 python -m venv .venv
-.venv/Scripts/python -m pip install maturin pytest pyarrow
+.venv/Scripts/python -m pip install maturin ".[test]"
 .venv/Scripts/python -m maturin develop
 .venv/Scripts/python -m pytest
 ```
@@ -367,6 +367,93 @@ assert handle.read_arrow_batch_reader(options=options).schema.names == ["id"]
 `record_options()` is the settings value for whichever encoding the media type names, and it is what
 carries a Parquet row-group size or page compression. `with` is the scoped pair: leaving the block
 publishes the resource at its exact length, which is what another reader needs to find a footer.
+
+## Anything in, a reader out
+
+`read_arrow`, `write_arrow`, and `append_arrow` are the same three methods with the argument widened
+to whatever your last library handed you. Each one turns what it was given into one
+`RecordBatchReader` and then calls the core method above it, so the widening is inference and never
+a second way to write.
+
+```python
+import pathlib
+import tempfile
+
+import pyarrow as pa
+import pyarrow.dataset as pads
+
+from yggdryl import IOBase
+
+schema = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("venue", pa.string())])
+table = pa.table({"id": [1, 2], "venue": ["XNAS", None]}, schema=schema)
+root = pathlib.Path(tempfile.mkdtemp())
+
+# A table, a dataset, a generator of tables, and plain rows all write.
+for name, rows in (
+    ("table.parquet", table),
+    ("dataset.parquet", pads.dataset(table)),
+    ("generated.parquet", (chunk for chunk in table.to_batches())),
+    ("rows.parquet", [{"id": 1, "venue": "XNAS"}, {"id": 2, "venue": None}]),
+):
+    handle = IOBase(root / name)
+    handle.write_arrow(rows)
+    assert handle.read_arrow().read_all().num_rows == 2
+```
+
+| You are holding | What happens |
+| --- | --- |
+| `RecordBatchReader`, `Table`, `RecordBatch`, any `__arrow_c_stream__` exporter | the Arrow C stream, uncopied |
+| `pyarrow.dataset.Dataset` or `Scanner` | its own reader, so the scan stays a scan |
+| a `pandas` or `polars` frame | the frame's own Arrow export |
+| a list or generator of any of those | chained, one item held at a time |
+| an iterable of mappings | grouped into batches, typed by the declared schema or by the first batch |
+| an iterable of sequences | the same, once a declared schema names the columns |
+
+Nothing that could stream is collected. A generator is pulled one item at a time and each item is
+dropped before the next is asked for, so a sequence of tables larger than memory writes exactly as a
+reader would - and `write_arrow(rows)` on an unbounded generator of dictionaries groups them into
+batches of `options.batch_size` rather than building a list first.
+
+A Yggdryl record collection is the one row shape that does *not* belong here: `Record.from_dicts` and
+`Record.into_arrow_record_batch_reader` already own that conversion with its cached schema, and the
+reader they return is what `write_arrow` takes.
+
+## pandas and polars
+
+Neither library is a dependency, and neither is imported when `yggdryl` loads. An incoming value is
+recognized by its *type's* module and qualified name, so a caller who has never installed polars pays
+nothing for its support and never sees an `ImportError` about it. The import happens only inside the
+one call that cannot proceed without it: reading rows *into* a frame.
+
+```python
+import pathlib
+import tempfile
+
+import pandas as pd
+
+from yggdryl import IOBase
+
+handle = IOBase(pathlib.Path(tempfile.mkdtemp()) / "trades.parquet")
+
+handle.write_pandas_frame(pd.DataFrame({"id": [1, 2], "venue": ["XNAS", "XNYS"]}))
+
+# The plural name streams: one frame per batch, converted when it is pulled.
+assert sum(len(frame) for frame in handle.read_pandas()) == 2
+# The `_frame` name is the whole thing in one frame.
+assert list(handle.read_pandas_frame()["venue"]) == ["XNAS", "XNYS"]
+```
+
+The eight names come in pairs, and the suffix is the whole difference:
+
+| Streaming | One frame | What it does |
+| --- | --- | --- |
+| `read_pandas()` / `read_polars()` | `read_pandas_frame()` / `read_polars_frame()` | read one frame per batch, or every row in one |
+| `write_pandas(frames)` / `write_polars(frames)` | `write_pandas_frame(frame)` / `write_polars_frame(frame)` | write a frame or an iterable of them, or exactly one |
+
+The named entry points are strict: `write_pandas` handed a polars frame is a mistake worth naming,
+and `write_arrow` already accepts both. A `polars.LazyFrame` is accepted and collected, because
+polars offers no way to hand its rows over a batch at a time - that is polars' boundary, not this
+one's.
 
 An Iceberg table is the same handle one level up.
 
