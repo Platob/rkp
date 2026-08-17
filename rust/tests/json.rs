@@ -376,7 +376,7 @@ fn borrowed_json_lines_preserve_empty_crlf_unicode_and_final_rows() {
 
 #[test]
 fn json_lines_skip_only_json_whitespace_rows() {
-    for control in [b'\x0b', b'\x0c'] {
+    for control in *b"\x0b\x0c" {
         let input = [control, b'\n', b'1', b'\n'];
 
         for error in [

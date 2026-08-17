@@ -24,10 +24,17 @@ SCHEMA = pa.schema(
 )
 
 
+def rows_batch(ids: list[int], venues: list[str | None]) -> pa.RecordBatch:
+    """Build one batch of the fixture schema, on any supported PyArrow."""
+    return pa.Table.from_pydict({"id": ids, "venue": venues}, schema=SCHEMA).to_batches()[0]
+
+
 @pytest.fixture
 def batch() -> pa.RecordBatch:
     """Two rows, one of them carrying a null."""
-    return pa.record_batch({"id": [1, 2], "venue": ["XNAS", None]}, schema=SCHEMA)
+    # `pa.record_batch` grew its mapping form after this package's PyArrow
+    # floor, so the rows are named through the table form it has always had.
+    return rows_batch([1, 2], ["XNAS", None])
 
 
 @pytest.fixture

@@ -10,70 +10,106 @@ import pytest
 
 from yggdryl import DataType, Field, Record, fields
 
+# Every Arrow datatype variant the core distinguishes. It is asserted as a
+# constant so that adding a variant to the core without adding it here fails,
+# independently of how many of them the installed PyArrow can spell.
+CATALOGUE_SIZE = 41
+
+
+def _available(*builders: typing.Callable[[], pa.DataType]) -> tuple[pa.DataType, ...]:
+    """Build every variant this PyArrow can spell, skipping the rest.
+
+    The package floor is PyArrow 15, which predates the view types and the
+    narrow decimals. Those are absent rather than broken there, so a release
+    that has no constructor for one runs the others instead of failing to
+    collect the module.
+    """
+    built = []
+    for build in builders:
+        try:
+            built.append(build())
+        except AttributeError:
+            continue
+    return tuple(built)
+
 
 def _all_datatype_variants() -> tuple[DataType, ...]:
     item = pa.field("item", pa.int32(), nullable=True)
-    arrow_types = (
-        pa.null(),
-        pa.bool_(),
-        pa.int8(),
-        pa.int16(),
-        pa.int32(),
-        pa.int64(),
-        pa.uint8(),
-        pa.uint16(),
-        pa.uint32(),
-        pa.uint64(),
-        pa.float16(),
-        pa.float32(),
-        pa.float64(),
-        pa.timestamp("ns", tz="UTC"),
-        pa.date32(),
-        pa.date64(),
-        pa.time32("ms"),
-        pa.time64("ns"),
-        pa.duration("us"),
-        pa.month_day_nano_interval(),
-        pa.binary(),
-        pa.binary(3),
-        pa.large_binary(),
-        pa.binary_view(),
-        pa.string(),
-        pa.large_string(),
-        pa.string_view(),
-        pa.list_(item),
-        pa.list_view(item),
-        pa.list_(item, 2),
-        pa.large_list(item),
-        pa.large_list_view(item),
-        pa.struct(
+    # Each variant is built by a callable rather than eagerly, because the
+    # package floor is PyArrow 15 and the view and narrow-decimal constructors
+    # arrived later. A release that cannot spell one simply does not run it;
+    # `CATALOGUE_SIZE` is what keeps the catalogue itself complete.
+    arrow_types = _available(
+        lambda: pa.null(),
+        lambda: pa.bool_(),
+        lambda: pa.int8(),
+        lambda: pa.int16(),
+        lambda: pa.int32(),
+        lambda: pa.int64(),
+        lambda: pa.uint8(),
+        lambda: pa.uint16(),
+        lambda: pa.uint32(),
+        lambda: pa.uint64(),
+        lambda: pa.float16(),
+        lambda: pa.float32(),
+        lambda: pa.float64(),
+        lambda: pa.timestamp("ns", tz="UTC"),
+        lambda: pa.date32(),
+        lambda: pa.date64(),
+        lambda: pa.time32("ms"),
+        lambda: pa.time64("ns"),
+        lambda: pa.duration("us"),
+        lambda: pa.month_day_nano_interval(),
+        lambda: pa.binary(),
+        lambda: pa.binary(3),
+        lambda: pa.large_binary(),
+        lambda: pa.binary_view(),
+        lambda: pa.string(),
+        lambda: pa.large_string(),
+        lambda: pa.string_view(),
+        lambda: pa.list_(item),
+        lambda: pa.list_view(item),
+        lambda: pa.list_(item, 2),
+        lambda: pa.large_list(item),
+        lambda: pa.large_list_view(item),
+        lambda: pa.struct(
             [
                 pa.field("required", pa.int32(), nullable=False),
                 pa.field("optional", pa.string(), nullable=True),
             ]
         ),
-        pa.dense_union(
+        lambda: pa.dense_union(
             [
                 pa.field("missing", pa.null(), nullable=True),
                 pa.field("number", pa.int32(), nullable=False),
             ],
             type_codes=[1, 4],
         ),
-        pa.dictionary(pa.int8(), pa.string()),
-        pa.decimal32(7, 2),
-        pa.decimal64(12, 2),
-        pa.decimal128(30, 2),
-        pa.decimal256(50, 2),
-        pa.map_(pa.string(), pa.int32()),
-        pa.run_end_encoded(pa.int32(), pa.string()),
+        lambda: pa.dictionary(pa.int8(), pa.string()),
+        lambda: pa.decimal32(7, 2),
+        lambda: pa.decimal64(12, 2),
+        lambda: pa.decimal128(30, 2),
+        lambda: pa.decimal256(50, 2),
+        lambda: pa.map_(pa.string(), pa.int32()),
+        lambda: pa.run_end_encoded(pa.int32(), pa.string()),
     )
     variants = tuple(DataType.from_arrow(data_type) for data_type in arrow_types)
-    assert len(variants) == 41
     # `id` is the per-variant identity; `kind` is the coarse family, so the
-    # 41 variants collapse into far fewer kinds.
-    assert len({data_type.id for data_type in variants}) == 41
-    assert len({data_type.kind for data_type in variants}) < 41
+    # variants collapse into far fewer kinds.
+    assert len({data_type.id for data_type in variants}) == len(variants)
+    assert len({data_type.kind for data_type in variants}) < len(variants)
     return variants
+
+
+def test_the_catalogue_names_every_variant_this_pyarrow_can_spell() -> None:
+    built = len(_all_datatype_variants())
+
+    # A PyArrow new enough to spell them all must spell all of them; an older
+    # one says how many it left out rather than quietly testing fewer.
+    if hasattr(pa, "binary_view") and hasattr(pa, "decimal32"):
+        assert built == CATALOGUE_SIZE
+    else:
+        assert built < CATALOGUE_SIZE, f"{built} of {CATALOGUE_SIZE} variants"
 
 
 @pytest.mark.parametrize(
