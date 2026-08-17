@@ -1953,6 +1953,287 @@ fn a_truncated_manifest_is_a_typed_error_and_not_a_panic() {
 }
 
 #[test]
+fn a_tiny_write_target_rolls_one_append_into_multiple_data_files() {
+    let path = root("target-size");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+
+    let batches: Vec<RecordBatch> = (0..3)
+        .map(|id| trades(&[id], &[Some("AAPL")], &[Some("XNAS")]))
+        .collect();
+    let arrow = batches[0].schema();
+
+    // Under the 512 MiB default, three tiny batches land in one file.
+    assert_eq!(
+        table.target_file_size().unwrap(),
+        512 * 1024 * 1024,
+        "the default is Iceberg's own"
+    );
+    table
+        .append(crate::arrow::batch_reader(arrow.clone(), batches.clone()))
+        .unwrap();
+    assert_eq!(table.data_files().unwrap().len(), 1);
+
+    // A one-byte target reaches the limit at every batch boundary, so the
+    // same three batches become three files in the one partition.
+    table
+        .commit_changes(|metadata| {
+            metadata.set_property("write.target-file-size-bytes", "1")?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(table.target_file_size().unwrap(), 1);
+    table
+        .append(crate::arrow::batch_reader(arrow, batches))
+        .unwrap();
+    let files = table.data_files().unwrap();
+    assert_eq!(files.len(), 4, "one whole file plus three rolled ones");
+
+    // One running index numbers the commit's files, whatever partition each
+    // lands in: the rolled commit wrote 00000, 00001, and 00002.
+    let snapshot = table.current_snapshot().unwrap().snapshot_id;
+    let mut indices: Vec<String> = files
+        .iter()
+        .filter_map(|(file, _)| {
+            let name = file.file_path.rsplit('/').next()?;
+            name.contains(&format!("-{snapshot}-"))
+                .then(|| name.split('-').next().unwrap_or_default().to_owned())
+        })
+        .collect();
+    indices.sort();
+    assert_eq!(indices, ["00000", "00001", "00002"]);
+
+    // However the rows were laid out, they all read back.
+    assert_eq!(collect(table.scan(None).unwrap()).len(), 6);
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn the_schema_root_write_target_is_honored_when_the_table_property_is_absent() {
+    let path = root("target-schema-root");
+    let mut schema = trade_schema();
+    schema
+        .iceberg_mut()
+        .insert("write.target-file-size-bytes", "1")
+        .unwrap();
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        schema,
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+
+    // No table property, so the schema root's `iceberg:` property decides.
+    assert_eq!(table.target_file_size().unwrap(), 1);
+    let batches: Vec<RecordBatch> = (0..2)
+        .map(|id| trades(&[id], &[Some("AAPL")], &[Some("XNAS")]))
+        .collect();
+    let arrow = batches[0].schema();
+    table
+        .append(crate::arrow::batch_reader(arrow.clone(), batches.clone()))
+        .unwrap();
+    assert_eq!(table.data_files().unwrap().len(), 2);
+
+    // The moment the table property exists, it wins over the schema root.
+    table
+        .commit_changes(|metadata| {
+            metadata.set_property("write.target-file-size-bytes", "1073741824")?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(table.target_file_size().unwrap(), 1 << 30);
+    table
+        .append(crate::arrow::batch_reader(arrow, batches))
+        .unwrap();
+    assert_eq!(table.data_files().unwrap().len(), 3);
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn an_unparseable_write_target_is_a_typed_error_naming_the_key() {
+    let path = root("target-unparseable");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    table
+        .commit_changes(|metadata| {
+            metadata.set_property("write.target-file-size-bytes", "512 MB")?;
+            Ok(())
+        })
+        .unwrap();
+
+    let error = table.target_file_size().unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::Error::InvalidMetadataValue { ref key, .. }
+                if key == "write.target-file-size-bytes"
+        ),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("write.target-file-size-bytes"),
+        "{message}"
+    );
+    assert!(message.contains("512 MB"), "{message}");
+    assert!(message.contains("expected"), "{message}");
+
+    // A present but unparseable target never silently becomes the default:
+    // the write refuses rather than guessing.
+    let batch = trades(&[1], &[Some("AAPL")], &[Some("XNAS")]);
+    assert!(
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .is_err()
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn compaction_merges_small_files_and_the_old_snapshot_still_time_travels() {
+    let path = root("compact");
+    let mut table = Table::create(
+        Folder::new(&path).unwrap(),
+        FormatVersion::V2,
+        trade_schema(),
+        PartitionSpec::unpartitioned(),
+    )
+    .unwrap();
+    for id in 0..5_i64 {
+        let batch = trades(&[id], &[Some("AAPL")], &[Some("XNAS")]);
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+    }
+    let before_rows = collect(table.scan(None).unwrap());
+    assert_eq!(table.data_files().unwrap().len(), 5);
+    let past = table.current_snapshot().unwrap().snapshot_id;
+    let snapshots_before = table.metadata().snapshots.len();
+
+    let compaction = table.compact().unwrap();
+    assert_eq!(compaction.files_before, 5);
+    assert_eq!(compaction.files_after, 1);
+    assert!(compaction.bytes_rewritten > 0);
+
+    // Fewer files, identical rows, one `replace` snapshot.
+    assert_eq!(table.data_files().unwrap().len(), 1);
+    assert_eq!(collect(table.scan(None).unwrap()), before_rows);
+    assert_eq!(table.metadata().snapshots.len(), snapshots_before + 1);
+    assert_eq!(table.current_snapshot().unwrap().operation(), "replace");
+
+    // The pre-compaction snapshot is untouched, so time travel still reads
+    // the five small files it names.
+    assert_eq!(
+        collect(table.scan_at(past, &[], None).unwrap()),
+        before_rows
+    );
+    assert_eq!(table.plan_at(past, &[]).unwrap().tasks.len(), 5);
+
+    // A second compaction has nothing to do: zeros, and no new snapshot.
+    let version = table.version();
+    assert_eq!(
+        table.compact().unwrap(),
+        super::table::Compaction::default()
+    );
+    assert_eq!(table.version(), version);
+    assert_eq!(table.metadata().snapshots.len(), snapshots_before + 1);
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn compaction_respects_partitions_and_pruning_still_prunes_after_it() {
+    let path = root("compact-partitions");
+    let schema = trade_schema();
+    let spec = PartitionSpec::identity(1, &schema, &["venue"]).unwrap();
+    let mut table =
+        Table::create(Folder::new(&path).unwrap(), FormatVersion::V2, schema, spec).unwrap();
+
+    // Two commits spanning two venues each: four small files, two per venue.
+    for id in 0..2_i64 {
+        let batch = trades(
+            &[2 * id, 2 * id + 1],
+            &[Some("AAPL"), Some("MSFT")],
+            &[Some("XNAS"), Some("XNYS")],
+        );
+        table
+            .append(crate::arrow::batch_reader(batch.schema(), [batch]))
+            .unwrap();
+    }
+    // And one venue holding a single file, which no compaction may touch.
+    let lone = trades(&[9], &[Some("VOD")], &[Some("XLON")]);
+    table
+        .append(crate::arrow::batch_reader(lone.schema(), [lone]))
+        .unwrap();
+    assert_eq!(table.data_files().unwrap().len(), 5);
+    let lone_path = table
+        .data_files()
+        .unwrap()
+        .into_iter()
+        .find(|(file, _)| file.partition[0] == Value::from("XLON"))
+        .unwrap()
+        .0
+        .file_path;
+    let before_rows = collect(table.scan(None).unwrap());
+
+    let compaction = table.compact().unwrap();
+    assert_eq!(compaction.files_before, 4, "the single-file group is kept");
+    assert_eq!(compaction.files_after, 2, "one merged file per venue");
+
+    // Files of different partitions never merged: each venue holds exactly
+    // one file, in its own directory, and the lone file kept its location.
+    let files = table.data_files().unwrap();
+    assert_eq!(files.len(), 3);
+    for venue in ["XNAS", "XNYS", "XLON"] {
+        let held: Vec<_> = files
+            .iter()
+            .filter(|(file, _)| file.partition[0] == Value::from(venue))
+            .collect();
+        assert_eq!(held.len(), 1, "{venue}");
+        assert!(
+            held[0].0.file_path.contains(&format!("venue={venue}")),
+            "{}",
+            held[0].0.file_path
+        );
+    }
+    assert!(
+        files.iter().any(|(file, _)| file.file_path == lone_path),
+        "the uncompacted file is carried, not rewritten"
+    );
+    assert_eq!(collect(table.scan(None).unwrap()), before_rows);
+
+    // Pruning still works over the compacted layout: a venue filter opens one
+    // file, skips the carried manifest outright, and reads the right rows.
+    let plan = table.plan(&[("venue", "XNAS")]).unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.files_skipped(), 1, "the other merged venue's file");
+    assert_eq!(plan.manifests_skipped(), 1, "the carried XLON manifest");
+    assert_eq!(
+        collect(table.scan_where(&[("venue", "XNAS")], None).unwrap()),
+        vec![
+            (0, Some("AAPL".to_owned()), Some("XNAS".to_owned())),
+            (2, Some("AAPL".to_owned()), Some("XNAS".to_owned())),
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
 fn a_wide_schema_round_trips_with_every_field_numbered() {
     let path = root("wide");
     let mut schema = DataType::from_fields(

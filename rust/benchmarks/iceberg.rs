@@ -30,8 +30,8 @@ const VENUES: usize = 8;
 /// The filter the pruned plan asks for: one of the eight venue values.
 const PRUNED_FILTER: (&str, &str) = ("venue", "venue-2");
 
-/// The scratch labels the planning tables live under, cleaned at exit.
-const SCRATCH_LABELS: [&str; 2] = ["files-10", "files-200"];
+/// The scratch labels the benchmark tables live under, cleaned at exit.
+const SCRATCH_LABELS: [&str; 4] = ["files-10", "files-200", "compact-200", "merge-50"];
 
 /// Spell one of the [`VENUES`] partition values.
 fn venue(index: usize) -> String {
@@ -317,12 +317,127 @@ fn partition_benchmarks(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// What compaction buys a planner: the 200-file table, folded once.
+///
+/// The compaction itself runs outside the timer - it is a one-off maintenance
+/// write - and what is measured is the plan every later read starts with,
+/// against the same snapshot shape `plan/files_200` measures before folding.
+fn compact_benchmarks(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("compact");
+    let mut table = plan_table(SCRATCH_LABELS[2], 200);
+
+    // Proven once outside the timer: the fold really happened, so the plan
+    // being measured reads 8 files where the uncompacted table read 200.
+    let compaction = table.compact().expect("the table compacts");
+    assert_eq!(compaction.files_before, 200, "every small file rewrites");
+    assert_eq!(compaction.files_after, VENUES, "one merged file per venue");
+    let plan = table.plan(&[]).expect("the compacted plan reads");
+    assert_eq!(plan.tasks.len(), VENUES);
+
+    group.bench_function("plan_after_compact_200", |bencher| {
+        bencher.iter(|| {
+            black_box(&table)
+                .plan(&[])
+                .expect("the compacted plan reads")
+        });
+    });
+    group.finish();
+}
+
+/// Build an unpartitioned table of `files` single-row data files.
+///
+/// One append is one commit is one file, so the merge benchmark gets a table
+/// whose per-file id bounds are as tight as bounds can be - which is exactly
+/// what lets the measured upsert carry most files unread.
+fn merge_table(label: &str, files: usize) -> Table<Folder> {
+    let path = scratch(label);
+    let _ = std::fs::remove_dir_all(&path);
+    let schema = plan_schema();
+    let mut table = Table::create(
+        Folder::new(&path).expect("the scratch directory is addressable"),
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )
+    .expect("the scratch table creates");
+    let arrow = schema
+        .to_arrow_schema()
+        .expect("the schema projects to Arrow");
+    for index in 0..files {
+        let id = i64::try_from(index).expect("the file index fits an id");
+        let batch = RecordBatch::try_new(
+            arrow.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(StringArray::from(vec![Some(venue(index % VENUES))])),
+            ],
+        )
+        .expect("the batch matches the schema");
+        table
+            .append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))
+            .expect("the append commits");
+    }
+    table
+}
+
+/// Upserting ten keyed rows into a table of fifty single-row files.
+fn merge_benchmarks(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("merge");
+    let mut table = merge_table(SCRATCH_LABELS[3], 50);
+    let arrow = plan_schema()
+        .to_arrow_schema()
+        .expect("the schema projects to Arrow");
+    let upsert = RecordBatch::try_new(
+        arrow,
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..10)),
+            Arc::new(StringArray::from(vec![Some(venue(0)); 10])),
+        ],
+    )
+    .expect("the upsert batch matches the schema");
+    let merge_by = vec!["id".to_owned()];
+
+    // Proven once outside the timer, which also settles the table into the
+    // steady state every measured merge sees: the ten matched single-row files
+    // fold into one and the other forty are carried untouched, so an upsert of
+    // stored keys adds no row and every later merge rewrites that one file.
+    table
+        .merge(
+            yggdryl::arrow::batch_reader(upsert.schema(), [upsert.clone()]),
+            &merge_by,
+            true,
+        )
+        .expect("the priming merge commits");
+    let plan = table.plan(&[]).expect("the merged table plans");
+    assert_eq!(
+        plan.record_count(),
+        50,
+        "an upsert of stored keys adds no row"
+    );
+    assert_eq!(plan.tasks.len(), 41, "ten matched files fold into one");
+
+    group.bench_function("upsert_into_50_files", |bencher| {
+        bencher.iter(|| {
+            table
+                .merge(
+                    yggdryl::arrow::batch_reader(upsert.schema(), [upsert.clone()]),
+                    black_box(&merge_by),
+                    true,
+                )
+                .expect("the merge commits");
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     iceberg,
     plan_benchmarks,
     metadata_benchmarks,
     manifest_benchmarks,
-    partition_benchmarks
+    partition_benchmarks,
+    compact_benchmarks,
+    merge_benchmarks
 );
 
 fn main() {

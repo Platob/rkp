@@ -1222,6 +1222,132 @@ let rows: usize = partition
 assert_eq!(rows, 1);
 ```
 
+## A warehouse of tables
+
+!!! note "Rust only"
+    The catalog is a core surface the bindings do not project yet.
+
+A caller who has rows and a dotted name should need nothing else. `Catalog` is that surface: one
+warehouse folder, namespaces as nested folders, and a table per name - `HadoopCatalog`'s layout,
+reached through [`IOBase`](io.md) and nothing else.
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{Int64Array, RecordBatch, StringArray};
+use yggdryl::iceberg::Catalog;
+use yggdryl::local::Folder;
+use yggdryl::DataType;
+
+let warehouse = std::env::temp_dir().join("yggdryl-doc-warehouse");
+let _ = std::fs::remove_dir_all(&warehouse);
+let catalog = Catalog::new(Folder::new(&warehouse)?);
+
+// Rows and a name are enough: the first append creates the table with the
+// schema the rows carry, and the second appends to it.
+let schema = DataType::from_fields([
+    DataType::Int64.required_field("id"),
+    DataType::Utf8.nullable_field("venue"),
+])?
+.required_field("row")
+.with_partition_fields(&["venue"])?;
+let arrow_schema = schema.to_arrow_schema()?;
+let rows = |ids: &[i64], venues: &[&str]| {
+    RecordBatch::try_new(
+        Arc::clone(&arrow_schema),
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(venues.to_vec())),
+        ],
+    )
+};
+let first = rows(&[1, 2], &["XNAS", "XNYS"])?;
+let table = catalog.append("nyc.trades", yggdryl::arrow::batch_reader(first.schema(), [first]))?;
+let rows_read: usize = table.scan(None)?.map(|batch| batch.map(|b| b.num_rows())).sum::<Result<usize, _>>()?;
+assert_eq!(rows_read, 2);
+
+let second = rows(&[3], &["XNAS"])?;
+catalog.append("nyc.trades", yggdryl::arrow::batch_reader(second.schema(), [second]))?;
+
+// The partition marks the schema carried became the table's spec.
+let reopened = catalog.table("nyc.trades")?;
+assert_eq!(reopened.metadata().default_spec()?.fields[0].name, "venue");
+assert!(catalog.has_table("nyc.trades")?);
+assert_eq!(catalog.list_namespaces(None)?, ["nyc"]);
+assert_eq!(catalog.list_tables("nyc")?, ["nyc.trades"]);
+
+let _ = std::fs::remove_dir_all(&warehouse);
+```
+
+`create_table` is the explicit spelling - it numbers an unnumbered schema, derives the identity spec
+from the schema's own [partition marks](field.md#a-field-can-be-a-partition-column), and refuses a
+name that already has a table. `append` and `overwrite` are create-or-write. Every convenience is a
+thin wrapper over the explicit one; nothing is decided twice.
+
+What is deliberately not here: `drop_table` and `rename_table`, because the storage contract has no
+delete or move primitive, and a catalog must not emulate either by leaving a half-erased table
+behind; and no catalog *service* client, because the module holds no network code. A REST catalog
+is future work behind an HTTP storage backend.
+
+## Data files aim at a size
+
+!!! note "Rust only"
+    The size target and compaction are core surfaces the bindings do not
+    project yet.
+
+One key names the target: the table property `write.target-file-size-bytes`, falling back to the
+schema root's `iceberg:write.target-file-size-bytes` protocol property, then Iceberg's 512 MiB
+default. A partition's stream rolls to a new data file at the batch boundary that reaches the
+target - sized by Arrow in-memory bytes, so Parquet's compression lands files under the target
+rather than at it - and a table that has accumulated small files rewrites them:
+
+```rust
+use std::sync::Arc;
+
+use arrow_array::{Int64Array, RecordBatch};
+use yggdryl::iceberg::{Catalog, FormatVersion};
+use yggdryl::local::Folder;
+use yggdryl::DataType;
+
+let warehouse = std::env::temp_dir().join("yggdryl-doc-compaction");
+let _ = std::fs::remove_dir_all(&warehouse);
+let catalog = Catalog::new(Folder::new(&warehouse)?);
+
+let schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+    .required_field("row");
+let arrow_schema = schema.to_arrow_schema()?;
+let one = |id: i64| {
+    RecordBatch::try_new(
+        Arc::clone(&arrow_schema),
+        vec![Arc::new(Int64Array::from(vec![id]))],
+    )
+};
+
+// Five appends, five snapshots, five small files.
+let mut table = catalog.create_table("tiny.rows", schema)?;
+for id in 0..5 {
+    let batch = one(id)?;
+    table.append(yggdryl::arrow::batch_reader(batch.schema(), [batch]))?;
+}
+assert_eq!(table.inspect_files()?.next().expect("one batch")?.num_rows(), 5);
+
+// Compaction rewrites the small groups as one replace commit and reports it.
+let compaction = table.compact()?;
+assert_eq!(compaction.files_before, 5);
+assert_eq!(compaction.files_after, 1);
+assert_eq!(table.scan(None)?.map(|batch| batch.map(|b| b.num_rows())).sum::<Result<usize, _>>()?, 5);
+
+// Nothing to do is a no-op that commits nothing.
+assert_eq!(table.compact()?, yggdryl::iceberg::Compaction::default());
+
+let _ = std::fs::remove_dir_all(&warehouse);
+```
+
+Compaction groups live files by partition, touches only groups holding at least two files with one
+under the target, and carries every other file into the new snapshot exactly as a merge carries the
+files it never read. The snapshot before the compaction still time-travels: rewriting the present
+never rewrites history.
+
 ## The Spark quickstart, locally
 
 !!! note "Rust only"
@@ -1237,25 +1363,28 @@ Spark, no JVM, and no catalog service. A local folder is the whole warehouse.
 use std::sync::Arc;
 
 use arrow_array::{Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
-use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+use yggdryl::generic::Holder;
+use yggdryl::iceberg::Table;
 use yggdryl::local::Folder;
 use yggdryl::DataType;
 
 let root = std::env::temp_dir().join("yggdryl-doc-nyc-taxis");
 let _ = std::fs::remove_dir_all(&root);
+let catalog = yggdryl::iceberg::Catalog::new(Folder::new(&root)?);
 
 // CREATE TABLE nyc.taxis (...) PARTITIONED BY (vendor_id)
-let mut schema = DataType::from_fields([
+// The partition mark on the schema is the whole PARTITIONED BY clause.
+let schema = DataType::from_fields([
     DataType::Int64.required_field("vendor_id"),
     DataType::Int64.required_field("trip_id"),
     DataType::Float32.nullable_field("trip_distance"),
     DataType::Float64.nullable_field("fare_amount"),
     DataType::Utf8.nullable_field("store_and_fwd_flag"),
 ])?
-.required_field("row");
-assign_field_ids(&mut schema, 1)?;
-let spec = PartitionSpec::identity(0, &schema, &["vendor_id"])?;
-let mut table = Table::create(Folder::new(&root)?, FormatVersion::V2, schema.clone(), spec)?;
+.required_field("row")
+.with_partition_fields(&["vendor_id"])?;
+let mut table = catalog.create_table("nyc.taxis", schema.clone())?;
+let schema = table.schema()?.clone();
 
 // INSERT INTO nyc.taxis VALUES (...)
 let arrow_schema = schema.to_arrow_schema()?;
@@ -1281,7 +1410,7 @@ let rows = taxis(
 table.append(yggdryl::arrow::batch_reader(rows.schema(), [rows]))?;
 
 // SELECT * FROM nyc.taxis
-let fares = |table: &Table<Folder>| -> Result<Vec<(i64, f64)>, Box<dyn std::error::Error>> {
+let fares = |table: &Table<Holder>| -> Result<Vec<(i64, f64)>, Box<dyn std::error::Error>> {
     let mut rows = Vec::new();
     for batch in table.scan(None)? {
         let batch = batch?;

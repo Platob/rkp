@@ -33,8 +33,9 @@
 //!
 //! # What a commit costs
 //!
-//! Committing means writing a new metadata document, so an append writes one
-//! Parquet file per partition, one manifest, one manifest list, and one
+//! Committing means writing a new metadata document, so an append writes at
+//! least one Parquet file per partition - more when a partition's rows exceed
+//! [`Table::target_file_size`] - one manifest, one manifest list, and one
 //! metadata JSON. Nothing is mutated in place, which is what makes the previous
 //! snapshot still readable afterwards.
 
@@ -67,6 +68,18 @@ const DATA_DIR: &str = "data";
 
 /// The file naming the current metadata version, as `HadoopTables` writes it.
 const VERSION_HINT: &str = "version-hint.text";
+
+/// The property naming the size a data file aims for, in bytes.
+///
+/// The table property carries this name exactly; the schema-root fallback is
+/// the same name under the `iceberg:` protocol prefix.
+const TARGET_FILE_SIZE_KEY: &str = "write.target-file-size-bytes";
+
+/// The size a data file aims for when nothing configures one.
+///
+/// This is Iceberg's own documented default for
+/// `write.target-file-size-bytes`: 512 MiB.
+const DEFAULT_TARGET_FILE_SIZE: u64 = 512 * 1024 * 1024;
 
 /// An Iceberg table reached entirely through one container handle.
 ///
@@ -225,6 +238,34 @@ impl<H: IOBase> Table<H> {
     /// Borrow the snapshot a reader sees, when the table has one.
     pub fn current_snapshot(&self) -> Option<&Snapshot> {
         self.metadata.current_snapshot()
+    }
+
+    /// Return the size a data file aims for, in bytes.
+    ///
+    /// The table property `write.target-file-size-bytes` decides. A table that
+    /// does not set it falls back to the schema root's
+    /// `iceberg:write.target-file-size-bytes` protocol property, and a table
+    /// that sets neither uses Iceberg's own default of 512 MiB.
+    ///
+    /// What a write measures against this target is the Arrow in-memory size
+    /// of the accumulated batches ([`RecordBatch::get_array_memory_size`]),
+    /// estimated *before* encoding. Parquet compresses what it writes, so data
+    /// files land under the target rather than at it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error naming the key and the value when either property
+    /// is present but does not spell a positive byte count; a configured
+    /// target is never silently replaced by the default.
+    pub fn target_file_size(&self) -> Result<u64> {
+        if let Some(text) = self.metadata.property(TARGET_FILE_SIZE_KEY) {
+            return parsed_target(SmolStr::new_static(TARGET_FILE_SIZE_KEY), text);
+        }
+        let root = self.schema()?.iceberg();
+        match root.get(TARGET_FILE_SIZE_KEY) {
+            Some(text) => parsed_target(SmolStr::new(root.key(TARGET_FILE_SIZE_KEY)), text),
+            None => Ok(DEFAULT_TARGET_FILE_SIZE),
+        }
     }
 
     /// Return every manifest the current snapshot points at.
@@ -584,7 +625,8 @@ impl<H: IOBase> Table<H> {
     /// Returns an error when the partition spec cannot place a row, when a
     /// batch cannot be cast to the table schema, or when any write fails.
     pub fn append(&mut self, batches: BatchReader) -> Result<()> {
-        self.commit(batches, "append", Retained::All)
+        self.commit(batches, "append", Retained::All)?;
+        Ok(())
     }
 
     /// Replace every row with `batches` as a new snapshot.
@@ -626,7 +668,8 @@ impl<H: IOBase> Table<H> {
                 manifests: plan.skipped,
                 entries: plan.excluded,
             },
-        )
+        )?;
+        Ok(())
     }
 
     /// Merge `batches` into the stored rows, matching on the `merge_by` columns.
@@ -706,7 +749,90 @@ impl<H: IOBase> Table<H> {
                 manifests: plan.skipped,
                 entries: carried,
             },
-        )
+        )?;
+        Ok(())
+    }
+
+    /// Merge the current snapshot's undersized data files, one partition at a time.
+    ///
+    /// The live files are grouped by spec and partition tuple - a data file
+    /// belongs to exactly one partition, so files of different partitions are
+    /// never merged into one - and a group is rewritten when it holds at least
+    /// two files and at least one of them is smaller than
+    /// [`Self::target_file_size`]. The rewritten rows go through the same
+    /// rolling writer an append uses, so a compacted partition lands in files
+    /// of roughly the target size, and every file of every other group is
+    /// carried into the new snapshot untouched: same location, same
+    /// statistics, same commit order.
+    ///
+    /// The commit is one `replace` snapshot, so the pre-compaction snapshot
+    /// stays retained and [`Self::scan_at`] still reads exactly the rows it
+    /// always read. A table with nothing to compact is left exactly as it is:
+    /// no snapshot is committed and the returned `Compaction` is all zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target size is configured but unparseable,
+    /// when a manifest cannot be read, or when any read or write of the
+    /// rewrite fails.
+    pub fn compact(&mut self) -> Result<Compaction> {
+        let target = i64::try_from(self.target_file_size()?).unwrap_or(i64::MAX);
+        let plan = self.plan(&[])?;
+
+        // Group the live files by (spec, partition tuple), in plan order.
+        let mut groups: Vec<(i32, Vec<Value>, Vec<ScanTask>)> = Vec::new();
+        for task in plan.tasks {
+            match groups.iter_mut().find(|(spec_id, partition, _)| {
+                *spec_id == task.spec.spec_id && *partition == task.entry.data_file.partition
+            }) {
+                Some((_, _, tasks)) => tasks.push(task),
+                None => {
+                    let partition = task.entry.data_file.partition.clone();
+                    groups.push((task.spec.spec_id, partition, vec![task]));
+                }
+            }
+        }
+
+        let mut selected: Vec<ScanTask> = Vec::new();
+        let mut carried = plan.excluded;
+        for (_, _, tasks) in groups {
+            let undersized = tasks
+                .iter()
+                .any(|task| task.entry.data_file.file_size_in_bytes < target);
+            if tasks.len() >= 2 && undersized {
+                selected.extend(tasks);
+            } else {
+                carried.extend(tasks);
+            }
+        }
+
+        // Nothing qualifies, so nothing is committed: a snapshot that changes
+        // no file would still cost a manifest, a list, and a document.
+        if selected.is_empty() {
+            return Ok(Compaction::default());
+        }
+
+        let files_before = selected.len();
+        let bytes_rewritten: i64 = selected
+            .iter()
+            .map(|task| task.entry.data_file.file_size_in_bytes)
+            .sum();
+
+        let schema = self.schema()?.clone();
+        let rows = self.reader(selected, &schema, None, Vec::new())?;
+        let files_after = self.commit(
+            rows,
+            "replace",
+            Retained::Only {
+                manifests: plan.skipped,
+                entries: carried,
+            },
+        )?;
+        Ok(Compaction {
+            files_before,
+            files_after,
+            bytes_rewritten,
+        })
     }
 
     /// Add a schema and make it current, then write a new metadata document.
@@ -768,10 +894,20 @@ impl<H: IOBase> Table<H> {
     }
 
     /// Write the data files, the manifest, the manifest list, and the metadata.
-    fn commit(&mut self, batches: BatchReader, operation: &str, retained: Retained) -> Result<()> {
+    ///
+    /// Returns how many data files the commit wrote. Each partition group's
+    /// rows are rolled into files of roughly [`Self::target_file_size`] bytes,
+    /// and one running index numbers every file of the commit.
+    fn commit(
+        &mut self,
+        batches: BatchReader,
+        operation: &str,
+        retained: Retained,
+    ) -> Result<usize> {
         let schema = self.schema()?.clone();
         let spec = self.metadata.default_spec()?.clone();
         spec.require_writable()?;
+        let target = self.target_file_size()?;
 
         let snapshot_id = snapshot_id();
         let sequence_number = self.metadata.last_sequence_number + 1;
@@ -779,20 +915,19 @@ impl<H: IOBase> Table<H> {
         let sources = spec.source_names(&schema)?;
 
         let mut written = Vec::new();
-        for (index, (values, group)) in
-            grouped_batches(batches, &schema, &spec, &sources, &partition)?
-                .into_iter()
-                .enumerate()
-        {
-            written.push(self.write_data_file(
-                index,
-                snapshot_id,
-                &schema,
-                &spec,
-                &values,
-                group,
-            )?);
+        for (values, group) in grouped_batches(batches, &schema, &spec, &sources, &partition)? {
+            for file in rolled(group, target) {
+                written.push(self.write_data_file(
+                    written.len(),
+                    snapshot_id,
+                    &schema,
+                    &spec,
+                    &values,
+                    file,
+                )?);
+            }
         }
+        let files_written = written.len();
 
         let added_records: i64 = written.iter().map(|file| file.record_count).sum();
         let added_size: i64 = written.iter().map(|file| file.file_size_in_bytes).sum();
@@ -891,7 +1026,8 @@ impl<H: IOBase> Table<H> {
                 Some(self.metadata.next_row_id.unwrap_or_default() + added_records);
         }
         self.metadata.set_current_snapshot(snapshot);
-        self.commit_metadata()
+        self.commit_metadata()?;
+        Ok(files_written)
     }
 
     /// Write one partition's rows as a Parquet data file and describe it.
@@ -1040,6 +1176,56 @@ impl<H: IOBase> Table<H> {
             self.metadata.location.trim_end_matches('/')
         )
     }
+}
+
+/// What one [`Table::compact`] call did, in numbers a caller can assert on.
+///
+/// A compaction with nothing to do reports zeros, because it commits nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Compaction {
+    /// How many live data files were read and replaced.
+    pub files_before: usize,
+    /// How many data files the rewrite produced in their place.
+    pub files_after: usize,
+    /// The recorded size of the replaced files, in bytes.
+    pub bytes_rewritten: i64,
+}
+
+/// Parse one configured target file size, or say why the value is not one.
+fn parsed_target(key: SmolStr, text: &str) -> Result<u64> {
+    match text.parse::<u64>() {
+        Ok(bytes) if bytes > 0 => Ok(bytes),
+        _ => Err(Error::InvalidMetadataValue {
+            key,
+            reason: format_smolstr!("expected a positive byte count, got {text:?}"),
+        }),
+    }
+}
+
+/// Split one partition group's batches into files of roughly `target` bytes.
+///
+/// The estimate is the Arrow in-memory size of each batch
+/// ([`RecordBatch::get_array_memory_size`]), taken *before* encoding: Parquet
+/// compresses what it writes, so the files land under the target rather than
+/// at it. A file closes at the first batch boundary at or past the target and
+/// a batch is never split, so one batch larger than the target is one file.
+fn rolled(batches: Vec<RecordBatch>, target: u64) -> Vec<Vec<RecordBatch>> {
+    let mut files: Vec<Vec<RecordBatch>> = Vec::new();
+    let mut current: Vec<RecordBatch> = Vec::new();
+    let mut held: u64 = 0;
+    for batch in batches {
+        let size = u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX);
+        held = held.saturating_add(size);
+        current.push(batch);
+        if held >= target {
+            files.push(std::mem::take(&mut current));
+            held = 0;
+        }
+    }
+    if !current.is_empty() {
+        files.push(current);
+    }
+    files
 }
 
 /// What a commit keeps of the files the current snapshot already names.

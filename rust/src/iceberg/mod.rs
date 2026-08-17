@@ -90,6 +90,7 @@
 //! file belongs to.
 
 mod avro;
+mod catalog;
 mod evolve;
 mod inspect;
 mod manifest;
@@ -103,6 +104,7 @@ mod table;
 mod types;
 mod value;
 
+pub use catalog::Catalog;
 pub use evolve::{SchemaUpdate, can_promote};
 pub use manifest::{
     DataFile, EntryStatus, FieldSummary, FileFormat, ManifestContent, ManifestEntry, ManifestFile,
@@ -113,7 +115,7 @@ pub use partition::{FIRST_PARTITION_ID, PartitionField, PartitionSpec, Transform
 pub use scan::{ScanPlan, ScanTask};
 pub use schema::{assign_field_ids, last_field_id, schema_from_json, schema_to_json};
 pub use snapshot::{MAIN_BRANCH, Snapshot, SnapshotRef};
-pub use table::Table;
+pub use table::{Compaction, Table};
 pub use types::PrimitiveType;
 
 use crate::Result;
