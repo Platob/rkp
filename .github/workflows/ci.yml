@@ -2,67 +2,114 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
   pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  test:
-    name: Python ${{ matrix.python-version }}
+  rust:
+    # The Parquet encoding and the Iceberg table format over it are behind
+    # non-default features, so a single-configuration job never compiles them
+    # at all: their code, their tests, and their documentation are only checked
+    # by the second leg.
+    name: Rust quality (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        include:
+          - name: default features
+            flags: ""
+          - name: parquet iceberg
+            flags: --features "parquet iceberg"
     steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Formatting
+        run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path rust/Cargo.toml --workspace --all-targets ${{ matrix.flags }} -- -D warnings
+      - name: Tests
+        run: cargo test --locked --manifest-path rust/Cargo.toml --workspace --all-targets ${{ matrix.flags }}
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --manifest-path rust/Cargo.toml --workspace --no-deps ${{ matrix.flags }}
+      - name: Compile benchmarks
+        run: cargo bench --locked --manifest-path rust/Cargo.toml --benches --no-run ${{ matrix.flags }}
 
-      - name: Install Java for Spark integration tests
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
-        with:
-          enable-cache: true
-          python-version: ${{ matrix.python-version }}
-          working-directory: python
-
-      - name: Install locked test and development dependencies
-        run: uv sync --project python --locked --extra test --group dev
-
-      - name: Run tests
-        run: uv run --project python --extra test --group dev pytest -q
-
-      - name: Lint and check formatting
-        if: matrix.python-version == '3.12'
+  core-msrv:
+    name: Core Rust 1.85
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install core MSRV
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Check core at its declared MSRV
         run: |
-          uv run --project python --group dev ruff check python/src python/tests python/benchmarks docs/examples
-          uv run --project python --group dev ruff format --check python/src python/tests python/benchmarks docs/examples
+          cargo +1.85.0 check --locked --manifest-path rust/Cargo.toml -p yggdryl --all-targets
+          cargo +1.85.0 check --locked --manifest-path rust/Cargo.toml -p yggdryl --no-default-features --lib
 
-      - name: Type-check the package
-        if: matrix.python-version == '3.12'
+  python:
+    name: Python binding (${{ matrix.pyarrow }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pyarrow:
+          - "pyarrow==18.*"
+          - "pyarrow>=18"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      # `pandas` and `polars` are not runtime dependencies; they are installed
+      # so the tests covering the frame entry points run here instead of
+      # skipping. Both are optional for PyArrow itself, so the pinned PyArrow
+      # in the matrix still decides which one is used.
+      - name: Install build and test tools
         run: >-
-          uv run --project python --group dev
-          mypy python/src/rkp python/tests/typing/record_methods.py
-          --ignore-missing-imports
+          python -m pip install "maturin>=1.9,<2" "${{ matrix.pyarrow }}"
+          "pytest>=8" "mypy>=1.15" "pandas>=2" "polars>=1" tzdata
+      - name: Build wheel
+        run: maturin build --locked --manifest-path python/Cargo.toml --interpreter python --out python/dist
+      - name: Install wheel
+        run: python -m pip install --force-reinstall --no-deps python/dist/*.whl
+      - name: Smoke tests
+        run: python -m pytest python/tests
+      - name: Static typing
+        run: >-
+          python -m mypy --strict
+          python/yggdryl
+          python/tests/typing_bindings.py
+          python/tests/typing_records.py
 
-      - name: Audit installed dependencies
-        if: matrix.python-version == '3.12'
-        working-directory: python
-        run: uv run --extra test --group dev pip-audit
-
-      - name: Build and validate distributions
-        if: matrix.python-version == '3.12'
-        run: |
-          uv build --project python --no-sources
-          uv run --project python --group dev twine check python/dist/*
+  node:
+    name: Node.js binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install Node.js build tooling
+        run: npm ci --prefix node
+      - name: Regenerate native module and audit package
+        run: npm run --prefix node test:package
+      - name: Smoke tests
+        run: npm test --prefix node

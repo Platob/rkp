@@ -1,0 +1,1723 @@
+# Apache Iceberg
+
+Read and write Apache Iceberg tables through one [`IOBase`](io.md) handle.
+
+!!! note "All three"
+    Python has the table - create, open, scan, append, overwrite, evolve, and
+    the metadata a commit produced - as `yggdryl.iceberg`, and JavaScript has
+    the same surface as the `iceberg` namespace of `@yggdryl/node`. The
+    standalone document readers and writers stay in Rust, and each section below
+    says so.
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::{arrow, DataType};
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use std::sync::Arc;
+
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Utf8.nullable_field("venue"),
+    ])?
+    .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+
+    let path = std::env::temp_dir().join("yggdryl-docs-iceberg-lead");
+    let _ = std::fs::remove_dir_all(&path);
+
+    // A table is created in a folder, and a folder is all it ever touches.
+    let spec = PartitionSpec::identity(1, &schema, &["venue"])?;
+    let mut table = Table::create(Folder::new(&path)?, FormatVersion::V2, schema.clone(), spec)?;
+
+    // A table that has never been written to has no current snapshot.
+    assert!(table.current_snapshot().is_none());
+    assert_eq!(table.scan(None)?.count(), 0);
+
+    let batch = RecordBatch::try_new(
+        schema.to_arrow_schema()?,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2])),
+            Arc::new(StringArray::from(vec![Some("XNAS"), Some("XNYS")])),
+        ],
+    )?;
+    table.append(arrow::batch_reader(batch.schema(), [batch]))?;
+
+    let snapshot = table.current_snapshot().expect("a snapshot");
+    assert_eq!(snapshot.operation(), "append");
+    assert_eq!(table.data_files()?.len(), 2, "one file per venue");
+
+    // Reopening finds the table again, with no catalog in between.
+    let reopened = Table::open(Folder::new(&path)?)?;
+    let rows: usize = reopened.scan(None)?.map(|batch| batch.unwrap().num_rows()).sum();
+    assert_eq!(rows, 2);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids
+
+    # Iceberg resolves a column by identifier, so a schema is numbered first.
+    schema = assign_field_ids(pa.schema([
+        pa.field("id", pa.int64(), nullable=False),
+        pa.field("venue", pa.string()),
+    ]))
+
+    root = IOBase(pathlib.Path(tempfile.mkdtemp()) / "trades")
+
+    # A table is created in a folder, and a folder is all it ever touches.
+    table = Table.create(root, schema, ["venue"])
+
+    # A table that has never been written to has no current snapshot.
+    assert table.current_snapshot is None
+    assert table.scan().read_all().num_rows == 0
+
+    table.append(
+        pa.record_batch(
+            {"id": [1, 2], "venue": ["XNAS", "XNYS"]},
+            schema=pa.schema([
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("venue", pa.string()),
+            ]),
+        )
+    )
+
+    assert table.current_snapshot is not None
+    assert table.current_snapshot.operation == "append"
+    assert len(table.data_files()) == 2, "one file per venue"
+
+    # Reopening finds the table again, with no catalog in between.
+    reopened = Table.open(IOBase(root.url.to_path()))
+    assert reopened.scan().read_all().num_rows == 2
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    // Iceberg resolves a column by identifier, so a schema is numbered first.
+    const schema = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int64'), Field.from('venue: utf8')], {
+        nullable: false,
+      }),
+    )
+
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-docs-')), 'trades')
+
+    // A table is created in a folder, and a folder is all it ever touches.
+    const table = iceberg.Table.create(root, schema, ['venue'])
+
+    // A table that has never been written to has no current snapshot.
+    assert.equal(table.currentSnapshot, null)
+    assert.equal(table.scan().toTable().numRows, 0)
+
+    table.append(
+      new arrow.Table({
+        id: arrow.vectorFromArray([1n, 2n], new arrow.Int64()),
+        venue: arrow.vectorFromArray(['XNAS', 'XNYS'], new arrow.Utf8()),
+      }),
+    )
+
+    assert.equal(table.currentSnapshot.operation, 'append')
+    assert.equal(table.dataFiles().length, 2, 'one file per venue')
+
+    // Reopening finds the table again, with no catalog in between.
+    const reopened = iceberg.Table.open(root)
+    assert.equal(reopened.scan().toTable().numRows, 2)
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
+
+**An Iceberg table is a folder.** `metadata/` holds the JSON documents and the Avro manifests,
+`data/` holds the Parquet files, and everything here is reached with
+[`IOBase::child_by`](io.md) and [`IOBase::ls`](io.md) against the handle the table was constructed
+from. Nothing in this module opens a path or calls the file system, so the same code works over a
+local directory today and over an object store the moment a backend for one exists.
+
+The vocabulary is the crate's own. A schema is a non-null struct [`Field`](field.md) whose children
+carry `PARQUET:field_id`; a metadata document is a [`Value`](json.md) read by the crate's own JSON
+parser; a data file is whatever [parquet](parquet.md) wrote plus the statistics it reported; a scan
+is a `BatchReader` with the same [column pushdown](io.md) every other read gets. No dependency is
+added for the table format itself - even the Avro container the manifests live in is implemented
+here, because it is a header and some blocks.
+
+## The `iceberg` feature
+
+`iceberg` is not a default feature:
+
+```toml
+[dependencies]
+yggdryl = { version = "0.1", features = ["iceberg"] }
+```
+
+It implies `parquet`, which implies `arrow`. A table format sits on top of the record encodings, so
+a consumer that only needs schemas never compiles it.
+
+## What a table writes
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::io::IOBase;
+    use yggdryl::local::Folder;
+    use yggdryl::{arrow, DataType};
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use std::sync::Arc;
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+
+    let path = std::env::temp_dir().join("yggdryl-docs-iceberg-layout");
+    let _ = std::fs::remove_dir_all(&path);
+    let mut table = Table::create(
+        Folder::new(&path)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    let batch = RecordBatch::try_new(
+        schema.to_arrow_schema()?,
+        vec![Arc::new(Int64Array::from(vec![1_i64]))],
+    )?;
+    table.append(arrow::batch_reader(batch.schema(), [batch]))?;
+
+    let names: Vec<String> = Folder::new(&path)?
+        .ls(true, false)?
+        .iter()
+        .filter(|entry| !entry.is_container())
+        .filter_map(|entry| entry.url().and_then(|url| url.file_name().map(str::to_owned)))
+        .collect();
+
+    // One Parquet data file, one manifest, one manifest list, two metadata
+    // documents (create, then commit), and the version hint that finds them.
+    assert!(names.iter().any(|name| name.ends_with(".parquet")));
+    assert!(names.iter().any(|name| name.starts_with("snap-") && name.ends_with(".avro")));
+    assert!(names.iter().any(|name| name.ends_with("-m0.avro")));
+    assert!(names.contains(&"v1.metadata.json".to_owned()));
+    assert!(names.contains(&"v2.metadata.json".to_owned()));
+    assert!(names.contains(&"version-hint.text".to_owned()));
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids
+
+    schema = assign_field_ids(pa.schema([pa.field("id", pa.int64(), nullable=False)]))
+    root = IOBase(pathlib.Path(tempfile.mkdtemp()) / "trades")
+
+    table = Table.create(root, schema)
+    table.append(
+        pa.record_batch(
+            {"id": [1]}, schema=pa.schema([pa.field("id", pa.int64(), nullable=False)])
+        )
+    )
+
+    # `table.root` is the folder handle the table reads and writes through.
+    names = [
+        entry.name
+        for entry in table.root.ls(recursive=True)
+        if entry.is_file()
+    ]
+
+    # One Parquet data file, one manifest, one manifest list, two metadata
+    # documents (create, then commit), and the version hint that finds them.
+    assert any(name.endswith(".parquet") for name in names)
+    assert any(name.startswith("snap-") and name.endswith(".avro") for name in names)
+    assert any(name.endswith("-m0.avro") for name in names)
+    assert "v1.metadata.json" in names
+    assert "v2.metadata.json" in names
+    assert "version-hint.text" in names
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const schema = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int64')], { nullable: false }),
+    )
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-docs-')), 'trades')
+
+    const table = iceberg.Table.create(root, schema)
+    table.append(new arrow.Table({ id: arrow.vectorFromArray([1n], new arrow.Int64()) }))
+
+    // `table.root` is the folder handle the table reads and writes through.
+    const names = table.root
+      .ls(true)
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name)
+
+    // One Parquet data file, one manifest, one manifest list, two metadata
+    // documents (create, then commit), and the version hint that finds them.
+    assert.ok(names.some((name) => name.endsWith('.parquet')))
+    assert.ok(names.some((name) => name.startsWith('snap-') && name.endsWith('.avro')))
+    assert.ok(names.some((name) => name.endsWith('-m0.avro')))
+    assert.ok(names.includes('v1.metadata.json'))
+    assert.ok(names.includes('v2.metadata.json'))
+    assert.ok(names.includes('version-hint.text'))
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
+
+Committing means writing a new metadata document; nothing is mutated in place, which is what makes
+the previous snapshot still readable afterwards. `Table::open` finds the current document the way
+`HadoopTables` does - `metadata/version-hint.text`, falling back to the highest-numbered
+`*.metadata.json` - because that is the only way to find a table without a catalog.
+
+## Table metadata, v1 through v3
+
+!!! note "Rust only"
+    A metadata document is read and written from Rust. The bindings read the
+    version a table declares as its `format_version`.
+
+```rust
+use yggdryl::iceberg::{FormatVersion, PartitionSpec, TableMetadata, assign_field_ids};
+use yggdryl::DataType;
+
+let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+    .required_field("row");
+assign_field_ids(&mut schema, 1)?;
+
+// v1 keeps the singular `schema` and `partition-spec` keys and has no
+// sequence numbers.
+let v1 = TableMetadata::new(
+    FormatVersion::V1,
+    "file:///lake/trades",
+    schema.clone(),
+    PartitionSpec::unpartitioned(),
+)?;
+let document = v1.to_json()?;
+assert!(document.contains_key("schema"));
+assert!(document.contains_key("partition-spec"));
+assert!(!document.contains_key("last-sequence-number"));
+
+// v2 makes the plural keys the authority and numbers every commit.
+let v2 = TableMetadata::new(
+    FormatVersion::V2,
+    "file:///lake/trades",
+    schema.clone(),
+    PartitionSpec::unpartitioned(),
+)?;
+assert!(v2.to_json()?.contains_key("last-sequence-number"));
+
+// v3 adds row lineage.
+let v3 = TableMetadata::new(
+    FormatVersion::V3,
+    "file:///lake/trades",
+    schema,
+    PartitionSpec::unpartitioned(),
+)?;
+assert_eq!(v3.next_row_id, Some(0));
+assert!(v3.to_json()?.contains_key("next-row-id"));
+
+// Every version reads back as itself.
+for original in [v1, v2, v3] {
+    let read = TableMetadata::from_json(&original.to_json()?)?;
+    assert_eq!(read.format_version, original.format_version);
+    assert!(read.current_snapshot().is_none());
+}
+```
+
+Reading normalizes: a v1 document's `schema` becomes a one-element `schemas`, and its bare
+`partition-spec` array becomes a spec with id zero, so nothing downstream has to ask which version
+it is looking at. Writing emits exactly what the declared version requires.
+
+The v3 additions this module implements are `next-row-id` on the table, `first-row-id` and
+`added-rows` on each snapshot, the nanosecond temporals `timestamp_ns` and `timestamptz_ns`, the
+`unknown` type, and the `initial-default` / `write-default` column values, which travel as reserved
+`iceberg:*` [Field metadata](field.md).
+
+## Snapshots and the current snapshot
+
+!!! note "Rust only"
+    The bindings read the same values off a table - its current snapshot and
+    its snapshots - rather than off a metadata document.
+
+```rust
+use yggdryl::iceberg::{FormatVersion, PartitionSpec, TableMetadata, assign_field_ids};
+use yggdryl::DataType;
+
+let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+    .required_field("row");
+assign_field_ids(&mut schema, 1)?;
+let metadata = TableMetadata::new(
+    FormatVersion::V2,
+    "file:///lake/trades",
+    schema,
+    PartitionSpec::unpartitioned(),
+)?;
+
+// A table can have snapshots and still have no current one; that is a
+// freshly created table, and a rolled-back one.
+assert!(metadata.current_snapshot().is_none());
+
+// `-1` is the other way a document spells "no current snapshot".
+let document = metadata.to_json()?.with_key("current-snapshot-id", -1_i64)?;
+let read = TableMetadata::from_json(&document)?;
+assert!(read.current_snapshot_id.is_none());
+assert!(read.current_snapshot().is_none());
+```
+
+A snapshot is one complete version of the table: an identifier, the manifest list naming every
+manifest alive at that moment, and a summary of what the commit did. The *current* snapshot is a
+pointer, which is why `current_snapshot` returns an `Option` and why reading a table without one
+must yield no rows rather than fail.
+
+## Manifest lists and manifests
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{
+        EntryStatus, FileFormat, FormatVersion, PartitionSpec, Table, assign_field_ids, read_manifest,
+        read_manifest_spec,
+    };
+    use yggdryl::io::IOBase;
+    use yggdryl::local::Folder;
+    use yggdryl::{arrow, DataType};
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use std::sync::Arc;
+
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Utf8.nullable_field("venue"),
+    ])?
+    .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+
+    let path = std::env::temp_dir().join("yggdryl-docs-iceberg-manifests");
+    let _ = std::fs::remove_dir_all(&path);
+    let spec = PartitionSpec::identity(1, &schema, &["venue"])?;
+    let mut table = Table::create(Folder::new(&path)?, FormatVersion::V2, schema.clone(), spec.clone())?;
+
+    let batch = RecordBatch::try_new(
+        schema.to_arrow_schema()?,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2])),
+            Arc::new(StringArray::from(vec![Some("XNAS"), Some("XNAS")])),
+        ],
+    )?;
+    table.append(arrow::batch_reader(batch.schema(), [batch]))?;
+
+    // A snapshot names one manifest list; each of its rows is a manifest.
+    let manifests = table.manifests()?;
+    assert_eq!(manifests.len(), 1);
+    assert_eq!(manifests[0].added_files_count, 1);
+    assert_eq!(manifests[0].added_rows_count, 2);
+
+    // A manifest is self-describing: its Avro header carries the schema and the spec.
+    let name = manifests[0].manifest_path.rsplit('/').next().unwrap().to_owned();
+    let handle = Folder::new(&path)?.child_by(&format!("metadata/{name}"))?;
+    assert_eq!(read_manifest_spec(&handle)?, spec);
+
+    let entries = read_manifest(&handle)?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].status, EntryStatus::Added);
+    assert_eq!(entries[0].data_file.file_format, FileFormat::Parquet);
+    assert_eq!(entries[0].data_file.record_count, 2);
+
+    // Statistics are keyed by field id, which is what lets a planner skip a file.
+    assert!(entries[0].data_file.value_counts.iter().any(|(id, count)| *id == 1 && *count == 2));
+    assert!(entries[0].data_file.column_sizes.iter().any(|(id, _)| *id == 1));
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids
+
+    columns = pa.schema([
+        pa.field("id", pa.int64(), nullable=False),
+        pa.field("venue", pa.string()),
+    ])
+    schema = assign_field_ids(columns)
+
+    root = IOBase(pathlib.Path(tempfile.mkdtemp()) / "trades")
+    table = Table.create(root, schema, ["venue"])
+    table.append(
+        pa.record_batch({"id": [1, 2], "venue": ["XNAS", "XNAS"]}, schema=columns)
+    )
+
+    # A snapshot names one manifest list; each of its rows is a manifest.
+    manifests = table.manifests()
+    assert len(manifests) == 1
+    assert manifests[0].is_data()
+    assert manifests[0].added_files_count == 1
+    assert manifests[0].added_rows_count == 2
+
+    # Each manifest row is a data file plus what the writer measured about it.
+    (file, spec), = table.data_files()
+    assert file.file_format == "PARQUET"
+    assert file.record_count == 2
+    assert spec.fields[0].name == "venue"
+
+    # Statistics are keyed by field id, which is what lets a planner skip a file.
+    assert file.value_counts[1] == 2
+    assert 1 in file.column_sizes
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const schema = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int64'), Field.from('venue: utf8')], {
+        nullable: false,
+      }),
+    )
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-docs-')), 'trades')
+
+    const table = iceberg.Table.create(root, schema, ['venue'])
+    table.append(
+      new arrow.Table({
+        id: arrow.vectorFromArray([1n, 2n], new arrow.Int64()),
+        venue: arrow.vectorFromArray(['XNAS', 'XNAS'], new arrow.Utf8()),
+      }),
+    )
+
+    // A snapshot names one manifest list; each of its rows is a manifest.
+    const manifests = table.manifests()
+    assert.equal(manifests.length, 1)
+    assert.equal(manifests[0].content, 'data')
+    assert.equal(manifests[0].addedFilesCount, 1)
+    assert.equal(manifests[0].addedRowsCount, 2)
+
+    // Each manifest row is a data file plus what the writer measured about it.
+    const [file] = table.dataFiles()
+    assert.equal(file.fileFormat, 'PARQUET')
+    assert.equal(file.recordCount, 2)
+    assert.deepEqual(file.partitionNames, ['venue'])
+
+    // Statistics are keyed by field id, which is what lets a planner skip a file.
+    assert.ok(file.valueCounts.some((entry) => entry.fieldId === 1 && entry.count === 2))
+    assert.ok(file.columnSizes.some((entry) => entry.fieldId === 1))
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
+
+Iceberg puts two levels of indirection between a snapshot and its rows, and both are Avro. That Avro
+is implemented in this module: a container is a header naming a writer schema, then blocks of records
+separated by a synchronization marker. Manifest rows cross the boundary as the same
+[`Value`](json.md) the JSON parser produces, so a manifest row and a metadata document are read with
+one vocabulary.
+
+Statistics come from the Parquet footer the write just produced. Counts and sizes are emitted for
+every top-level column; *bounds* are emitted only for the types whose Parquet statistic bytes are
+byte-for-byte the Iceberg single-value encoding. A decimal is the case that differs - Parquet stores
+it big-endian in a fixed width, Iceberg stores the minimal two's-complement big-endian - so a decimal
+column gets counts but no bounds, rather than bounds that mean something else.
+
+## Partition specs and the Hive layout
+
+!!! note "Rust only"
+    The bindings build the identity spec a table is created with, and read
+    one back off the table; the transform vocabulary and the path rendering
+    are Rust.
+
+```rust
+use yggdryl::iceberg::{PartitionSpec, Transform, assign_field_ids};
+use yggdryl::{DataType, Value};
+
+let mut schema = DataType::from_fields([
+    DataType::Int64.required_field("id"),
+    DataType::Utf8.nullable_field("venue"),
+])?
+.required_field("row");
+assign_field_ids(&mut schema, 1)?;
+
+let spec = PartitionSpec::identity(1, &schema, &["venue"])?;
+assert_eq!(spec.fields[0].source_id, 2);
+assert_eq!(spec.fields[0].field_id, 1000);
+assert_eq!(spec.fields[0].transform, Transform::Identity);
+
+// The directory chain is the `column=value` shape the crate's Hive reader knows.
+assert_eq!(spec.partition_path(&[Value::from("XNAS")])?, "venue=XNAS");
+assert_eq!(spec.partition_path(&[Value::Null])?, "venue=null");
+
+// A partition value is nullable even when its source column is not.
+let partition = spec.partition_field(&schema)?;
+assert!(partition.fields()[0].is_nullable());
+
+// Only the invertible transforms can place a row.
+assert!(Transform::Identity.is_invertible());
+assert!(!Transform::from_str("bucket[16]")?.is_invertible());
+let mut hashed = spec.clone();
+hashed.fields[0].transform = Transform::Bucket(16);
+assert!(hashed.require_writable().unwrap_err().to_string().contains("bucket[16]"));
+```
+
+Iceberg writes partition directories in exactly the `column=value` shape
+[`Url::hive_partitions`](uri.md) already reads, so a table this module writes is also a lake the rest
+of the crate can walk with [`IOBase::children_where`](io.md). Unlike Hive, an Iceberg data file still
+stores its partition columns, so a scan needs no restoration step in the normal case.
+
+**The manifest is the authority on a partition value, not the path.** A null value is spelled `null`
+in a directory name, and a path cannot say whether that is the string `"null"` or the absence of a
+value:
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::{arrow, DataType};
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use std::sync::Arc;
+
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Utf8.nullable_field("venue"),
+    ])?
+    .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+
+    let path = std::env::temp_dir().join("yggdryl-docs-iceberg-null-partition");
+    let _ = std::fs::remove_dir_all(&path);
+    let spec = PartitionSpec::identity(1, &schema, &["venue"])?;
+    let mut table = Table::create(Folder::new(&path)?, FormatVersion::V2, schema.clone(), spec)?;
+
+    let batch = RecordBatch::try_new(
+        schema.to_arrow_schema()?,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2])),
+            Arc::new(StringArray::from(vec![Some("XNAS"), None])),
+        ],
+    )?;
+    table.append(arrow::batch_reader(batch.schema(), [batch]))?;
+
+    let files = table.data_files()?;
+    assert_eq!(files.len(), 2);
+    let (null_file, _) = files.iter().find(|(file, _)| file.partition[0].is_null()).unwrap();
+    assert!(null_file.file_path.contains("venue=null"), "the path spells it");
+    assert!(null_file.partition[0].is_null(), "the manifest means it");
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids
+
+    columns = pa.schema([
+        pa.field("id", pa.int64(), nullable=False),
+        pa.field("venue", pa.string()),
+    ])
+    schema = assign_field_ids(columns)
+
+    root = IOBase(pathlib.Path(tempfile.mkdtemp()) / "trades")
+    table = Table.create(root, schema, ["venue"])
+    table.append(pa.record_batch({"id": [1, 2], "venue": ["XNAS", None]}, schema=columns))
+
+    files = table.data_files()
+    assert len(files) == 2
+    null_file, _ = next(pair for pair in files if pair[0].partition[0] is None)
+    assert "venue=null" in null_file.path, "the path spells it"
+    assert null_file.partition[0] is None, "the manifest means it"
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const schema = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int64'), Field.from('venue: utf8')], {
+        nullable: false,
+      }),
+    )
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-docs-')), 'trades')
+
+    const table = iceberg.Table.create(root, schema, ['venue'])
+    table.append(
+      new arrow.Table({
+        id: arrow.vectorFromArray([1n, 2n], new arrow.Int64()),
+        venue: arrow.vectorFromArray(['XNAS', null], new arrow.Utf8()),
+      }),
+    )
+
+    const files = table.dataFiles()
+    assert.equal(files.length, 2)
+    const absent = files.find((file) => file.partition[0].asJs() === null)
+    assert.ok(absent.filePath.includes('venue=null'), 'the path spells it')
+    assert.equal(absent.partition[0].asJs(), null, 'the manifest means it')
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
+
+## Reading with column pushdown
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::{arrow, DataType};
+
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchReader, StringArray};
+    use std::sync::Arc;
+
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Utf8.nullable_field("symbol"),
+    ])?
+    .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+
+    let path = std::env::temp_dir().join("yggdryl-docs-iceberg-pushdown");
+    let _ = std::fs::remove_dir_all(&path);
+    let mut table = Table::create(
+        Folder::new(&path)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    let batch = RecordBatch::try_new(
+        schema.to_arrow_schema()?,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2])),
+            Arc::new(StringArray::from(vec![Some("AAPL"), Some("MSFT")])),
+        ],
+    )?;
+    table.append(arrow::batch_reader(batch.schema(), [batch]))?;
+
+    // The target names the columns to keep; each file's Parquet reader gets it as
+    // its own projection mask, so the dropped column chunk is never decoded.
+    let wanted = schema.without_fields(&["symbol"])?;
+    let reader = table.scan(Some(&wanted))?;
+    assert_eq!(reader.schema().fields().len(), 1);
+    for batch in reader {
+        assert_eq!(batch?.num_columns(), 1);
+    }
+
+    // No target reads everything.
+    assert_eq!(table.scan(None)?.schema().fields().len(), 2);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids
+
+    columns = pa.schema([
+        pa.field("id", pa.int64(), nullable=False),
+        pa.field("symbol", pa.string()),
+    ])
+    schema = assign_field_ids(columns)
+
+    root = IOBase(pathlib.Path(tempfile.mkdtemp()) / "trades")
+    table = Table.create(root, schema)
+    table.append(
+        pa.record_batch({"id": [1, 2], "symbol": ["AAPL", "MSFT"]}, schema=columns)
+    )
+
+    # The target names the columns to keep; each file's Parquet reader gets it as
+    # its own projection mask, so the dropped column chunk is never decoded.
+    wanted = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+    reader = table.scan(wanted)
+    assert reader.schema.names == ["id"]
+    assert reader.read_all().num_rows == 2
+
+    # No target reads everything.
+    assert table.scan().schema.names == ["id", "symbol"]
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const schema = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int64'), Field.from('symbol: utf8')], {
+        nullable: false,
+      }),
+    )
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-docs-')), 'trades')
+
+    const table = iceberg.Table.create(root, schema)
+    table.append(
+      new arrow.Table({
+        id: arrow.vectorFromArray([1n, 2n], new arrow.Int64()),
+        symbol: arrow.vectorFromArray(['AAPL', 'MSFT'], new arrow.Utf8()),
+      }),
+    )
+
+    // The target names the columns to keep; each file's Parquet reader gets it as
+    // its own projection mask, so the dropped column chunk is never decoded.
+    const wanted = fields.struct('row', [schema.dataType.at(0)], { nullable: false })
+    const projected = table.scan(wanted).toTable()
+    assert.deepEqual(projected.schema.fields.map((child) => child.name), ['id'])
+    assert.equal(projected.numRows, 2)
+
+    // No target reads everything.
+    assert.equal(table.scan().toTable().numCols, 2)
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
+
+`Table::scan` hands its optional `Field` to each data file as the schema
+[`IOBase::read_arrow_batch_reader`](io.md) reads under, minus the partition columns the file does not
+store, then casts what comes back to the scan's own root. The pushdown is what makes a projected scan
+cheap; the cast is what makes a table whose schema evolved readable as one shape.
+
+## Planning a scan from the metadata
+
+!!! note "Rust only"
+    The Python and JavaScript packages do not expose the scan planner yet. What
+    they *do* get is the next section: a filtered read and an upsert through the
+    three record methods, which plan through this same code.
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::{arrow, DataType};
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use std::sync::Arc;
+
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Utf8.nullable_field("venue"),
+    ])?
+    .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+
+    let path = std::env::temp_dir().join("yggdryl-docs-iceberg-plan");
+    let _ = std::fs::remove_dir_all(&path);
+    let spec = PartitionSpec::identity(1, &schema, &["venue"])?;
+    let mut table = Table::create(Folder::new(&path)?, FormatVersion::V2, schema.clone(), spec)?;
+
+    // One commit per venue, so the manifest list has three rows to prune.
+    for (id, venue) in [(1_i64, "XNAS"), (2, "XNYS"), (3, "XLON")] {
+        let batch = RecordBatch::try_new(
+            schema.to_arrow_schema()?,
+            vec![
+                Arc::new(Int64Array::from(vec![id])),
+                Arc::new(StringArray::from(vec![Some(venue)])),
+            ],
+        )?;
+        table.append(arrow::batch_reader(batch.schema(), [batch]))?;
+    }
+
+    // Nothing is listed: the snapshot names the manifest list, whose per-partition
+    // summaries exclude two manifests before either Avro file is opened.
+    let plan = table.plan(&[("venue", "XNYS")])?;
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.record_count(), 1);
+    assert_eq!(plan.manifests_read, 1);
+    assert_eq!(plan.manifests_skipped(), 2);
+
+    // A filter on a column the spec does not partition on prunes on the file's
+    // own statistics instead, and then filters the rows the survivors hold.
+    let bounded = table.plan(&[("id", "3")])?;
+    assert_eq!(bounded.tasks.len(), 1);
+    assert_eq!(bounded.files_skipped(), 2);
+
+    let rows: usize = table
+        .scan_where(&[("id", "3")], None)?
+        .map(|batch| batch.unwrap().num_rows())
+        .sum();
+    assert_eq!(rows, 1);
+    ```
+
+A scan is planned entirely from the metadata, and every level of it prunes:
+
+| Level | What it carries | What it skips |
+| --- | --- | --- |
+| Snapshot | the manifest list | every file an earlier snapshot named |
+| Manifest list row | one `FieldSummary` per partition field | a whole manifest, unopened |
+| Manifest entry | the file's partition tuple | one data file, unopened |
+| Data file | per-column bounds and null counts | one data file, unopened |
+
+A filter is a column name and a value as text - the same vocabulary
+[`IOBase::children_where`](io.md) filters a lake with. Against an `identity`
+partition column it is compared to the text the layout spells, so `null` names
+the absence exactly as a directory name does, and the tuple settles it: every row
+of a file whose tuple matches holds that value. Against any other column it is
+compared to the value a cast from that text produces, and the surviving files are
+filtered row by row afterwards - because a statistic bounds a *file* and does not
+select a row. `ScanPlan` reports both numbers, so "a filtered read touches only
+the files the metadata says it must" is something a caller can assert on rather
+than believe.
+
+## The three record methods over a table
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::generic::IORecordOptions;
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::io::IOBase;
+    use yggdryl::local::Folder;
+    use yggdryl::{arrow, DataType};
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use std::sync::Arc;
+
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Utf8.nullable_field("venue"),
+    ])?
+    .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+
+    let path = std::env::temp_dir().join("yggdryl-docs-iceberg-records");
+    let _ = std::fs::remove_dir_all(&path);
+    let spec = PartitionSpec::identity(1, &schema, &["venue"])?;
+    Table::create(Folder::new(&path)?, FormatVersion::V2, schema.clone(), spec)?;
+
+    let arrow_schema = schema.to_arrow_schema()?;
+    let rows = |ids: Vec<i64>, venues: Vec<&'static str>| {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(venues)),
+            ],
+        )
+        .expect("a batch matching the root");
+        arrow::batch_reader(batch.schema(), [batch])
+    };
+
+    // The folder *is* the table, so the ordinary record surface reaches it. Its
+    // options come from the metadata, before a single data file exists.
+    let mut folder = Folder::new(&path)?;
+    let options = folder.record_options()?;
+    folder.write_arrow_batch_reader(rows(vec![1, 2], vec!["XNAS", "XNYS"]), &options)?;
+    folder.append_arrow_batch_reader(rows(vec![3], vec!["XLON"]), &options)?;
+
+    // A match key upserts: `2` is stored and updates, `9` is new and appends.
+    let merging = options.clone().with_merge_by(["id"]);
+    folder.write_arrow_batch_reader(rows(vec![2, 9], vec!["XNYS", "XLON"]), &merging)?;
+
+    let total: usize = folder
+        .read_arrow_batch_reader(&options)?
+        .map(|batch| batch.unwrap().num_rows())
+        .sum();
+    assert_eq!(total, 4);
+
+    // Each call was one commit, and the read went through the last one.
+    let table = Table::open(Folder::new(&path)?)?;
+    assert_eq!(table.metadata().snapshots.len(), 3);
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids
+
+    columns = pa.schema([
+        pa.field("id", pa.int64(), nullable=False),
+        pa.field("venue", pa.string()),
+    ])
+    schema = assign_field_ids(columns)
+    rows = lambda ids, venues: pa.record_batch(
+        {"id": ids, "venue": venues}, schema=columns
+    )
+
+    path = pathlib.Path(tempfile.mkdtemp()) / "trades"
+    Table.create(IOBase(path), schema, ["venue"])
+
+    # The folder *is* the table, so the ordinary record surface reaches it. Its
+    # options come from the metadata, before a single data file exists.
+    folder = IOBase(path)
+    options = folder.record_options()
+    folder.write_arrow_batch_reader(rows([1, 2], ["XNAS", "XNYS"]), options=options)
+    folder.append_arrow_batch_reader(rows([3], ["XLON"]), options=options)
+
+    # A match key upserts: `2` is stored and updates, `9` is new and appends.
+    merging = folder.record_options()
+    merging.merge_by = ["id"]
+    folder.write_arrow_batch_reader(rows([2, 9], ["XNYS", "XLON"]), options=merging)
+
+    assert folder.read_arrow_batch_reader(options=options).read_all().num_rows == 4
+
+    # Each call was one commit, and the read went through the last one.
+    assert len(Table.open(IOBase(path)).snapshots) == 3
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { BatchReader, Field, IOBase, fields, iceberg } = require('@yggdryl/node')
+
+    const schema = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int64'), Field.from('venue: utf8?')], {
+        nullable: false,
+      }),
+    )
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-docs-')), 'trades')
+    iceberg.Table.create(root, schema, ['venue'])
+
+    const rows = (ids, venues) =>
+      BatchReader.from(
+        new arrow.Table({
+          id: arrow.vectorFromArray(ids, new arrow.Int64()),
+          venue: arrow.vectorFromArray(venues, new arrow.Utf8()),
+        }),
+      )
+
+    // The folder *is* the table, so the ordinary record surface reaches it. Its
+    // options come from the metadata, before a single data file exists.
+    const folder = IOBase.from(root)
+    const options = folder.recordOptions()
+    folder.writeArrowBatchReader(rows([1n, 2n], ['XNAS', 'XNYS']), options)
+    folder.appendArrowBatchReader(rows([3n], ['XLON']), options)
+
+    // A match key upserts: `2` is stored and updates, `9` is new and appends.
+    folder.writeArrowBatchReader(
+      rows([2n, 9n], ['XNYS', 'XLON']),
+      options.withMergeBy(['id']),
+    )
+
+    assert.equal(folder.readArrowBatchReader(options).toTable().numRows, 4)
+
+    // Each call was one commit, and the read went through the last one.
+    assert.equal(iceberg.Table.open(root).snapshots.length, 3)
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
+
+A handle addressing a table's folder is not read as a folder of Parquet files: it
+is read through the current snapshot, so a file an overwrite replaced is never
+read back and a stray file nobody committed is never read at all. The three
+methods keep their meanings, and each one is a single commit:
+
+- `read_arrow_batch_reader` scans the current snapshot, planning as above.
+- `write_arrow_batch_reader` with no match key replaces every row; with one it
+  merges, reading only the data files whose recorded bounds for the key columns
+  overlap the incoming keys and carrying the rest into the new snapshot untouched
+  - same location, same statistics, same commit order. That is what makes an
+  upsert cost the files it can actually change, and it stays correct however
+  coarse the statistics are, because a file that is not read keeps every row.
+- `append_arrow_batch_reader` writes new data files and keeps every manifest the
+  last snapshot had, so nothing stored is read or rewritten.
+
+A handle addressing one of the table's `column=value` directories addresses that
+partition of it, exactly as it would in a plain Hive lake - the difference is that
+the files come from the manifest rather than from a directory listing:
+
+```rust
+use yggdryl::generic::IORecordOptions;
+use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+use yggdryl::io::IOBase;
+use yggdryl::local::Folder;
+use yggdryl::{arrow, DataType};
+
+use arrow_array::{Int64Array, RecordBatch, StringArray};
+use std::sync::Arc;
+
+let mut schema = DataType::from_fields([
+    DataType::Int64.required_field("id"),
+    DataType::Utf8.nullable_field("venue"),
+])?
+.required_field("row");
+assign_field_ids(&mut schema, 1)?;
+
+let path = std::env::temp_dir().join("yggdryl-docs-iceberg-partition");
+let _ = std::fs::remove_dir_all(&path);
+let spec = PartitionSpec::identity(1, &schema, &["venue"])?;
+let mut table = Table::create(Folder::new(&path)?, FormatVersion::V2, schema.clone(), spec)?;
+
+let batch = RecordBatch::try_new(
+    schema.to_arrow_schema()?,
+    vec![
+        Arc::new(Int64Array::from(vec![1_i64, 2])),
+        Arc::new(StringArray::from(vec![Some("XNAS"), Some("XNYS")])),
+    ],
+)?;
+table.append(arrow::batch_reader(batch.schema(), [batch]))?;
+
+let partition = Folder::new(path.join("data").join("venue=XNYS"))?;
+let options = partition.record_options()?;
+let rows: usize = partition
+    .read_arrow_batch_reader(&options)?
+    .map(|batch| batch.unwrap().num_rows())
+    .sum();
+assert_eq!(rows, 1);
+```
+
+## Schema evolution and field ids
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{FormatVersion, PartitionSpec, Table, assign_field_ids};
+    use yggdryl::local::Folder;
+    use yggdryl::{arrow, DataType};
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use std::sync::Arc;
+
+    let mut schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+    assign_field_ids(&mut schema, 1)?;
+
+    let path = std::env::temp_dir().join("yggdryl-docs-iceberg-evolution");
+    let _ = std::fs::remove_dir_all(&path);
+    let mut table = Table::create(
+        Folder::new(&path)?,
+        FormatVersion::V2,
+        schema.clone(),
+        PartitionSpec::unpartitioned(),
+    )?;
+
+    let batch = RecordBatch::try_new(
+        schema.to_arrow_schema()?,
+        vec![Arc::new(Int64Array::from(vec![1_i64]))],
+    )?;
+    table.append(arrow::batch_reader(batch.schema(), [batch]))?;
+
+    // Add a column. Numbering continues above `last-column-id`, so the new column
+    // can never be confused with a dropped one.
+    let mut evolved = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        DataType::Int64.nullable_field("quantity"),
+    ])?
+    .required_field("row");
+    assign_field_ids(&mut evolved, 1)?;
+    assert_eq!(table.evolve_schema(evolved)?, 1, "the new schema's id");
+
+    // The old schema is retained, so the snapshot written under it still reads.
+    assert_eq!(table.metadata().schemas.len(), 2);
+    assert_eq!(table.metadata().schema_by_id(0).unwrap().field_len(), 1);
+
+    // And the file written before the column existed reads it as null.
+    for batch in table.scan(None)? {
+        let batch = batch?;
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.column_by_name("quantity").unwrap().null_count(), batch.num_rows());
+    }
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import tempfile
+
+    import pyarrow as pa
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table, assign_field_ids
+
+    columns = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+    schema = assign_field_ids(columns)
+
+    root = IOBase(pathlib.Path(tempfile.mkdtemp()) / "trades")
+    table = Table.create(root, schema)
+    table.append(pa.record_batch({"id": [1]}, schema=columns))
+
+    # Add a column. Numbering continues above `last-column-id`, so the new column
+    # can never be confused with a dropped one.
+    evolved = assign_field_ids(pa.schema([
+        pa.field("id", pa.int64(), nullable=False),
+        pa.field("quantity", pa.int64()),
+    ]))
+    assert table.evolve_schema(evolved) == 1, "the new schema's id"
+
+    # The old schema is retained, so the snapshot written under it still reads.
+    assert len(table.schemas) == 2
+    assert len(table.schemas[0].data_type) == 1
+
+    # And the file written before the column existed reads it as null.
+    rows = table.scan().read_all()
+    assert rows.column_names == ["id", "quantity"]
+    assert rows.column("quantity").null_count == rows.num_rows
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const arrow = require('apache-arrow')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const schema = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int64')], { nullable: false }),
+    )
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-docs-')), 'trades')
+
+    const table = iceberg.Table.create(root, schema)
+    table.append(new arrow.Table({ id: arrow.vectorFromArray([1n], new arrow.Int64()) }))
+
+    // Add a column. Numbering continues above `last-column-id`, so the new column
+    // can never be confused with a dropped one.
+    const evolved = iceberg.assignFieldIds(
+      fields.struct('row', [Field.from('id: int64'), Field.from('quantity: int64')], {
+        nullable: false,
+      }),
+    )
+    assert.equal(table.evolveSchema(evolved), 1, "the new schema's id")
+
+    // The old schema is retained, so the snapshot written under it still reads.
+    assert.equal(table.schemas.length, 2)
+    assert.equal(table.schemas[0].dataType.length, 1)
+
+    // And the file written before the column existed reads it as null.
+    const rows = table.scan().toTable()
+    assert.deepEqual(rows.schema.fields.map((child) => child.name), ['id', 'quantity'])
+    assert.equal(rows.getChild('quantity').nullCount, rows.numRows)
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
+
+An Iceberg schema is a struct with *numbered* fields, and the number is the identity: a column read
+by id survives a rename, and a new column can never reuse a retired id.
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{assign_field_ids, last_field_id};
+    use yggdryl::DataType;
+
+    let leg = DataType::from_fields([DataType::decimal(18, 4)?.required_field("price")])?;
+    let mut schema = DataType::from_fields([
+        DataType::Int64.required_field("id"),
+        leg.nullable_field("leg"),
+    ])?
+    .required_field("row");
+
+    // Depth first from `start`; the return value is the first id it did not use.
+    assert_eq!(assign_field_ids(&mut schema, 1)?, 4);
+    assert_eq!(schema.fields()[0].id()?, Some(1));
+    assert_eq!(schema.fields()[1].id()?, Some(2));
+    assert_eq!(schema.fields()[1].fields()[0].id()?, Some(3));
+    assert_eq!(last_field_id(&schema)?, 3, "what a table records as last-column-id");
+
+    // The root is not a column, so it is not numbered.
+    assert_eq!(schema.id()?, None);
+
+    // A field that already carries an id keeps it, so a second pass changes nothing.
+    assert_eq!(assign_field_ids(&mut schema, 100)?, 100);
+    assert_eq!(schema.fields()[0].id()?, Some(1));
+    ```
+
+=== "Python"
+
+    ```python
+    import pyarrow as pa
+
+    from yggdryl.iceberg import assign_field_ids
+
+    columns = pa.schema([
+        pa.field("id", pa.int64(), nullable=False),
+        pa.field(
+            "leg",
+            pa.struct([pa.field("price", pa.decimal128(18, 4), nullable=False)]),
+        ),
+    ])
+
+    # Depth first from `start`; the numbered schema is what comes back, so the
+    # schema handed in is left as it was.
+    schema = assign_field_ids(columns, 1)
+    assert [child.id for child in schema.data_type] == [1, 2]
+    assert schema.data_type[1].data_type[0].id == 3
+
+    # The root is not a column, so it is not numbered.
+    assert schema.id is None
+
+    # A field that already carries an id keeps it, so a second pass changes nothing.
+    assert [child.id for child in assign_field_ids(schema, 100).data_type] == [1, 2]
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const leg = fields.struct('leg', [Field.from('price: decimal(18, 4)')])
+    const plain = fields.struct('row', [Field.from('id: int64'), leg], { nullable: false })
+
+    // Depth first from `start`; the numbered schema is what comes back, so the
+    // schema handed in is left as it was.
+    const schema = iceberg.assignFieldIds(plain)
+    assert.equal(plain.dataType.at(0).id, null)
+    assert.equal(schema.dataType.at(0).id, 1)
+    assert.equal(schema.dataType.at(1).id, 2)
+    assert.equal(schema.dataType.at(1).dataType.at(0).id, 3)
+
+    // The root is not a column, so it is not numbered.
+    assert.equal(schema.id, null)
+
+    // A field that already carries an id keeps it, so a second pass changes nothing.
+    assert.equal(iceberg.assignFieldIds(schema, 100).dataType.at(0).id, 1)
+    ```
+
+Numbering is explicit, never implicit: a field tree built in Rust has no ids until `assign_field_ids`
+puts them there, which is what creating a table needs. Because an existing id is preserved, the same
+call also fills the gaps in a tree you extended, and the returned id is where the next call starts.
+
+Writing a schema whose columns were never numbered fails, and says so:
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::schema_to_json;
+    use yggdryl::DataType;
+
+    let schema = DataType::from_fields([DataType::Int64.required_field("id")])?
+        .required_field("row");
+
+    let message = schema_to_json(&schema).unwrap_err().to_string();
+    assert!(message.contains("assign_field_ids"));
+    ```
+
+=== "Python"
+
+    ```python
+    import pathlib
+    import tempfile
+
+    import pyarrow as pa
+    import pytest
+
+    from yggdryl import IOBase
+    from yggdryl.iceberg import Table
+
+    columns = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+
+    with pytest.raises(ValueError, match="assign_field_ids"):
+        Table.create(IOBase(pathlib.Path(tempfile.mkdtemp()) / "trades"), columns)
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const fs = require('node:fs')
+    const os = require('node:os')
+    const path = require('node:path')
+    const { Field, fields, iceberg } = require('@yggdryl/node')
+
+    const unnumbered = fields.struct('row', [Field.from('id: int64')], { nullable: false })
+    const root = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'yggdryl-docs-')), 'trades')
+
+    assert.throws(() => iceberg.Table.create(root, unnumbered), /assign_field_ids/)
+
+    fs.rmSync(path.dirname(root), { recursive: true, force: true })
+    ```
+
+## Schemas as documents
+
+!!! note "All three"
+    Both bindings read and write the document under the same two names, and
+    both take it as the mapping their own JSON decoder produces.
+
+=== "Rust"
+
+    ```rust
+    use yggdryl::iceberg::{schema_from_json, schema_to_json};
+    use yggdryl::{json, DataType};
+
+    let document = json::from_str(
+        r#"{"type":"struct","schema-id":0,"fields":[
+            {"id":1,"name":"id","required":true,"type":"long"},
+            {"id":2,"name":"symbol","required":false,"type":"string"}
+        ]}"#,
+    )?;
+
+    // An Iceberg schema is a non-null struct field; its columns are the children.
+    let schema = schema_from_json("row", &document)?;
+    assert!(schema.is_struct());
+    assert!(!schema.is_nullable());
+    assert_eq!(schema.field_len(), 2);
+    assert_eq!(schema.fields()[0].data_type(), &DataType::Int64);
+
+    // `required` inverts into nullability, and `id` becomes PARQUET:field_id.
+    assert!(!schema.fields()[0].is_nullable());
+    assert!(schema.fields()[1].is_nullable());
+    assert_eq!(schema.fields()[0].id()?, Some(1));
+    assert_eq!(schema.fields()[0].get_metadata("PARQUET:field_id"), Some("1"));
+
+    // The same document comes back out.
+    assert_eq!(schema_to_json(&schema)?, document);
+    ```
+
+=== "Python"
+
+    ```python
+    import json
+
+    from yggdryl.iceberg import schema_from_json, schema_to_json
+
+    document = json.loads("""{"type":"struct","schema-id":0,"fields":[
+        {"id":1,"name":"id","required":true,"type":"long"},
+        {"id":2,"name":"symbol","required":false,"type":"string"}
+    ]}""")
+
+    # An Iceberg schema is a non-null struct field; its columns are the children.
+    schema = schema_from_json("row", document)
+    assert schema.data_type.kind == "struct"
+    assert not schema.nullable
+    assert len(schema.data_type) == 2
+    assert str(schema.data_type[0].data_type) == "int64"
+
+    # `required` inverts into nullability, and `id` becomes PARQUET:field_id.
+    assert not schema.data_type[0].nullable
+    assert schema.data_type[1].nullable
+    assert schema.data_type[0].id == 1
+    assert schema.data_type[0]["PARQUET:field_id"] == "1"
+
+    # The same document comes back out.
+    assert schema_to_json(schema) == document
+    ```
+
+=== "JavaScript"
+
+    ```javascript
+    const assert = require('node:assert/strict')
+    const { iceberg, json } = require('@yggdryl/node')
+
+    const document = json.loads(
+      Buffer.from(`{"type":"struct","schema-id":0,"fields":[
+        {"id":1,"name":"id","required":true,"type":"long"},
+        {"id":2,"name":"symbol","required":false,"type":"string"}
+      ]}`),
+    )
+
+    // An Iceberg schema is a non-null struct field; its columns are the children.
+    const schema = iceberg.schemaFromJson('row', document)
+    assert.equal(schema.dataType.kind, 'struct')
+    assert.equal(schema.nullable, false)
+    assert.equal(schema.dataType.length, 2)
+    assert.equal(String(schema.dataType.at(0).dataType), 'int64')
+
+    // `required` inverts into nullability, and `id` becomes PARQUET:field_id.
+    assert.equal(schema.dataType.at(0).nullable, false)
+    assert.equal(schema.dataType.at(1).nullable, true)
+    assert.equal(schema.dataType.at(0).id, 1)
+    assert.equal(schema.dataType.at(0).get('PARQUET:field_id'), '1')
+
+    // The same document comes back out.
+    assert.deepEqual(iceberg.schemaToJson(schema).asJs(), document)
+    ```
+
+There is no Iceberg schema type in this module. An Iceberg schema *is* a non-null struct
+[`Field`](field.md) whose children carry `PARQUET:field_id`, so the two functions convert rather than
+mirror: what comes back is a field the rest of the crate already reads, writes, casts, and projects
+into [Arrow](arrow.md).
+
+Documents are read and written by the crate's own [JSON](json.md) parser, so an Iceberg document is
+an ordinary [`Value`](json.md) - the same value a YAML or TOML document decodes to - and no second
+JSON model enters the crate through this module.
+
+Three things the field model spells differently, all of which survive the round trip:
+
+- The root takes the `name` you pass, because an Iceberg schema names its columns but not itself.
+- Iceberg states requirement and the core states nullability, so `"required": true` reads back as
+  `is_nullable() == false` and writes back as `!field.is_nullable()`.
+- `schema-id` is kept as `iceberg:schema-id` metadata on the root, a column's `doc` as `iceberg:doc`,
+  and the v3 defaults as `iceberg:initial-default` and `iceberg:write-default`, which is why
+  re-emitting the document reproduces it instead of dropping fields the field model has no slot for.
+
+## Primitive types
+
+!!! note "Rust only"
+    The type mapping is a Rust table. The bindings see its result in the
+    schema a table reports.
+
+```rust
+use yggdryl::iceberg::PrimitiveType;
+use yggdryl::{DataType, TimeUnit};
+
+// Every Iceberg primitive name has exactly one physical datatype.
+assert_eq!(PrimitiveType::from_str("long")?.to_data_type()?, DataType::Int64);
+assert_eq!(PrimitiveType::from_str("string")?.to_data_type()?, DataType::Utf8);
+assert_eq!(
+    PrimitiveType::from_str("decimal(18, 4)")?.to_data_type()?,
+    DataType::decimal(18, 4)?
+);
+
+// Iceberg fixed every temporal resolution at microseconds until v3 added the
+// nanosecond pair.
+assert_eq!(
+    PrimitiveType::from_str("timestamp")?.to_data_type()?,
+    DataType::Timestamp(TimeUnit::Microsecond, None)
+);
+assert_eq!(
+    PrimitiveType::from_str("timestamp_ns")?.to_data_type()?,
+    DataType::Timestamp(TimeUnit::Nanosecond, None)
+);
+assert_eq!(
+    PrimitiveType::from_str("time")?.to_data_type()?,
+    DataType::time(TimeUnit::Microsecond)?
+);
+
+// A v3 `unknown` column always reads as null, which Arrow spells exactly.
+assert_eq!(PrimitiveType::from_str("unknown")?.to_data_type()?, DataType::Null);
+
+// A name round trips through `Display`.
+assert_eq!(PrimitiveType::from_str("fixed[16]")?.to_string(), "fixed[16]");
+```
+
+`PrimitiveType` is the whole Iceberg type vocabulary, parsed from the spelling that appears in table
+metadata JSON:
+
+| Iceberg | `DataType` | Version |
+| --- | --- | --- |
+| `boolean` | `Boolean` | v1 |
+| `int` | `Int32` | v1 |
+| `long` | `Int64` | v1 |
+| `float` | `Float32` | v1 |
+| `double` | `Float64` | v1 |
+| `decimal(p, s)` | `Decimal128 { precision: p, scale: s }` | v1 |
+| `date` | `Date32` | v1 |
+| `time` | `Time64(Microsecond)` | v1 |
+| `timestamp` | `Timestamp(Microsecond, None)` | v1 |
+| `timestamptz` | `Timestamp(Microsecond, Some("UTC"))` | v1 |
+| `timestamp_ns` | `Timestamp(Nanosecond, None)` | v3 |
+| `timestamptz_ns` | `Timestamp(Nanosecond, Some("UTC"))` | v3 |
+| `string` | `Utf8` | v1 |
+| `uuid` | `FixedSizeBinary(16)` | v1 |
+| `fixed[n]` | `FixedSizeBinary(n)` | v1 |
+| `binary` | `Binary` | v1 |
+| `unknown` | `Null` | v3 |
+
+`to_data_type` is total: every Iceberg type materializes without loss. `from_data_type` is not, and
+that is the point - it names the datatype it refuses instead of widening it behind your back:
+
+```rust
+use yggdryl::iceberg::PrimitiveType;
+use yggdryl::DataType;
+
+// The variants that differ only in physical layout collapse onto one name.
+assert_eq!(PrimitiveType::from_data_type(&DataType::Utf8)?, PrimitiveType::String);
+assert_eq!(PrimitiveType::from_data_type(&DataType::LargeUtf8)?, PrimitiveType::String);
+assert_eq!(PrimitiveType::from_data_type(&DataType::BinaryView)?, PrimitiveType::Binary);
+assert_eq!(
+    PrimitiveType::from_data_type(&DataType::decimal64(9, 2)?)?,
+    PrimitiveType::Decimal { precision: 9, scale: 2 }
+);
+
+// A datatype Iceberg cannot express is reported, never approximated.
+let message = PrimitiveType::from_data_type(&DataType::Int8).unwrap_err().to_string();
+assert!(message.contains("int8"));
+assert!(PrimitiveType::from_data_type(&DataType::Int16).is_err());
+
+// A UUID is 16 bytes on the wire and nothing more, so it writes back as `fixed[16]`.
+assert_eq!(
+    PrimitiveType::from_data_type(&PrimitiveType::Uuid.to_data_type()?)?.to_string(),
+    "fixed[16]"
+);
+```
+
+`int8`, `uint32`, `interval`, `union`, `decimal256`, and any `time` or `timestamp` unit other than
+microsecond and nanosecond have no Iceberg spelling. Widen them yourself before writing, so the
+column type in the table is one you chose.
+
+## Nested types
+
+!!! note "Rust only"
+    The type mapping is a Rust table. The bindings see its result in the
+    schema a table reports.
+
+```rust
+use yggdryl::iceberg::{schema_from_json, schema_to_json};
+use yggdryl::{json, DataType};
+
+let document = json::from_str(
+    r#"{"type":"struct","fields":[
+        {"id":1,"name":"legs","required":false,"type":{
+            "type":"list","element-id":2,"element":{
+                "type":"struct","fields":[
+                    {"id":3,"name":"price","required":true,"type":"decimal(18, 4)"}
+                ]
+            },"element-required":true
+        }},
+        {"id":4,"name":"tags","required":false,"type":{
+            "type":"map","key-id":5,"key":"string","value-id":6,"value":"int",
+            "value-required":false
+        }}
+    ]}"#,
+)?;
+
+let schema = schema_from_json("row", &document)?;
+
+// A list becomes a `List` whose item field is named `element` and carries `element-id`.
+let legs = &schema.fields()[0];
+let DataType::List(element) = legs.data_type() else { panic!("expected a list") };
+assert_eq!(element.name(), "element");
+assert_eq!(element.id()?, Some(2));
+assert!(!element.is_nullable());
+assert_eq!(element.fields()[0].name(), "price");
+
+// A map becomes a `Map` over a non-null `entries` struct of `key` and `value`.
+let tags = &schema.fields()[1];
+let DataType::Map(map) = tags.data_type() else { panic!("expected a map") };
+assert_eq!(map.entries().name(), "entries");
+assert!(!map.entries().is_nullable());
+assert!(!map.entries().fields()[0].is_nullable());
+assert!(map.entries().fields()[1].is_nullable());
+assert_eq!(map.entries().fields()[0].id()?, Some(5));
+
+assert_eq!(schema_to_json(&schema)?, document);
+```
+
+`struct`, `list`, and `map` nest to any depth. The names `element`, `key`, `value`, and `entries`
+are synthesized, because Iceberg numbers those positions instead of naming them: `element-id`,
+`key-id`, and `value-id` become field ids on the fields the conversion builds. A map key is always
+required, so only `element-required` and `value-required` read as nullability; both default to
+required when absent.
+
+## Into a data file
+
+!!! note "Rust only"
+    The bindings commit through a table's append and overwrite, which write
+    the same files; the writer's own settings stay in Rust.
+
+```rust
+use arrow_array::RecordBatch;
+use yggdryl::arrow;
+use yggdryl::iceberg::schema_from_json;
+use yggdryl::io::Buffer;
+use yggdryl::json;
+use yggdryl::parquet::Parquet;
+
+let document = json::from_str(
+    r#"{"type":"struct","fields":[
+        {"id":7,"name":"id","required":true,"type":"long"},
+        {"id":8,"name":"symbol","required":false,"type":"string"}
+    ]}"#,
+)?;
+let schema = schema_from_json("row", &document)?;
+
+let mut media = Parquet::new(Buffer::new());
+media.write_batch_reader(arrow::batch_reader(
+    schema.to_arrow_schema()?,
+    std::iter::empty::<RecordBatch>(),
+))?;
+
+// The ids Iceberg assigned are the ids in the file.
+let written = media.read_field()?;
+assert_eq!(written.fields()[0].id()?, Some(7));
+assert_eq!(written.fields()[1].id()?, Some(8));
+assert!(!written.fields()[0].is_nullable());
+```
+
+[parquet](parquet.md) has no Iceberg-specific code path. It writes `PARQUET:field_id` into the file
+schema and reads it back, and because that is the same metadata key the conversion here uses, an
+Iceberg schema needs no translation step before it becomes a data file - which is what lets a reader
+resolve columns by id rather than by position.
+
+## Interoperating with another implementation
+
+A table format that only its own writer can read is not a table format. `python
+scripts/check_iceberg_interop.py` runs the exchange in both directions against
+[PyIceberg](https://py.iceberg.apache.org/): a partitioned v2 table written here is opened as a
+PyIceberg `StaticTable` and compared column by column and row by row, and a table PyIceberg writes -
+different metadata file names, different manifest field ordering, deflate-compressed Avro - is
+opened by `Table::open` and compared the same way. `cargo test --features "parquet iceberg" --test
+iceberg_interop` is the Rust half; run alone it says on stdout that it skipped the external table
+rather than passing quietly.
+
+## What is not here
+
+No catalog client and no network code: nothing here resolves a table name, lists a namespace, or
+speaks to a catalog service. Committing a snapshot means writing metadata somewhere, and *where* is
+the [`IOBase`](io.md) handle the caller supplies.
+
+No deletes. This module writes and reads data files; position and equality delete files are read as
+manifest content that a scan skips, not produced.
+
+Two partition transforms can place a row: `identity` and `void`. A write against a spec using
+`bucket`, `truncate`, or a calendar transform is refused by name rather than silently writing rows
+into the wrong partition; *reading* such a table is unaffected, because a manifest already records
+which partition each file belongs to.
+
+<!-- notebooks: generated by scripts/build_docs_notebooks.py -->
+
+## Notebooks
+
+Every example on this page, as a notebook generated from these blocks and
+shipped unexecuted:
+[Rust](../notebooks/core_iceberg-rust.ipynb){ download },
+[Python](../notebooks/core_iceberg-python.ipynb){ download },
+[JavaScript](../notebooks/core_iceberg-javascript.ipynb){ download }.
+
+<!-- /notebooks -->
