@@ -16,8 +16,20 @@ env:
 
 jobs:
   rust:
-    name: Rust quality
+    # The Parquet encoding and the Iceberg table format over it are behind
+    # non-default features, so a single-configuration job never compiles them
+    # at all: their code, their tests, and their documentation are only checked
+    # by the second leg.
+    name: Rust quality (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            flags: ""
+          - name: parquet iceberg
+            flags: --features "parquet iceberg"
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -25,15 +37,15 @@ jobs:
       - name: Formatting
         run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
       - name: Clippy
-        run: cargo clippy --locked --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path rust/Cargo.toml --workspace --all-targets ${{ matrix.flags }} -- -D warnings
       - name: Tests
-        run: cargo test --locked --manifest-path rust/Cargo.toml --workspace --all-targets
+        run: cargo test --locked --manifest-path rust/Cargo.toml --workspace --all-targets ${{ matrix.flags }}
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --manifest-path rust/Cargo.toml --workspace --no-deps
+        run: cargo doc --locked --manifest-path rust/Cargo.toml --workspace --no-deps ${{ matrix.flags }}
       - name: Compile benchmarks
-        run: cargo bench --locked --manifest-path rust/Cargo.toml --benches --no-run
+        run: cargo bench --locked --manifest-path rust/Cargo.toml --benches --no-run ${{ matrix.flags }}
 
   core-msrv:
     name: Core Rust 1.85
@@ -54,8 +66,8 @@ jobs:
       fail-fast: false
       matrix:
         pyarrow:
-          - "pyarrow==15.*"
-          - "pyarrow>=15"
+          - "pyarrow==18.*"
+          - "pyarrow>=18"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6

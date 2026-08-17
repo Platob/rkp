@@ -1211,7 +1211,9 @@ These rules apply to both the Python and JavaScript extensions.
   one-cell error localization after a bulk Arrow array builder fails. Record
   output `safe=False` skips annotation validation only; it must still enforce Arrow
   physical validity and must never enable unsafe overflow casts.
-  Keep the Python package floor at PyArrow 15 for C-stream import. Do not use
+  Keep the Python package floor at PyArrow 18 for C-stream import. 15 supplied
+  the generic C-stream reader, but the run-end-encoded map and extension-type
+  scalar paths this adapter relies on were only correct from 18. Do not use
   newer `maps_as_pydicts` conveniences: normalize Arrow map pair sequences in
   the adapter and reject duplicate keys before the shared mapping caster.
 - Record Arrow exports are exactly `into_arrow_field`, `into_arrow_schema`,

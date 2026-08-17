@@ -16,7 +16,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "pyarrow>=15",
+  "pyarrow>=18",
   "typing_extensions>=4.4; python_version < '3.11'",
 ]
 

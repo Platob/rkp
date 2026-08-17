@@ -19,8 +19,8 @@ CATALOGUE_SIZE = 41
 def _available(*builders: typing.Callable[[], pa.DataType]) -> tuple[pa.DataType, ...]:
     """Build every variant this PyArrow can spell, skipping the rest.
 
-    The package floor is PyArrow 15, which predates the view types and the
-    narrow decimals. Those are absent rather than broken there, so a release
+    The package floor is PyArrow 18, which predates the narrow decimals that
+    arrived in 19. Those are absent rather than broken there, so a release
     that has no constructor for one runs the others instead of failing to
     collect the module.
     """
@@ -36,8 +36,8 @@ def _available(*builders: typing.Callable[[], pa.DataType]) -> tuple[pa.DataType
 def _all_datatype_variants() -> tuple[DataType, ...]:
     item = pa.field("item", pa.int32(), nullable=True)
     # Each variant is built by a callable rather than eagerly, because the
-    # package floor is PyArrow 15 and the view and narrow-decimal constructors
-    # arrived later. A release that cannot spell one simply does not run it;
+    # package floor is PyArrow 18 and the narrow-decimal constructors arrived
+    # in 19. A release that cannot spell one simply does not run it;
     # `CATALOGUE_SIZE` is what keeps the catalogue itself complete.
     arrow_types = _available(
         lambda: pa.null(),
